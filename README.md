@@ -1,3 +1,5 @@
+Modified with hard stochastic attention
+
 ## Sequence-to-Sequence Learning with Attentional Neural Networks
 
 [Torch](http://torch.ch) implementation of a standard sequence-to-sequence model with (optional)

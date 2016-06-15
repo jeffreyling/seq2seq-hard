@@ -1,3 +1,5 @@
+require 'hard_attn'
+
 function nn.Module:reuseMem()
    self.reuse = true
    return self
@@ -117,15 +119,15 @@ function make_lstm(data, opt, model, use_chars)
      local top_h = outputs[#outputs]
      local decoder_out
      if opt.attn == 1 then
-	local decoder_attn = make_decoder_attn(data, opt)
-	decoder_attn.name = 'decoder_attn'
-	decoder_out = decoder_attn({top_h, inputs[2]})
+        local decoder_attn = make_decoder_attn(data, opt)
+        decoder_attn.name = 'decoder_attn'
+        decoder_out = decoder_attn({top_h, inputs[2]})
      else
-	decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
-	decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
+        decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
+        decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
      end
      if dropout > 0 then
-	decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
+        decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
      end     
      table.insert(outputs, decoder_out)
   end
@@ -149,6 +151,15 @@ function make_decoder_attn(data, opt, simple)
    local softmax_attn = nn.SoftMax()
    softmax_attn.name = 'softmax_attn'
    attn = softmax_attn(attn)
+
+   -- sample (hard attention)
+   if opt.attn_type == 'hard' then
+     local sampler = nn.ReinforceCategorical()
+     sampler.name = 'sampler'
+     attn = sampler(attn) -- one hot
+     -- TODO: can probably optimize something here since it's one hot
+     -- TODO: temperature?
+   end
    attn = nn.Replicate(1,2)(attn) -- batch_l x  1 x source_l
    
    -- apply attention to context
@@ -169,13 +180,18 @@ function make_generator(data, opt)
    local model = nn.Sequential()
    model:add(nn.Linear(opt.rnn_size, data.target_size))
    model:add(nn.LogSoftMax())
+
+   -- module will be added later
    local w = torch.ones(data.target_size)
    w[1] = 0
-   criterion = nn.ClassNLLCriterion(w)
+   if opt.attn_type == 'soft' then
+     criterion = nn.ClassNLLCriterion(w)
+   elseif opt.attn_type == 'hard' then
+     criterion = nn.ReinforceNLLCriterion(nil, w)
+   end
    criterion.sizeAverage = false
    return model, criterion
 end
-
 
 -- cnn Unit
 function make_cnn(input_size, kernel_width, num_kernels)

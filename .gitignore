@@ -4,6 +4,8 @@
 *.dict
 *.txt
 
+*.swp
+
 # Compiled Lua sources
 luac.out
 

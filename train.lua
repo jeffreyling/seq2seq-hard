@@ -35,6 +35,7 @@ cmd:option('-rnn_size', 500, [[Size of LSTM hidden states]])
 cmd:option('-word_vec_size', 500, [[Word embedding sizes]])
 cmd:option('-attn', 1, [[If = 1, use attention on the decoder side. If = 0, it uses the last
                        hidden state of the decoder as context at each time step.]])
+cmd:option('-attn_type', 'hard', [[Hard or soft attention on decoder side]])
 cmd:option('-brnn', 0, [[If = 1, use a bidirectional RNN. Hidden states of the fwd/bwd
                               RNNs are summed.]])
 cmd:option('-use_chars_enc', 0, [[If = 1, use character on the encoder 
@@ -219,17 +220,30 @@ function train(train_data, valid_data)
    end   
    for i = 1, opt.max_sent_l_src do
       if encoder_clones[i].apply then
-	 encoder_clones[i]:apply(function(m) m:setReuse() end)
+         encoder_clones[i]:apply(function(m) m:setReuse() end)
       end
       if opt.brnn == 1 then
-	 encoder_bwd_clones[i]:apply(function(m) m:setReuse() end)
+         encoder_bwd_clones[i]:apply(function(m) m:setReuse() end)
       end      
+   end
+
+   if opt.attn_type == 'hard' then
+     decoder_attn_layers = {}
+     sampler_layers = {}
    end
    for i = 1, opt.max_sent_l_targ do
       if decoder_clones[i].apply then
-	 decoder_clones[i]:apply(function(m) m:setReuse() end)
+         decoder_clones[i]:apply(function(m) m:setReuse() end)
       end
    end   
+   if opt.attn_type == 'hard' then
+     for i = 1, opt.max_sent_l_targ do
+       decoder_clones[i]:apply(get_RL_layer)
+       decoder_attn_layers[i]:apply(get_RL_layer)
+     end
+   end
+   -- set criterion modules for broadcasting reward
+   criterion.modules = sampler_layers
 
    local h_init = torch.zeros(opt.max_batch_l, opt.rnn_size)
    if opt.gpuid >= 0 then
@@ -735,15 +749,25 @@ end
 function get_layer(layer)
    if layer.name ~= nil then
       if layer.name == 'word_vecs_dec' then
-	 table.insert(word_vec_layers, layer)
+         table.insert(word_vec_layers, layer)
       elseif layer.name == 'word_vecs_enc' then
-	 table.insert(word_vec_layers, layer)
+         table.insert(word_vec_layers, layer)
       elseif layer.name == 'charcnn_enc' or layer.name == 'mlp_enc' then
-	 local p, gp = layer:parameters()
-	 for i = 1, #p do
-	    table.insert(charcnn_layers, p[i])
-	    table.insert(charcnn_grad_layers, gp[i])
-	 end	 
+         local p, gp = layer:parameters()
+         for i = 1, #p do
+            table.insert(charcnn_layers, p[i])
+            table.insert(charcnn_grad_layers, gp[i])
+         end	 
+      end
+   end
+end
+
+function get_RL_layer(layer)
+   if layer.name ~= nil then
+      if layer.name == 'decoder_attn' then
+        table.insert(decoder_attn_layers, layer)
+      elseif layer.name == 'sampler' then
+        table.insert(sampler_layers, layer)
       end
    end
 end
@@ -831,7 +855,7 @@ function main()
 	 optStates[i] = {}
       end     
    end
-   
+
    if opt.gpuid >= 0 then
       for i = 1, #layers do	 
 	 if opt.gpuid2 >= 0 then 
