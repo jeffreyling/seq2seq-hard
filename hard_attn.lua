@@ -220,6 +220,9 @@ function ReinforceNLLCriterion:updateGradInput(input, target)
    -- learn the baseline reward
    --self.gradInput[2] = self.criterion:backward(baseline, self.reward)
    --self.gradInput[2] = self:fromBatch(self.gradInput[2], 1)
+   if self.sizeAverage then
+     self.gradInput:div(input:size(1))
+   end
    return self.gradInput
 end
 
