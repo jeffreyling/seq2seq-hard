@@ -141,10 +141,10 @@ end
 -- Modified ClassNLLCriterion
 local ReinforceNLLCriterion, parent = torch.class("nn.ReinforceNLLCriterion", "nn.Criterion")
 
-function ReinforceNLLCriterion:__init(modules, weights, sizeAverage)
+function ReinforceNLLCriterion:__init(modules, weights, sizeAverage, scale)
    parent.__init(self)
    self.modules = modules -- so it can call module:reinforce(reward)
-   --self.scale = scale or 1 -- scale of reward
+   self.scale = scale or 1 -- scale of reward
    --self.criterion = criterion or nn.MSECriterion() -- baseline criterion
    if sizeAverage ~= nil then
      self.sizeAverage = sizeAverage
@@ -160,6 +160,9 @@ function ReinforceNLLCriterion:__init(modules, weights, sizeAverage)
 end
 
 function ReinforceNLLCriterion:updateOutput(input, target)
+   assert(torch.type(input) == 'table')
+   local input = input[1]
+
    if type(target) == 'number' then
      if input:type() ~= 'torch.CudaTensor' then
        self.target = self.target:long()
@@ -171,19 +174,11 @@ function ReinforceNLLCriterion:updateOutput(input, target)
      self.target = target:long()
    end
 
-   --assert(torch.type(input) == 'table') -- not needed without baseline
    self.reward = self.reward or input.new()
-    -- TODO: optimize?
    self.reward = input:gather(2,target:view(target:size(1), 1))
    self.reward:resize(input:size(1))
+   self.reward:mul(self.scale)
 
-   --???
-   --if torch.type(self._maxIdx) ~= torch.type(target) then
-      --self._target = self._target or self._maxIdx.new()
-      --self._target:resize(target:size()):copy(target)
-      --target = self._target
-   --end
-   
    -- loss = -sum(reward) aka NLL
    self.output = -self.reward:sum()
    if self.sizeAverage then
@@ -192,34 +187,38 @@ function ReinforceNLLCriterion:updateOutput(input, target)
    return self.output
 end
 
--- TODO: baseline and stuff
-function ReinforceNLLCriterion:updateGradInput(input, target)
-   -- reduce variance of reward using baseline
-   --self.vrReward = self.vrReward or self.reward.new()
-   --self.vrReward:resizeAs(self.reward):copy(self.reward)
-   --self.vrReward:add(-1, baseline)
+-- TODO: consider making the baseline learned
+function ReinforceNLLCriterion:updateGradInput(inputTable, target)
+  local input = inputTable[1]
+  local baseline = inputTable[2]
 
+   -- reduce variance of reward using baseline
+   self.vrReward = self.vrReward or self.reward.new()
+   self.vrReward:resizeAs(self.reward):copy(self.reward)
+   self.vrReward:add(-baseline)
    if self.sizeAverage then
-      self.reward:div(input:size(1)) -- double check this?
+      self.vrReward:div(input:size(1)) -- double check this?
    end
    -- broadcast reward to modules
    for _, module in ipairs(self.modules) do
-     module:reinforce(self.reward)  
+     module:reinforce(self.vrReward)  
    end
-   
+
    -- zero gradInput
    self.gradInput:resizeAs(input):zero()
-   local ones = input.new()
-   ones = torch.ones(target:size(1), 1)
+   local ones = input.new():resize(target:size(1), 1):fill(1)
    if input:type() == 'torch.CudaTensor' then
      ones = ones:cuda()
    end
    self.gradInput:scatter(2, target:view(target:size(1), 1), -ones)
-   -- TODO: optimize?
 
    -- learn the baseline reward
    --self.gradInput[2] = self.criterion:backward(baseline, self.reward)
    --self.gradInput[2] = self:fromBatch(self.gradInput[2], 1)
+
+   if self.sizeAverage then
+     self.gradInput:div(input:size(1))
+   end
    return self.gradInput
 end
 

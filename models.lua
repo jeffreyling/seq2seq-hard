@@ -189,7 +189,7 @@ function make_generator(data, opt)
    elseif opt.attn_type == 'hard' then
      criterion = nn.ReinforceNLLCriterion(nil, w)
    end
-   criterion.sizeAverage = false
+   --criterion.sizeAverage = false -- why is this here?
    return model, criterion
 end
 
