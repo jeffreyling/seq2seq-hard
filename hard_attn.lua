@@ -90,10 +90,17 @@ end
 ------------------------------------------------------------------------
 local ReinforceCategorical, parent = torch.class("nn.ReinforceCategorical", "nn.Reinforce")
 
+function ReinforceCategorical:__init(semi_sampling_p, stochastic)
+  parent.__init(self, stochastic)
+  self.semi_sampling_p = semi_sampling_p or 1
+  self.entropy_scale = 0
+end
+
 function ReinforceCategorical:updateOutput(input)
    self.output:resizeAs(input)
    self._index = self._index or ((torch.type(input) == 'torch.CudaTensor') and torch.CudaTensor() or torch.LongTensor())
-   if self.stochastic or self.train ~= false then
+   self._do_sample = (torch.uniform() < self.semi_sampling_p)
+   if self._do_sample and (self.stochastic or self.train ~= false) then
       -- sample from categorical with p = input
       self._input = self._input or input.new()
       -- prevent division by zero error (see updateGradInput)
@@ -127,6 +134,11 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
    
    -- multiply by reward 
    self.gradInput:cmul(self:rewardAs(input))
+   -- add entropy term
+   self._gradEnt = self._input:clone()
+   self._gradEnt:log():add(1)
+   self.gradInput:add(self.entropy_scale, self._gradEnt)
+
    -- multiply by -1 ( gradient descent on input )
    self.gradInput:mul(-1)
    return self.gradInput

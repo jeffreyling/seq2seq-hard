@@ -154,7 +154,9 @@ function make_decoder_attn(data, opt, simple)
 
    -- sample (hard attention)
    if opt.attn_type == 'hard' then
-     local sampler = nn.ReinforceCategorical()
+     -- false for stochastic on valid
+     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, false)
+     sampler.entropy_scale = opt.entropy_scale
      sampler.name = 'sampler'
      attn = sampler(attn) -- one hot
      -- TODO: can probably optimize something here since it's one hot

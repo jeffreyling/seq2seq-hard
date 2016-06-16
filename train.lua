@@ -77,7 +77,10 @@ cmd:text("Options for hard attention")
 cmd:text("")
 
 -- hard attention specs (attn_type == 'hard')
-cmd:option('-reward_scale', 1, [[Scale reward by this factor]])
+cmd:option('-reward_scale', 0.1, [[Scale reward by this factor]])
+cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
+cmd:option('-semi_sampling_p', 0.5, [[Probability of using multinoulli sampling over passing
+                                    params through, set 1 to always sample]])
 
 cmd:text("")
 cmd:text("**Optimization options**")
