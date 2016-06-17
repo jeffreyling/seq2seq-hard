@@ -45,12 +45,7 @@ end
 
 -- a Reward Criterion will call this
 function Reinforce:reinforce(reward)
-   --parent.reinforce(self, reward)
-   if self.reward == nil then
-     self.reward = reward
-   else
-     self.reward:add(reward)
-   end
+   self.reward = reward
 end
 
 function Reinforce:updateOutput(input)
@@ -217,6 +212,7 @@ function ReinforceNLLCriterion:updateGradInput(inputTable, target)
    self.vrReward:resizeAs(self.reward):copy(self.reward)
    self.vrReward:add(-baseline)
    self.vrReward:mul(self.scale) -- scale 
+   self.vrReward:maskedFill(mask, 0) -- zero out padding samples
    if self.sizeAverage then
       self.vrReward:div(input:size(1))
    end
@@ -242,9 +238,6 @@ function ReinforceNLLCriterion:updateGradInput(inputTable, target)
 end
 
 function ReinforceNLLCriterion:type(type)
-   --self._maxVal = nil
-   --self._maxIdx = nil
-   --self._target = nil
    local module = self.module
    self.module = nil
    local ret = parent.type(self, type)

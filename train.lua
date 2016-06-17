@@ -456,9 +456,6 @@ function train(train_data, valid_data)
         if opt.brnn == 1 then
           encoder_bwd_grads:zero()
         end
-        for i,layer in ipairs(sampler_layers) do
-          layer.reward = nil
-        end
 
         local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
         local loss = 0
