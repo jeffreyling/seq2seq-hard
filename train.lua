@@ -375,7 +375,7 @@ function train(train_data, valid_data)
           d = data[batch_order[i]]
         end
         local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
-        local batch_l, target_l, source_l = d[5], d[6], d[7]
+        local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
 
         local encoder_grads = encoder_grad_proto[{{1, batch_l}, {1, source_l}}]
         local encoder_bwd_grads 
@@ -466,8 +466,10 @@ function train(train_data, valid_data)
             loss = loss + criterion:forward(pred, target_out[t]) -- modified by Jeffrey
             dl_dpred = criterion:backward(pred, target_out[t])
           elseif opt.attn_type == 'hard' then
-            loss = loss + criterion:forward({pred, baseline}, target_out[t])
-            dl_dpred = criterion:backward({pred, baseline}, target_out[t])
+            local mask = target_l_all:lt(t) -- mask for ignoring padding
+            local inp = {pred, baseline, mask, t}
+            loss = loss + criterion:forward(inp, target_out[t])
+            dl_dpred = criterion:backward(inp, target_out[t])
           end
           --dl_dpred:div(batch_l)
           local dl_dtarget = generator:backward(preds[t], dl_dpred)
@@ -757,8 +759,7 @@ function train(train_data, valid_data)
         if opt.attn_type == 'soft' then
           loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
         elseif opt.attn_type == 'hard' then
-          -- baseline doesn't matter for non-train
-          loss = loss + criterion:forward({pred, 0}, target_out[t])*batch_l -- added by Jeffrey
+          loss = loss + criterion:forward({pred, 0,}, target_out[t])*batch_l -- added by Jeffrey
         end
       end
       nll = nll + loss

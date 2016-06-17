@@ -189,7 +189,6 @@ function ReinforceNLLCriterion:updateOutput(input, target)
    self.reward = self.reward or input.new()
    self.reward = input:gather(2,target:view(target:size(1), 1))
    self.reward:resize(input:size(1))
-   self.reward:mul(self.scale)
 
    -- loss = -sum(reward) aka NLL
    self.output = -self.reward:sum()
@@ -201,32 +200,36 @@ end
 
 -- TODO: consider making the baseline learned
 function ReinforceNLLCriterion:updateGradInput(inputTable, target)
+  -- t is timestep of LSTM
   local input = inputTable[1]
   local baseline = inputTable[2]
+  local mask = inputTable[3]
+  local t = inputTable[4]
 
    -- reduce variance of reward using baseline
    self.vrReward = self.vrReward or self.reward.new()
    self.vrReward:resizeAs(self.reward):copy(self.reward)
    self.vrReward:add(-baseline)
+   --self.vrReward:mul(self.scale) -- scale 
+   --self.vrReward:maskedFill(mask, 0) -- zero out padding samples
    if self.sizeAverage then
-      self.vrReward:div(input:size(1)) -- double check this?
+      self.vrReward:div(input:size(1))
    end
    -- broadcast reward to modules
-   for _, module in ipairs(self.modules) do
+   for i, module in ipairs(self.modules) do
      module:reinforce(self.vrReward)  
+     --if i > t then break end -- reward only modules from t or before
    end
 
-   -- zero gradInput
+   -- gradInput
    self.gradInput:resizeAs(input):zero()
    local ones = input.new():resize(target:size(1), 1):fill(1)
    if input:type() == 'torch.CudaTensor' then
      ones = ones:cuda()
    end
    self.gradInput:scatter(2, target:view(target:size(1), 1), -ones)
+   --self.gradInput:maskedFill(mask:view(mask:size(1),1):expand(self.gradInput:size()), 0) -- zero out padding samples
 
-   -- learn the baseline reward
-   --self.gradInput[2] = self.criterion:backward(baseline, self.reward)
-   --self.gradInput[2] = self:fromBatch(self.gradInput[2], 1)
    if self.sizeAverage then
      self.gradInput:div(input:size(1))
    end

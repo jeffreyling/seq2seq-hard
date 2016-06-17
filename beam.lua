@@ -6,6 +6,7 @@ require 'nngraph'
 require 'models.lua'
 require 'data.lua'
 require 'util.lua'
+require 'hard_attn'
 
 stringx = require('pl.stringx')
 
@@ -160,30 +161,30 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
 
    if model_opt.init_dec == 1 then
       for L = 1, model_opt.num_layers do
-	 rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
-	    rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
-	 rnn_state_dec[L*2+model_opt.input_feed]:copy(
-	    rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
+         rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
+            rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
+         rnn_state_dec[L*2+model_opt.input_feed]:copy(
+            rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
       end
    end
    
    if model_opt.brnn == 1 then
       for i = 1, #rnn_state_enc do
-	 rnn_state_enc[i]:zero()
+         rnn_state_enc[i]:zero()
       end      
       for t = source_l, 1, -1 do
-	 local encoder_input = {source_input[t], table.unpack(rnn_state_enc)}
-	 local out = model[4]:forward(encoder_input)
-	 rnn_state_enc = out
-	 context[{{},t}]:add(out[#out])
+         local encoder_input = {source_input[t], table.unpack(rnn_state_enc)}
+         local out = model[4]:forward(encoder_input)
+         rnn_state_enc = out
+         context[{{},t}]:add(out[#out])
       end
       if model_opt.init_dec == 1 then
-	 for L = 1, model_opt.num_layers do
-	    rnn_state_dec[L*2-1+model_opt.input_feed]:add(
-	       rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
-	    rnn_state_dec[L*2+model_opt.input_feed]:add(
-	       rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))	    
-	 end	 
+         for L = 1, model_opt.num_layers do
+            rnn_state_dec[L*2-1+model_opt.input_feed]:add(
+               rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
+            rnn_state_dec[L*2+model_opt.input_feed]:add(
+               rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))            
+         end         
       end      
    end   
    context = context:expand(K, source_l, model_opt.rnn_size)
@@ -207,33 +208,33 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       attn_argmax[i] = {}
       local decoder_input1
       if model_opt.use_chars_dec == 1 then
-	 decoder_input1 = word2charidx_targ:index(1, next_ys:narrow(1,i-1,1):squeeze())
+         decoder_input1 = word2charidx_targ:index(1, next_ys:narrow(1,i-1,1):squeeze())
       else
-	 decoder_input1 = next_ys:narrow(1,i-1,1):squeeze()
-	 if opt.beam == 1 then
-	    decoder_input1 = torch.LongTensor({decoder_input1})
-	 end	
+         decoder_input1 = next_ys:narrow(1,i-1,1):squeeze()
+         if opt.beam == 1 then
+            decoder_input1 = torch.LongTensor({decoder_input1})
+         end        
       end
       local decoder_input
       if model_opt.attn == 1 then
-	 decoder_input = {decoder_input1, context, table.unpack(rnn_state_dec)}
+         decoder_input = {decoder_input1, context, table.unpack(rnn_state_dec)}
       else
-	 decoder_input = {decoder_input1, context[{{}, source_l}], table.unpack(rnn_state_dec)}
+         decoder_input = {decoder_input1, context[{{}, source_l}], table.unpack(rnn_state_dec)}
       end      
       local out_decoder = model[2]:forward(decoder_input)
       local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
       
       rnn_state_dec = {} -- to be modified later
       if model_opt.input_feed == 1 then
-	 table.insert(rnn_state_dec, out_decoder[#out_decoder])
+         table.insert(rnn_state_dec, out_decoder[#out_decoder])
       end      
       for j = 1, #out_decoder - 1 do
-	 table.insert(rnn_state_dec, out_decoder[j])
+         table.insert(rnn_state_dec, out_decoder[j])
       end
       out_float:resize(out:size()):copy(out)
       for k = 1, K do
-	 State.disallow(out_float:select(1, k))
-	 out_float[k]:add(scores[i-1][k])
+         State.disallow(out_float:select(1, k))
+         out_float[k]:add(scores[i-1][k])
       end
       -- All the scores available.
 
@@ -243,8 +244,8 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
        end
 
        if model_opt.start_symbol == 1 then
-	  decoder_softmax.output[{{},1}]:zero()
-	  decoder_softmax.output[{{},source_l}]:zero()
+          decoder_softmax.output[{{},1}]:zero()
+          decoder_softmax.output[{{},source_l}]:zero()
        end
        
        for k = 1, K do
@@ -259,13 +260,13 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                    diff = false
                 end
              end
-	     
+             
              if i < 2 or diff then
-		if model_opt.attn == 1 then
-		   max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
-		   attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
-		end		
-	        prev_ks[i][k] = prev_k
+                if model_opt.attn == 1 then
+                   max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
+                   attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
+                end                
+                prev_ks[i][k] = prev_k
                 next_ys[i][k] = y_i
                 scores[i][k] = score
                 flat_out[index[1]] = -1e9
@@ -275,61 +276,61 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
           end
        end
        for j = 1, #rnn_state_dec do
-	  rnn_state_dec[j]:copy(rnn_state_dec[j]:index(1, prev_ks[i]))
+          rnn_state_dec[j]:copy(rnn_state_dec[j]:index(1, prev_ks[i]))
        end
        end_hyp = states[i][1]
        end_score = scores[i][1]
        if model_opt.attn == 1 then
-	  end_attn_argmax = attn_argmax[i][1]
+          end_attn_argmax = attn_argmax[i][1]
        end       
        if end_hyp[#end_hyp] == END then
-	  done = true
-	  found_eos = true
+          done = true
+          found_eos = true
        else
-	  for k = 1, K do
-	     local possible_hyp = states[i][k]
-	     if possible_hyp[#possible_hyp] == END then
-		found_eos = true
-		if scores[i][k] > max_score then
-		   max_hyp = possible_hyp
-		   max_score = scores[i][k]
-		   if model_opt.attn == 1 then
-		      max_attn_argmax = attn_argmax[i][k]
-		   end		   
-		end
-	     end	     
-	  end	  
+          for k = 1, K do
+             local possible_hyp = states[i][k]
+             if possible_hyp[#possible_hyp] == END then
+                found_eos = true
+                if scores[i][k] > max_score then
+                   max_hyp = possible_hyp
+                   max_score = scores[i][k]
+                   if model_opt.attn == 1 then
+                      max_attn_argmax = attn_argmax[i][k]
+                   end                   
+                end
+             end             
+          end          
        end       
    end
    local gold_score = 0
    if opt.score_gold == 1 then
       rnn_state_dec = {}
       for i = 1, #init_fwd_dec do
-	 table.insert(rnn_state_dec, init_fwd_dec[i][{{1}}]:zero())
+         table.insert(rnn_state_dec, init_fwd_dec[i][{{1}}]:zero())
       end
       if model_opt.init_dec == 1 then
-	 for L = 1, model_opt.num_layers do
-	    rnn_state_dec[L*2]:copy(rnn_state_enc[L*2-1][{{1}}])
-	    rnn_state_dec[L*2+1]:copy(rnn_state_enc[L*2][{{1}}])
-	 end
+         for L = 1, model_opt.num_layers do
+            rnn_state_dec[L*2]:copy(rnn_state_enc[L*2-1][{{1}}])
+            rnn_state_dec[L*2+1]:copy(rnn_state_enc[L*2][{{1}}])
+         end
       end
       local target_l = gold:size(1) 
       for t = 2, target_l do
-	 local decoder_input1
-	 if model_opt.use_chars_dec == 1 then
-	    decoder_input1 = word2charidx_targ:index(1, gold[{{t-1}}])
-	 else
-	    decoder_input1 = gold[{{t-1}}]
-	 end
-	 local decoder_input = {decoder_input1, context[{{1}}], table.unpack(rnn_state_dec)}
-	 local out_decoder = model[2]:forward(decoder_input)
-	 local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
-	 rnn_state_dec = {} -- to be modified later
-	 table.insert(rnn_state_dec, out_decoder[#out_decoder])
-	 for j = 1, #out_decoder - 1 do
-	    table.insert(rnn_state_dec, out_decoder[j])
-	 end
-	 gold_score = gold_score + out[1][gold[t]]
+         local decoder_input1
+         if model_opt.use_chars_dec == 1 then
+            decoder_input1 = word2charidx_targ:index(1, gold[{{t-1}}])
+         else
+            decoder_input1 = gold[{{t-1}}]
+         end
+         local decoder_input = {decoder_input1, context[{{1}}], table.unpack(rnn_state_dec)}
+         local out_decoder = model[2]:forward(decoder_input)
+         local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+         rnn_state_dec = {} -- to be modified later
+         table.insert(rnn_state_dec, out_decoder[#out_decoder])
+         for j = 1, #out_decoder - 1 do
+            table.insert(rnn_state_dec, out_decoder[j])
+         end
+         gold_score = gold_score + out[1][gold[t]]
 
       end      
    end
@@ -348,7 +349,7 @@ function idx2key(file)
    for line in f:lines() do
       local c = {}
       for w in line:gmatch'([^%s]+)' do
-	 table.insert(c, w)
+         table.insert(c, w)
       end
       t[tonumber(c[2])] = c[1]
    end   
@@ -367,15 +368,15 @@ end
 function get_layer(layer)
    if layer.name ~= nil then
       if layer.name == 'decoder_attn' then
-	 decoder_attn = layer
+         decoder_attn = layer
       elseif layer.name:sub(1,3) == 'hop' then
-	 hop_attn = layer
+         hop_attn = layer
       elseif layer.name:sub(1,7) == 'softmax' then
-	 table.insert(softmax_layers, layer)
+         table.insert(softmax_layers, layer)
       elseif layer.name == 'word_vecs_enc' then
-	 word_vecs_enc = layer
+         word_vecs_enc = layer
       elseif layer.name == 'word_vecs_dec' then
-	 word_vecs_dec = layer
+         word_vecs_dec = layer
       end       
    end
 end
@@ -427,8 +428,8 @@ function word2charidx(word, char2idx, max_word_l, t)
       t[i] = char_idx
       i = i+1
       if i >= max_word_l then
-	 t[i] = END
-	 break
+         t[i] = END
+         break
       end
    end
    if i < max_word_l then
@@ -448,18 +449,18 @@ function wordidx2sent(sent, idx2word, source_str, attn, skip_end)
    end   
    for i = 2, end_i do -- skip START and END
       if sent[i] == UNK then
-	 if opt.replace_unk == 1 then
-	    local s = source_str[attn[i]]
-	    if phrase_table[s] ~= nil then
-	       print(s .. ':' ..phrase_table[s])
-	    end	    
-	    local r = phrase_table[s] or s
-	    table.insert(t, r)	    
-	 else
-	    table.insert(t, idx2word[sent[i]])
-	 end	 
+         if opt.replace_unk == 1 then
+            local s = source_str[attn[i]]
+            if phrase_table[s] ~= nil then
+               print(s .. ':' ..phrase_table[s])
+            end            
+            local r = phrase_table[s] or s
+            table.insert(t, r)            
+         else
+            table.insert(t, idx2word[sent[i]])
+         end         
       else
-	 table.insert(t, idx2word[sent[i]])	 
+         table.insert(t, idx2word[sent[i]])         
       end           
    end
    return table.concat(t, ' ')
@@ -493,7 +494,7 @@ function main()
       require 'cutorch'
       require 'cunn'
       if opt.cudnn == 1 then
-	 require 'cudnn'
+         require 'cudnn'
       end      
    end      
    print('loading ' .. opt.model .. '...')
@@ -503,11 +504,11 @@ function main()
    if opt.replace_unk == 1 then
       phrase_table = {}
       if path.exists(opt.srctarg_dict) then
-	 local f = io.open(opt.srctarg_dict,'r')
-	 for line in f:lines() do
-	    local c = line:split("|||")
-	    phrase_table[strip(c[1])] = c[2]
-	 end
+         local f = io.open(opt.srctarg_dict,'r')
+         for line in f:lines() do
+            local c = line:split("|||")
+            phrase_table[strip(c[1])] = c[2]
+         end
       end      
    end
 
@@ -533,8 +534,8 @@ function main()
    if model_opt.use_chars_dec == 1 then
       word2charidx_targ = torch.LongTensor(#idx2word_targ, model_opt.max_word_l):fill(PAD)
       for i = 1, #idx2word_targ do
-	 word2charidx_targ[i] = word2charidx(idx2word_targ[i], char2idx,
-					     model_opt.max_word_l, word2charidx_targ[i])
+         word2charidx_targ[i] = word2charidx(idx2word_targ[i], char2idx,
+                                             model_opt.max_word_l, word2charidx_targ[i])
       end      
    end  
    -- load gold labels if it exists
@@ -543,7 +544,7 @@ function main()
       gold = {}
       local file = io.open(opt.targ_file, 'r')
       for line in file:lines() do
-	 table.insert(gold, line)
+         table.insert(gold, line)
       end
    else
       opt.score_gold = 0
@@ -552,15 +553,15 @@ function main()
    if opt.gpuid >= 0 then
       cutorch.setDevice(opt.gpuid)
       for i = 1, #model do
-	 if opt.gpuid2 >= 0 then
-	    if i == 1 or i == 4 then
-	       cutorch.setDevice(opt.gpuid)
-	    else
-	       cutorch.setDevice(opt.gpuid2)
-	    end
-	 end	 	       
-	 model[i]:double():cuda()
-	 model[i]:evaluate()
+         if opt.gpuid2 >= 0 then
+            if i == 1 or i == 4 then
+               cutorch.setDevice(opt.gpuid)
+            else
+               cutorch.setDevice(opt.gpuid2)
+            end
+         end                        
+         model[i]:double():cuda()
+         model[i]:evaluate()
       end
    end
 
@@ -581,15 +582,15 @@ function main()
       h_init_dec = h_init_dec:cuda()
       cutorch.setDevice(opt.gpuid)
       if opt.gpuid2 >= 0 then
-	 cutorch.setDevice(opt.gpuid)
-	 context_proto = context_proto:cuda()	 
-	 cutorch.setDevice(opt.gpuid2)
-	 context_proto2 = torch.zeros(opt.beam, MAX_SENT_L, model_opt.rnn_size):cuda()
+         cutorch.setDevice(opt.gpuid)
+         context_proto = context_proto:cuda()         
+         cutorch.setDevice(opt.gpuid2)
+         context_proto2 = torch.zeros(opt.beam, MAX_SENT_L, model_opt.rnn_size):cuda()
       else
-	 context_proto = context_proto:cuda()
+         context_proto = context_proto:cuda()
       end
       if model_opt.attn == 1 then
-	 attn_layer = attn_layer:cuda()
+         attn_layer = attn_layer:cuda()
       end      
    end
    init_fwd_enc = {}
@@ -621,46 +622,46 @@ function main()
       print('SENT ' .. sent_id .. ': ' ..line)
       local source, source_str
       if model_opt.use_chars_enc == 0 then
-	 source, source_str = sent2wordidx(line, word2idx_src, model_opt.start_symbol)
+         source, source_str = sent2wordidx(line, word2idx_src, model_opt.start_symbol)
       else
-	 source, source_str = sent2charidx(line, char2idx, model_opt.max_word_l, model_opt.start_symbol)
+         source, source_str = sent2charidx(line, char2idx, model_opt.max_word_l, model_opt.start_symbol)
       end
       if opt.score_gold == 1 then
-	 target, target_str = sent2wordidx(gold[sent_id], word2idx_targ, 1)
+         target, target_str = sent2wordidx(gold[sent_id], word2idx_targ, 1)
       end
       state = State.initial(START)
       pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn = generate_beam(model,
-  		state, opt.beam, MAX_SENT_L, source, target)
+                  state, opt.beam, MAX_SENT_L, source, target)
       pred_score_total = pred_score_total + pred_score
       pred_words_total = pred_words_total + #pred - 1
       pred_sent = wordidx2sent(pred, idx2word_targ, source_str, attn, true)
       out_file:write(pred_sent .. '\n')      
       print('PRED ' .. sent_id .. ': ' .. pred_sent)
       if gold ~= nil then
-	 print('GOLD ' .. sent_id .. ': ' .. gold[sent_id])
-	 if opt.score_gold == 1 then
-	    print(string.format("PRED SCORE: %.4f, GOLD SCORE: %.4f", pred_score, gold_score))
-	    gold_score_total = gold_score_total + gold_score
-	    gold_words_total = gold_words_total + target:size(1) - 1	 	    
-	 end
+         print('GOLD ' .. sent_id .. ': ' .. gold[sent_id])
+         if opt.score_gold == 1 then
+            print(string.format("PRED SCORE: %.4f, GOLD SCORE: %.4f", pred_score, gold_score))
+            gold_score_total = gold_score_total + gold_score
+            gold_words_total = gold_words_total + target:size(1) - 1                     
+         end
       end
       if opt.n_best > 1 then
-	 for n = 1, opt.n_best do
-	    pred_sent_n = wordidx2sent(all_sents[n], idx2word_targ, source_str, all_attn[n], false)
-	    local out_n = string.format("%d ||| %s ||| %.4f", n, pred_sent_n, all_scores[n])
-	    print(out_n)
-	    out_file:write(out_n .. '\n')
-	 end	 
+         for n = 1, opt.n_best do
+            pred_sent_n = wordidx2sent(all_sents[n], idx2word_targ, source_str, all_attn[n], false)
+            local out_n = string.format("%d ||| %s ||| %.4f", n, pred_sent_n, all_scores[n])
+            print(out_n)
+            out_file:write(out_n .. '\n')
+         end         
       end
       
       print('')
    end
    print(string.format("PRED AVG SCORE: %.4f, PRED PPL: %.4f", pred_score_total / pred_words_total,
-		       math.exp(-pred_score_total/pred_words_total)))
+                       math.exp(-pred_score_total/pred_words_total)))
    if opt.score_gold == 1 then      
       print(string.format("GOLD AVG SCORE: %.4f, GOLD PPL: %.4f",
-			  gold_score_total / gold_words_total,
-			  math.exp(-gold_score_total/gold_words_total)))
+                          gold_score_total / gold_words_total,
+                          math.exp(-gold_score_total/gold_words_total)))
    end
    out_file:close()
 end
