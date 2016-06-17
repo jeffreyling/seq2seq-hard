@@ -46,7 +46,11 @@ end
 -- a Reward Criterion will call this
 function Reinforce:reinforce(reward)
    --parent.reinforce(self, reward)
-   self.reward = reward
+   if self.reward == nil then
+     self.reward = reward
+   else
+     self.reward:add(reward)
+   end
 end
 
 function Reinforce:updateOutput(input)
@@ -171,9 +175,10 @@ function ReinforceNLLCriterion:__init(modules, weights, sizeAverage, scale)
    self.gradInput = torch.Tensor()
 end
 
-function ReinforceNLLCriterion:updateOutput(input, target)
-   assert(torch.type(input) == 'table')
-   local input = input[1]
+function ReinforceNLLCriterion:updateOutput(inputTable, target)
+   assert(torch.type(inputTable) == 'table')
+   local input = inputTable[1]
+   local mask = inputTable[3]
 
    if type(target) == 'number' then
      if input:type() ~= 'torch.CudaTensor' then
@@ -189,6 +194,7 @@ function ReinforceNLLCriterion:updateOutput(input, target)
    self.reward = self.reward or input.new()
    self.reward = input:gather(2,target:view(target:size(1), 1))
    self.reward:resize(input:size(1))
+   self.reward:maskedFill(mask, 0) -- zero out padding samples
 
    -- loss = -sum(reward) aka NLL
    self.output = -self.reward:sum()
@@ -210,15 +216,14 @@ function ReinforceNLLCriterion:updateGradInput(inputTable, target)
    self.vrReward = self.vrReward or self.reward.new()
    self.vrReward:resizeAs(self.reward):copy(self.reward)
    self.vrReward:add(-baseline)
-   --self.vrReward:mul(self.scale) -- scale 
-   --self.vrReward:maskedFill(mask, 0) -- zero out padding samples
+   self.vrReward:mul(self.scale) -- scale 
    if self.sizeAverage then
       self.vrReward:div(input:size(1))
    end
    -- broadcast reward to modules
    for i, module in ipairs(self.modules) do
      module:reinforce(self.vrReward)  
-     --if i > t then break end -- reward only modules from t or before
+     if i > t then break end -- reward only modules from t or before
    end
 
    -- gradInput
@@ -228,7 +233,7 @@ function ReinforceNLLCriterion:updateGradInput(inputTable, target)
      ones = ones:cuda()
    end
    self.gradInput:scatter(2, target:view(target:size(1), 1), -ones)
-   --self.gradInput:maskedFill(mask:view(mask:size(1),1):expand(self.gradInput:size()), 0) -- zero out padding samples
+   self.gradInput:maskedFill(mask:view(mask:size(1),1):expand(self.gradInput:size()), 0) -- zero out padding samples
 
    if self.sizeAverage then
      self.gradInput:div(input:size(1))

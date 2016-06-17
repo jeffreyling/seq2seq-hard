@@ -456,6 +456,9 @@ function train(train_data, valid_data)
         if opt.brnn == 1 then
           encoder_bwd_grads:zero()
         end
+        for i,layer in ipairs(sampler_layers) do
+          layer.reward = nil
+        end
 
         local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
         local loss = 0
@@ -697,7 +700,7 @@ function train(train_data, valid_data)
     for i = 1, data:size() do
       local d = data[i]
       local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
-      local batch_l, target_l, source_l = d[5], d[6], d[7]
+      local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
       local rnn_state_enc = reset_state(init_fwd_enc, batch_l)
       local context = context_proto[{{1, batch_l}, {1, source_l}}]
       -- forward prop encoder
@@ -759,7 +762,8 @@ function train(train_data, valid_data)
         if opt.attn_type == 'soft' then
           loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
         elseif opt.attn_type == 'hard' then
-          loss = loss + criterion:forward({pred, 0,}, target_out[t])*batch_l -- added by Jeffrey
+          local mask = target_l_all:lt(t) -- mask for ignoring padding
+          loss = loss + criterion:forward({pred, 0, mask, t}, target_out[t])*batch_l -- added by Jeffrey
         end
       end
       nll = nll + loss
