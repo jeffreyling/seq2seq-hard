@@ -173,7 +173,7 @@ end
 function ReinforceNLLCriterion:updateOutput(inputTable, target)
    assert(torch.type(inputTable) == 'table')
    local input = inputTable[1]
-   local mask = inputTable[3]
+   local mask = inputTable[2]
 
    if type(target) == 'number' then
      if input:type() ~= 'torch.CudaTensor' then
@@ -203,24 +203,22 @@ end
 function ReinforceNLLCriterion:updateGradInput(inputTable, target)
   -- t is timestep of LSTM
   local input = inputTable[1]
-  local baseline = inputTable[2]
-  local mask = inputTable[3]
-  local t = inputTable[4]
+  local mask = inputTable[2]
 
-   -- reduce variance of reward using baseline
-   self.vrReward = self.vrReward or self.reward.new()
-   self.vrReward:resizeAs(self.reward):copy(self.reward)
-   self.vrReward:add(-baseline)
-   self.vrReward:mul(self.scale) -- scale 
-   self.vrReward:maskedFill(mask, 0) -- zero out padding samples
-   if self.sizeAverage then
-      self.vrReward:div(input:size(1))
-   end
-   -- broadcast reward to modules
-   for i, module in ipairs(self.modules) do
-     module:reinforce(self.vrReward)  
-     if i > t then break end -- reward only modules from t or before
-   end
+   ---- reduce variance of reward using baseline
+   --self.vrReward = self.vrReward or self.reward.new()
+   --self.vrReward:resizeAs(self.reward):copy(self.reward)
+   --self.vrReward:add(-baseline)
+   --self.vrReward:mul(self.scale) -- scale 
+   --self.vrReward:maskedFill(mask, 0) -- zero out padding samples
+   --if self.sizeAverage then
+      --self.vrReward:div(input:size(1))
+   --end
+   ---- broadcast reward to modules
+   --for i, module in ipairs(self.modules) do
+     --module:reinforce(self.vrReward)  
+     --if i > t then break end -- reward only modules from t or before
+   --end
 
    -- gradInput
    self.gradInput:resizeAs(input):zero()

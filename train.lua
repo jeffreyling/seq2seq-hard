@@ -457,6 +457,29 @@ function train(train_data, valid_data)
           encoder_bwd_grads:zero()
         end
 
+        -- TODO: think of a better way to do this within criterion
+        if opt.attn_type == 'hard' then
+          -- get complete reward
+          local total_reward
+          for t = 1, target_l do
+            local pred = generator:forward(preds[t])
+            local mask = target_l_all:lt(t) -- mask for ignoring padding
+            local inp = {pred, mask}
+            criterion:forward(inp, target_out[t])
+            if t == 1 then
+              total_reward = criterion.reward
+            else
+              total_reward:add(criterion.reward)
+            end
+          end
+          total_reward:add(-baseline)
+          total_reward:mul(opt.reward_scale)
+          total_reward:div(batch_l)
+          for i,module in ipairs(sampler_layers) do
+            module:reinforce(total_reward)
+          end
+        end
+
         local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
         local loss = 0
         for t = target_l, 1, -1 do
@@ -467,7 +490,7 @@ function train(train_data, valid_data)
             dl_dpred = criterion:backward(pred, target_out[t])
           elseif opt.attn_type == 'hard' then
             local mask = target_l_all:lt(t) -- mask for ignoring padding
-            local inp = {pred, baseline, mask, t}
+            local inp = {pred, mask}
             loss = loss + criterion:forward(inp, target_out[t])
             dl_dpred = criterion:backward(inp, target_out[t])
           end
@@ -760,7 +783,7 @@ function train(train_data, valid_data)
           loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
         elseif opt.attn_type == 'hard' then
           local mask = target_l_all:lt(t) -- mask for ignoring padding
-          loss = loss + criterion:forward({pred, 0, mask, t}, target_out[t])*batch_l -- added by Jeffrey
+          loss = loss + criterion:forward({pred, mask}, target_out[t])*batch_l -- added by Jeffrey
         end
       end
       nll = nll + loss
