@@ -77,10 +77,13 @@ cmd:text("Options for hard attention")
 cmd:text("")
 
 -- hard attention specs (attn_type == 'hard')
-cmd:option('-reward_scale', 0.1, [[Scale reward by this factor]])
+cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
 cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 0.5, [[Probability of using multinoulli sampling over passing
                                     params through, set 1 to always sample]])
+cmd:option('-baseline', 'average', [[What baseline to use. Options are `learned` and `average`]])
+cmd:option('-baseline_mix', 0.9, [[Mixing factor for averaged baseline, 0.9*b_k + 0.1*r]])
+cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
 
 cmd:text("")
 cmd:text("**Optimization options**")
@@ -247,13 +250,11 @@ function train(train_data, valid_data)
       end
    end   
    if opt.attn_type == 'hard' then
+     -- save stochastic layers
      for i = 1, opt.max_sent_l_targ do
        decoder_clones[i]:apply(get_RL_layer)
        decoder_attn_layers[i]:apply(get_RL_layer)
      end
-     -- set criterion modules for broadcasting reward
-     criterion.modules = sampler_layers
-     criterion.scale = opt.reward_scale
    end
 
    local h_init = torch.zeros(opt.max_batch_l, opt.rnn_size)
@@ -457,43 +458,42 @@ function train(train_data, valid_data)
           encoder_bwd_grads:zero()
         end
 
-        -- TODO: think of a better way to do this within criterion
-        if opt.attn_type == 'hard' then
-          -- get complete reward
-          local total_reward
-          for t = 1, target_l do
-            local pred = generator:forward(preds[t])
-            local mask = target_l_all:lt(t) -- mask for ignoring padding
-            local inp = {pred, mask}
-            criterion:forward(inp, target_out[t])
-            if t == 1 then
-              total_reward = criterion.reward
-            else
-              total_reward:add(criterion.reward)
-            end
-          end
-          total_reward:add(-baseline)
-          total_reward:mul(opt.reward_scale)
-          total_reward:div(batch_l)
-          for i,module in ipairs(sampler_layers) do
-            module:reinforce(total_reward)
-          end
-        end
-
         local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
         local loss = 0
+        local sum_reward -- for hard attn
+        local discount = opt.discount -- discount factor
         for t = target_l, 1, -1 do
           local pred = generator:forward(preds[t])
-          local dl_dpred
-          if opt.attn_type == 'soft' then
-            loss = loss + criterion:forward(pred, target_out[t]) -- modified by Jeffrey
-            dl_dpred = criterion:backward(pred, target_out[t])
-          elseif opt.attn_type == 'hard' then
-            local mask = target_l_all:lt(t) -- mask for ignoring padding
-            local inp = {pred, mask}
-            loss = loss + criterion:forward(inp, target_out[t])
-            dl_dpred = criterion:backward(inp, target_out[t])
+          if opt.attn_type == 'hard' then
+            -- TODO: consider discounted rewards
+            local b
+            if opt.baseline == 'learned' then
+              b = baseline_m:forward(preds[t])
+            elseif opt.baseline == 'average' then
+              b = baseline
+            end
+            local mask = target_l_all:lt(t)
+            local inp = {pred, b, mask}
+            reward_criterion:forward(inp, target_out[t])
+            if t == target_l then
+              sum_reward = reward_criterion.vrReward
+            else
+              sum_reward:mul(discount)
+              sum_reward:add(reward_criterion.vrReward)
+            end
+
+            -- broadcast reward
+            sampler_layers[t]:reinforce(sum_reward:clone())
+            if opt.baseline == 'learned' then
+              -- backprop for baseline
+              local dl_db = reward_criterion:backward(inp, target_out[t])[2]
+              baseline_m:backward(preds[t], dl_db)
+            end
           end
+
+          -- standard backprop
+          loss = loss + criterion:forward(pred, target_out[t]) -- modified by Jeffrey
+          local dl_dpred = criterion:backward(pred, target_out[t])
           --dl_dpred:div(batch_l)
           local dl_dtarget = generator:backward(preds[t], dl_dpred)
           drnn_state_dec[#drnn_state_dec]:add(dl_dtarget)
@@ -526,6 +526,9 @@ function train(train_data, valid_data)
 
         local grad_norm = 0
         grad_norm = grad_norm + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
+        if opt.attn_type == 'hard' then
+          grad_norm = grad_norm + grad_params[4]:norm()^2
+        end
 
         -- backward prop encoder
         if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
@@ -590,7 +593,11 @@ function train(train_data, valid_data)
 
         grad_norm = grad_norm + grad_params[1]:norm()^2
         if opt.brnn == 1 then
-          grad_norm = grad_norm + grad_params[4]:norm()^2
+          if opt.attn_type == 'hard' then
+            grad_norm = grad_norm + grad_params[5]:norm()^2
+          else
+            grad_norm = grad_norm + grad_params[4]:norm()^2
+          end
         end
         grad_norm = grad_norm^0.5	 
         if opt.brnn == 1 then
@@ -637,7 +644,9 @@ function train(train_data, valid_data)
         num_words_source = num_words_source + batch_l*source_l
         train_nonzeros = train_nonzeros + nonzeros
         train_loss = train_loss + loss*batch_l
-        baseline = 0.9 * baseline + 0.1 * (-loss) -- Jeffrey
+        if opt.baseline == 'average' then
+          baseline = 0.9 * baseline + 0.1 * sum_reward:sum() -- Jeffrey
+        end
         local time_taken = timer:time().real - start_time
         if i % opt.print_every == 0 then
           local stats = string.format('Epoch: %d, Batch: %d/%d, Batch size: %d, LR: %.4f, ',
@@ -779,12 +788,7 @@ function train(train_data, valid_data)
           table.insert(rnn_state_dec, out[j])
         end
         local pred = generator:forward(out[#out])
-        if opt.attn_type == 'soft' then
-          loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
-        elseif opt.attn_type == 'hard' then
-          local mask = target_l_all:lt(t) -- mask for ignoring padding
-          loss = loss + criterion:forward({pred, mask}, target_out[t])*batch_l -- added by Jeffrey
-        end
+        loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
       end
       nll = nll + loss
       total = total + nonzeros
@@ -870,6 +874,9 @@ function main()
       encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
       decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
       generator, criterion = make_generator(valid_data, opt)
+      if opt.attn_type == 'hard' then
+        baseline_m, reward_criterion = make_reinforce(valid_data, opt)
+      end
       if opt.brnn == 1 then
 	 encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
       end      
@@ -886,13 +893,23 @@ function main()
       encoder = model[1]:double()
       decoder = model[2]:double()      
       generator = model[3]:double()
-      if model_opt.brnn == 1 then
-	 encoder_bwd = model[4]:double()
-      end      
+      if model_opt.attn_type == 'hard' then
+        baseline_m = model[4]:double()
+        if model_opt.brnn == 1 then
+     encoder_bwd = model[5]:double()
+        end      
+      else
+        if model_opt.brnn == 1 then
+     encoder_bwd = model[4]:double()
+        end      
+      end
       _, criterion = make_generator(valid_data, opt)
    end   
    
    layers = {encoder, decoder, generator}
+   if opt.attn_type == 'hard' then
+     table.insert(layers, baseline_m)
+   end
    if opt.brnn == 1 then
       table.insert(layers, encoder_bwd)
    end
@@ -921,6 +938,9 @@ function main()
 	 cutorch.setDevice(opt.gpuid2) --criterion on gpu2
       end      
       criterion:cuda()      
+      if opt.attn_type == 'hard' then
+        reward_criterion:cuda()
+      end
    end
 
    -- these layers will be manipulated during training

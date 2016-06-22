@@ -159,7 +159,6 @@ function make_decoder_attn(data, opt, simple)
      sampler.entropy_scale = opt.entropy_scale
      sampler.name = 'sampler'
      attn = sampler(attn) -- one hot
-     -- TODO: can probably optimize something here since it's one hot
      -- TODO: temperature?
    end
    attn = nn.Replicate(1,2)(attn) -- batch_l x  1 x source_l
@@ -183,16 +182,20 @@ function make_generator(data, opt)
    model:add(nn.Linear(opt.rnn_size, data.target_size))
    model:add(nn.LogSoftMax())
 
-   -- module will be added later
    local w = torch.ones(data.target_size)
    w[1] = 0
-   if opt.attn_type == 'soft' then
-     criterion = nn.ClassNLLCriterion(w)
-   elseif opt.attn_type == 'hard' then
-     criterion = nn.ReinforceNLLCriterion(nil, w)
-   end
+   criterion = nn.ClassNLLCriterion(w)
    --criterion.sizeAverage = false -- why is this here?
    return model, criterion
+end
+
+function make_reinforce(data, opt)
+  local baseline = nn.Sequential()
+  baseline:add(nn.Linear(opt.rnn_size, 1))
+  local reward_criterion = nn.ReinforceNLLCriterion()
+  reward_criterion.scale = opt.reward_scale
+
+  return baseline, reward_criterion
 end
 
 -- cnn Unit

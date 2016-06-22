@@ -98,19 +98,26 @@ end
 function ReinforceCategorical:updateOutput(input)
    self.output:resizeAs(input)
    self._index = self._index or ((torch.type(input) == 'torch.CudaTensor') and torch.CudaTensor() or torch.LongTensor())
-   self._do_sample = (torch.uniform() < self.semi_sampling_p)
-   if self._do_sample and (self.stochastic or self.train ~= false) then
-      -- sample from categorical with p = input
-      self._input = self._input or input.new()
-      -- prevent division by zero error (see updateGradInput)
-      self._input:resizeAs(input):copy(input):add(0.00000001) 
-      input.multinomial(self._index, input, 1)
-      -- one hot encoding
+   if self.train ~= false then
+      -- do argmax at test time
+      _, self._index = input:max(2)
       self.output:zero()
       self.output:scatter(2, self._index, 1)
    else
-      -- use p for evaluation
-      self.output:copy(input)
+     self._do_sample = (torch.uniform() < self.semi_sampling_p)
+     if self._do_sample and self.stochastic then
+        -- sample from categorical with p = input
+        self._input = self._input or input.new()
+        -- prevent division by zero error (see updateGradInput)
+        self._input:resizeAs(input):copy(input):add(0.00000001) 
+        input.multinomial(self._index, input, 1)
+        -- one hot encoding
+        self.output:zero()
+        self.output:scatter(2, self._index, 1)
+     else
+        -- use p
+        self.output:copy(input)
+     end
    end
    return self.output
 end
@@ -152,28 +159,20 @@ end
 -- Modified ClassNLLCriterion
 local ReinforceNLLCriterion, parent = torch.class("nn.ReinforceNLLCriterion", "nn.Criterion")
 
-function ReinforceNLLCriterion:__init(modules, weights, sizeAverage, scale)
+function ReinforceNLLCriterion:__init(scale, criterion)
    parent.__init(self)
-   self.modules = modules -- so it can call module:reinforce(reward)
    self.scale = scale or 1 -- scale of reward
-   --self.criterion = criterion or nn.MSECriterion() -- baseline criterion
-   if sizeAverage ~= nil then
-     self.sizeAverage = sizeAverage
-   else
-     self.sizeAverage = true
-   end
-   if weights then
-     assert(weights:dim() == 1, "weights input should be 1-D Tensor")
-     self.weights = weights
-   end
+   self.sizeAverage = true
+   self.criterion = criterion or nn.MSECriterion() -- baseline criterion
 
-   self.gradInput = torch.Tensor()
+   self.gradInput = {torch.Tensor()}
 end
 
 function ReinforceNLLCriterion:updateOutput(inputTable, target)
    assert(torch.type(inputTable) == 'table')
    local input = inputTable[1]
-   local mask = inputTable[2]
+   local b = inputTable[2]
+   local mask = inputTable[3]
 
    if type(target) == 'number' then
      if input:type() ~= 'torch.CudaTensor' then
@@ -190,48 +189,47 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    self.reward = input:gather(2,target:view(target:size(1), 1))
    self.reward:resize(input:size(1))
    self.reward:maskedFill(mask, 0) -- zero out padding samples
+   -- subtract baseline
+   self.vrReward = self.vrReward or self.reward.new()
+   self.vrReward:resizeAs(self.reward):copy(self.reward)
+   if type(b) == 'number' then
+     self.vrReward:add(-b)
+   else
+     self.vrReward:add(-1, b)
+   end
+   self.vrReward:mul(self.scale)
+   if self.sizeAverage then
+      self.vrReward:div(input:size(1))
+   end
 
    -- loss = -sum(reward) aka NLL
+   -- this actually doesn't matter, we won't use it
    self.output = -self.reward:sum()
-   if self.sizeAverage then
-      self.output = self.output/input:size(1)
-   end
    return self.output
 end
 
 -- TODO: consider making the baseline learned
 function ReinforceNLLCriterion:updateGradInput(inputTable, target)
-  -- t is timestep of LSTM
   local input = inputTable[1]
-  local mask = inputTable[2]
+  local b = inputTable[2]
+  local mask = inputTable[3]
 
-   ---- reduce variance of reward using baseline
-   --self.vrReward = self.vrReward or self.reward.new()
-   --self.vrReward:resizeAs(self.reward):copy(self.reward)
-   --self.vrReward:add(-baseline)
-   --self.vrReward:mul(self.scale) -- scale 
-   --self.vrReward:maskedFill(mask, 0) -- zero out padding samples
-   --if self.sizeAverage then
-      --self.vrReward:div(input:size(1))
-   --end
-   ---- broadcast reward to modules
-   --for i, module in ipairs(self.modules) do
-     --module:reinforce(self.vrReward)  
-     --if i > t then break end -- reward only modules from t or before
-   --end
+  -- zero gradInput
+  self.gradInput[1]:resizeAs(input):zero()
+  -- baseline grad
+  self.criterion:forward(b, self.reward)
+  self.gradInput[2] = self.criterion:backward(b, self.reward)
+  self.gradInput[2]:maskedFill(mask, 0)
 
    -- gradInput
-   self.gradInput:resizeAs(input):zero()
-   local ones = input.new():resize(target:size(1), 1):fill(1)
-   if input:type() == 'torch.CudaTensor' then
-     ones = ones:cuda()
-   end
-   self.gradInput:scatter(2, target:view(target:size(1), 1), -ones)
-   self.gradInput:maskedFill(mask:view(mask:size(1),1):expand(self.gradInput:size()), 0) -- zero out padding samples
+   --self.gradInput:resizeAs(input):zero()
+   --local ones = input.new():resize(target:size(1), 1):fill(1)
+   --if input:type() == 'torch.CudaTensor' then
+     --ones = ones:cuda()
+   --end
+   --self.gradInput:scatter(2, target:view(target:size(1), 1), -ones)
+   --self.gradInput:maskedFill(mask:view(mask:size(1),1):expand(self.gradInput:size()), 0) -- zero out padding samples
 
-   if self.sizeAverage then
-     self.gradInput:div(input:size(1))
-   end
    return self.gradInput
 end
 
