@@ -36,11 +36,8 @@ nn.Criterion.toBatch = nn.Module.toBatch
 ------------------------------------------------------------------------
 local Reinforce, parent = torch.class("nn.Reinforce", "nn.Module")
 
-function Reinforce:__init(stochastic)
+function Reinforce:__init()
    parent.__init(self)
-   -- true makes it stochastic during evaluation and training
-   -- false makes it stochastic only during training
-   self.stochastic = stochastic
 end
 
 -- a Reward Criterion will call this
@@ -89,35 +86,59 @@ end
 ------------------------------------------------------------------------
 local ReinforceCategorical, parent = torch.class("nn.ReinforceCategorical", "nn.Reinforce")
 
-function ReinforceCategorical:__init(semi_sampling_p, stochastic)
-  parent.__init(self, stochastic)
+function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, eps_prob)
+  parent.__init(self)
   self.semi_sampling_p = semi_sampling_p or 1
-  self.entropy_scale = 0
+  self.entropy_scale = entropy_scale or 0
   self.through = false -- pass prob weights through
+  self.eps_prob = eps_prob or 1 -- prob of exploration
+end
+
+function ReinforceCategorical:_doArgmax(input)
+   _, self._index = input:max(2)
+   self.output:zero()
+   self.output:scatter(2, self._index, 1)
+end
+
+function ReinforceCategorical:_doSample(input)
+   self._do_sample = (torch.uniform() < self.semi_sampling_p)
+   if self._do_sample == false or self.stochastic == false then
+      -- use p
+      self.output:copy(input)
+   else
+      -- sample from categorical with p = input
+      self._input = self._input or input.new()
+      -- prevent division by zero error (see updateGradInput)
+      self._input:resizeAs(input):copy(input):add(0.00000001) 
+      input.multinomial(self._index, input, 1)
+      -- one hot encoding
+      self.output:zero()
+      self.output:scatter(2, self._index, 1)
+   end
 end
 
 function ReinforceCategorical:updateOutput(input)
    self.output:resizeAs(input)
    self._index = self._index or ((torch.type(input) == 'torch.CudaTensor') and torch.CudaTensor() or torch.LongTensor())
-   if self.train ~= false then
-      -- do argmax at test time
-      _, self._index = input:max(2)
-      self.output:zero()
-      self.output:scatter(2, self._index, 1)
+   if self.through == true then
+     -- identity
+     self.output:copy(input)
    else
-     self._do_sample = (torch.uniform() < self.semi_sampling_p)
-     if self._do_sample and self.stochastic and self.through == false then
-        -- sample from categorical with p = input
-        self._input = self._input or input.new()
-        -- prevent division by zero error (see updateGradInput)
-        self._input:resizeAs(input):copy(input):add(0.00000001) 
-        input.multinomial(self._index, input, 1)
-        -- one hot encoding
-        self.output:zero()
-        self.output:scatter(2, self._index, 1)
+     if self.train then
+       self._do_explore = (torch.uniform() < self.eps_prob)
+       if self._do_explore == true then
+         -- explore
+         self:_doSample(input)
+         self.explored = true
+       else
+         -- exploit
+         self:_doArgmax(input)
+         self.explored = false
+       end
      else
-        -- use p
-        self.output:copy(input)
+       assert(self.train == false)
+       -- do argmax at test time
+       self:_doArgmax(input)
      end
    end
    return self.output
@@ -137,21 +158,27 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      -- identity function
      self.gradInput:copy(gradOutput)
    else 
-     self.gradInput:copy(self.output)
-     self._input = self._input or input.new()
-     -- prevent division by zero error
-     self._input:resizeAs(input):copy(input):add(0.00000001) 
-     self.gradInput:cdiv(self._input)
-     
-     -- multiply by reward 
-     self.gradInput:cmul(self:rewardAs(input))
-     -- add entropy term
-     self._gradEnt = self._input:clone()
-     self._gradEnt:log():add(1)
-     self.gradInput:add(self.entropy_scale, self._gradEnt)
+     if self.explored then
+       self.gradInput:copy(self.output)
+       self._input = self._input or input.new()
+       -- prevent division by zero error
+       self._input:resizeAs(input):copy(input):add(0.00000001) 
+       self.gradInput:cdiv(self._input)
+       
+       -- multiply by reward 
+       self.gradInput:cmul(self:rewardAs(input))
+       -- add entropy term
+       self._gradEnt = self._input:clone()
+       self._gradEnt:log():add(1)
+       self.gradInput:add(self.entropy_scale, self._gradEnt)
 
-     -- multiply by -1 ( gradient descent on input )
-     self.gradInput:mul(-1)
+       -- multiply by -1 ( gradient descent on input )
+       self.gradInput:mul(-1)
+     else
+       -- ??? is this right?
+       self.gradInput:copy(self.output)
+       self.gradInput:mul(-1)
+     end
    end
    return self.gradInput
 end

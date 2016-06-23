@@ -155,7 +155,8 @@ function make_decoder_attn(data, opt, simple)
    -- sample (hard attention)
    if opt.attn_type == 'hard' then
      -- false for stochastic on valid
-     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, false)
+     local sampler = nn.ReinforceCategorical()
+     sampler.semi_sampling_p = opt.semi_sampling_p
      sampler.entropy_scale = opt.entropy_scale
      sampler.name = 'sampler'
      attn = sampler(attn) -- one hot
@@ -191,7 +192,10 @@ end
 
 function make_reinforce(data, opt)
   local baseline = nn.Sequential()
-  baseline:add(nn.Linear(opt.rnn_size, 1))
+  local lin = nn.Linear(opt.rnn_size, 1)
+  lin.bias:zero()
+  baseline:add(lin)
+
   local reward_criterion = nn.ReinforceNLLCriterion()
   reward_criterion.scale = opt.reward_scale
 

@@ -82,9 +82,14 @@ cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 0.5, [[Probability of using multinoulli sampling over passing
                                     params through, set 1 to always sample]])
 cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned` and `average`]])
-cmd:option('-baseline_mix', 0.9, [[Mixing factor for averaged baseline, 0.9*b_k + 0.1*r]])
+cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = b_k + lr*(r - b_k)]])
 cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
 cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
+cmd:option('-sum_reward', 0, [[Only useful with input_feed = 1, makes the reward cumulative
+                               over end of sequence. Equivalent to discount = 0]])
+cmd:option('-eps_greedy', 0, [[If = 1, do epsilon greedy with schedule 1/epoch for hard attention]])
+--cmd:option('-greedy_eps', 0.1, [[Epsilon greedy, in hard attention sampling do random with prob eps
+                                 --and argmax with prob 1-eps]]) -- for now let's do a schedule 1/epoch
 
 cmd:text("")
 cmd:text("**Optimization options**")
@@ -241,20 +246,29 @@ function train(train_data, valid_data)
       end      
    end
 
-   if opt.attn_type == 'hard' then
-     decoder_attn_layers = {}
-     sampler_layers = {}
-   end
    for i = 1, opt.max_sent_l_targ do
       if decoder_clones[i].apply then
          decoder_clones[i]:apply(function(m) m:setReuse() end)
       end
    end   
+
    if opt.attn_type == 'hard' then
      -- save stochastic layers
+     decoder_attn_layers = {}
+     sampler_layers = {}
      for i = 1, opt.max_sent_l_targ do
        decoder_clones[i]:apply(get_RL_layer)
        decoder_attn_layers[i]:apply(get_RL_layer)
+     end
+
+     if opt.baseline_method == 'average' then
+       -- baseline should be time dependent on target
+       if type(opt.baseline) == 'number' then
+         opt.baseline = {}
+         for t = 1, opt.max_sent_l_targ do
+           opt.baseline[t] = 0
+         end
+       end
      end
    end
 
@@ -430,14 +444,22 @@ function train(train_data, valid_data)
           context = context2
         end	 
 
-        if epoch <= opt.soft_anneal then
-          -- train with soft attention
-          for i, module in ipairs(sampler_layers) do
-            module.through = true
+        if opt.soft_anneal > 0 then
+          if epoch == 1 then
+            -- train with soft attention
+            for _, module in ipairs(sampler_layers) do
+              module.through = true
+            end
+          elseif epoch == opt.soft_anneal + 1 then
+            for _, module in ipairs(sampler_layers) do
+              module.through = false
+            end
           end
-        elseif epoch == opt.soft_anneal + 1 then
-          for i, module in ipairs(sampler_layers) do
-            module.through = false
+        end
+        if opt.eps_greedy == 1 then
+          for _, module in ipairs(sampler_layers) do
+            -- exploration schedule
+            module.eps_prob = 1/epoch
           end
         end
 
@@ -476,21 +498,26 @@ function train(train_data, valid_data)
         for t = target_l, 1, -1 do
           local pred = generator:forward(preds[t])
           if opt.attn_type == 'hard' then
-            -- TODO: consider discounted rewards
             local b
             if opt.baseline_method == 'learned' then
               b = baseline_m:forward(preds[t])
             elseif opt.baseline_method == 'average' then
-              b = opt.baseline
+              b = opt.baseline[t]
             end
             local mask = target_l_all:lt(t)
             local inp = {pred, b, mask}
             reward_criterion:forward(inp, target_out[t])
-            if t == target_l then
-              sum_reward = reward_criterion.vrReward
+            if opt.sum_reward == 1 then
+              -- cumulative reward
+              if t == target_l then
+                sum_reward = reward_criterion.vrReward
+              else
+                sum_reward:mul(discount)
+                sum_reward:add(reward_criterion.vrReward)
+              end
             else
-              sum_reward:mul(discount)
-              sum_reward:add(reward_criterion.vrReward)
+              -- single time step reward
+              sum_reward = reward_criterion.vrReward
             end
 
             -- broadcast reward
@@ -499,6 +526,8 @@ function train(train_data, valid_data)
               -- backprop for baseline
               local dl_db = reward_criterion:backward(inp, target_out[t])[2]
               baseline_m:backward(preds[t], dl_db)
+            elseif opt.baseline_method == 'average' then
+              opt.baseline[t] = opt.baseline[t] + opt.baseline_lr * (sum_reward:sum() - opt.baseline[t])
             end
           end
 
@@ -655,9 +684,6 @@ function train(train_data, valid_data)
         num_words_source = num_words_source + batch_l*source_l
         train_nonzeros = train_nonzeros + nonzeros
         train_loss = train_loss + loss*batch_l
-        if opt.baseline_method == 'average' then
-          opt.baseline = 0.9 * opt.baseline + 0.1 * sum_reward:sum() -- Jeffrey
-        end
         local time_taken = timer:time().real - start_time
         if i % opt.print_every == 0 then
           local stats = string.format('Epoch: %d, Batch: %d/%d, Batch size: %d, LR: %.4f, ',
@@ -669,16 +695,17 @@ function train(train_data, valid_data)
           num_words_source / time_taken,
           num_words_target / time_taken)			   
           print(stats)
+
+          --print('baselines:', torch.Tensor(opt.baseline):view(1,#opt.baseline))
         end
         if i % 200 == 0 then
           collectgarbage()
         end
       end
       return train_loss, train_nonzeros
-    end   
+    end
 
     local total_loss, total_nonzeros, batch_loss, batch_nonzeros
-    opt.baseline = 0 -- RL baseline
     for epoch = opt.start_epoch, opt.epochs do
       generator:training()
       if opt.num_shards > 0 then
@@ -904,6 +931,7 @@ function main()
       generator, criterion = make_generator(valid_data, opt)
       if opt.attn_type == 'hard' then
         baseline_m, reward_criterion = make_reinforce(valid_data, opt)
+        opt.baseline = 0 -- RL average
       end
       if opt.brnn == 1 then
 	 encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
@@ -917,6 +945,7 @@ function main()
       opt.rnn_size = model_opt.rnn_size
       opt.input_feed = model_opt.input_feed
       opt.attn = model_opt.attn
+      opt.attn_type = model_opt.attn_type
       opt.brnn = model_opt.brnn
       encoder = model[1]:double()
       decoder = model[2]:double()      
@@ -930,6 +959,9 @@ function main()
         if model_opt.brnn == 1 then
      encoder_bwd = model[4]:double()
         end      
+      end
+      if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'average' then
+        opt.baseline = model_opt.baseline
       end
       _, criterion = make_generator(valid_data, opt)
       if opt.attn_type == 'hard' then
