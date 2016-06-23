@@ -93,6 +93,7 @@ function ReinforceCategorical:__init(semi_sampling_p, stochastic)
   parent.__init(self, stochastic)
   self.semi_sampling_p = semi_sampling_p or 1
   self.entropy_scale = 0
+  self.through = false -- pass prob weights through
 end
 
 function ReinforceCategorical:updateOutput(input)
@@ -105,7 +106,7 @@ function ReinforceCategorical:updateOutput(input)
       self.output:scatter(2, self._index, 1)
    else
      self._do_sample = (torch.uniform() < self.semi_sampling_p)
-     if self._do_sample and self.stochastic then
+     if self._do_sample and self.stochastic and self.through == false then
         -- sample from categorical with p = input
         self._input = self._input or input.new()
         -- prevent division by zero error (see updateGradInput)
@@ -132,21 +133,26 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
    -- ------------ =   
    --     d p          0         otherwise
    self.gradInput:resizeAs(input):zero()
-   self.gradInput:copy(self.output)
-   self._input = self._input or input.new()
-   -- prevent division by zero error
-   self._input:resizeAs(input):copy(input):add(0.00000001) 
-   self.gradInput:cdiv(self._input)
-   
-   -- multiply by reward 
-   self.gradInput:cmul(self:rewardAs(input))
-   -- add entropy term
-   self._gradEnt = self._input:clone()
-   self._gradEnt:log():add(1)
-   self.gradInput:add(self.entropy_scale, self._gradEnt)
+   if self.through then
+     -- identity function
+     self.gradInput:copy(gradOutput)
+   else 
+     self.gradInput:copy(self.output)
+     self._input = self._input or input.new()
+     -- prevent division by zero error
+     self._input:resizeAs(input):copy(input):add(0.00000001) 
+     self.gradInput:cdiv(self._input)
+     
+     -- multiply by reward 
+     self.gradInput:cmul(self:rewardAs(input))
+     -- add entropy term
+     self._gradEnt = self._input:clone()
+     self._gradEnt:log():add(1)
+     self.gradInput:add(self.entropy_scale, self._gradEnt)
 
-   -- multiply by -1 ( gradient descent on input )
-   self.gradInput:mul(-1)
+     -- multiply by -1 ( gradient descent on input )
+     self.gradInput:mul(-1)
+   end
    return self.gradInput
 end
 

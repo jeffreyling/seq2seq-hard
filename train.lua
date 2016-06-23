@@ -81,9 +81,10 @@ cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
 cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 0.5, [[Probability of using multinoulli sampling over passing
                                     params through, set 1 to always sample]])
-cmd:option('-baseline', 'average', [[What baseline to use. Options are `learned` and `average`]])
+cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned` and `average`]])
 cmd:option('-baseline_mix', 0.9, [[Mixing factor for averaged baseline, 0.9*b_k + 0.1*r]])
 cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
+cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
 
 cmd:text("")
 cmd:text("**Optimization options**")
@@ -365,7 +366,6 @@ function train(train_data, valid_data)
       local start_time = timer:time().real
       local num_words_target = 0
       local num_words_source = 0
-      local baseline = 0 -- RL baseline
       
       for i = 1, data:size() do
         zero_table(grad_params, 'zero')
@@ -430,6 +430,17 @@ function train(train_data, valid_data)
           context = context2
         end	 
 
+        if epoch <= opt.soft_anneal then
+          -- train with soft attention
+          for i, module in ipairs(sampler_layers) do
+            module.through = true
+          end
+        elseif epoch == opt.soft_anneal + 1 then
+          for i, module in ipairs(sampler_layers) do
+            module.through = false
+          end
+        end
+
         local preds = {}
         local decoder_input
         for t = 1, target_l do
@@ -467,10 +478,10 @@ function train(train_data, valid_data)
           if opt.attn_type == 'hard' then
             -- TODO: consider discounted rewards
             local b
-            if opt.baseline == 'learned' then
+            if opt.baseline_method == 'learned' then
               b = baseline_m:forward(preds[t])
-            elseif opt.baseline == 'average' then
-              b = baseline
+            elseif opt.baseline_method == 'average' then
+              b = opt.baseline
             end
             local mask = target_l_all:lt(t)
             local inp = {pred, b, mask}
@@ -484,7 +495,7 @@ function train(train_data, valid_data)
 
             -- broadcast reward
             sampler_layers[t]:reinforce(sum_reward:clone())
-            if opt.baseline == 'learned' then
+            if opt.baseline_method == 'learned' then
               -- backprop for baseline
               local dl_db = reward_criterion:backward(inp, target_out[t])[2]
               baseline_m:backward(preds[t], dl_db)
@@ -526,7 +537,7 @@ function train(train_data, valid_data)
 
         local grad_norm = 0
         grad_norm = grad_norm + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
-        if opt.attn_type == 'hard' then
+        if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
           grad_norm = grad_norm + grad_params[4]:norm()^2
         end
 
@@ -593,7 +604,7 @@ function train(train_data, valid_data)
 
         grad_norm = grad_norm + grad_params[1]:norm()^2
         if opt.brnn == 1 then
-          if opt.attn_type == 'hard' then
+          if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
             grad_norm = grad_norm + grad_params[5]:norm()^2
           else
             grad_norm = grad_norm + grad_params[4]:norm()^2
@@ -644,8 +655,8 @@ function train(train_data, valid_data)
         num_words_source = num_words_source + batch_l*source_l
         train_nonzeros = train_nonzeros + nonzeros
         train_loss = train_loss + loss*batch_l
-        if opt.baseline == 'average' then
-          baseline = 0.9 * baseline + 0.1 * sum_reward:sum() -- Jeffrey
+        if opt.baseline_method == 'average' then
+          opt.baseline = 0.9 * opt.baseline + 0.1 * sum_reward:sum() -- Jeffrey
         end
         local time_taken = timer:time().real - start_time
         if i % opt.print_every == 0 then
@@ -667,6 +678,7 @@ function train(train_data, valid_data)
     end   
 
     local total_loss, total_nonzeros, batch_loss, batch_nonzeros
+    opt.baseline = 0 -- RL baseline
     for epoch = opt.start_epoch, opt.epochs do
       generator:training()
       if opt.num_shards > 0 then
@@ -726,6 +738,7 @@ function train(train_data, valid_data)
 
     local nll = 0
     local total = 0
+      --local asdf_bit = 1 -- TODO: delete this
     for i = 1, data:size() do
       local d = data[i]
       local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
@@ -788,6 +801,21 @@ function train(train_data, valid_data)
           table.insert(rnn_state_dec, out[j])
         end
         local pred = generator:forward(out[#out])
+          -- TODO: delete this
+          --if asdf_bit == 1 then
+            --local asdf_max, asdf_idx = pred:max(2)
+            --print('attn:', sampler_layers[t].output)
+            --print('pred:', asdf_idx)
+            --print('source:', source)
+            --local x = io.read()
+            --if x == 'asdf' then asdf_bit = 0 end
+          --end
+        --for i = 1, pred:size(1) do
+          --print('attn:', sampler_layers[t].output)
+          --print('pred:', asdf_max[i])
+          --print('source:', source:select(2,i))
+        --end
+        -- TODO: delete this
         loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
       end
       nll = nll + loss
@@ -893,7 +921,7 @@ function main()
       encoder = model[1]:double()
       decoder = model[2]:double()      
       generator = model[3]:double()
-      if model_opt.attn_type == 'hard' then
+      if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'learned' then
         baseline_m = model[4]:double()
         if model_opt.brnn == 1 then
      encoder_bwd = model[5]:double()
@@ -904,6 +932,9 @@ function main()
         end      
       end
       _, criterion = make_generator(valid_data, opt)
+      if opt.attn_type == 'hard' then
+        _, reward_criterion = make_reinforce(valid_data, opt)
+      end
    end   
    
    layers = {encoder, decoder, generator}
