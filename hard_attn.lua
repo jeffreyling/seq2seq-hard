@@ -100,9 +100,10 @@ function ReinforceCategorical:_doArgmax(input)
    self.output:scatter(2, self._index, 1)
 end
 
+-- many samples???
 function ReinforceCategorical:_doSample(input)
    self._do_sample = (torch.uniform() < self.semi_sampling_p)
-   if self._do_sample == false or self.stochastic == false then
+   if self._do_sample == false then
       -- use p
       self.output:copy(input)
    else

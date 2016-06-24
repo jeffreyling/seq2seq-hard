@@ -87,9 +87,7 @@ cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
 cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
 cmd:option('-sum_reward', 0, [[Only useful with input_feed = 1, makes the reward cumulative
                                over end of sequence. Equivalent to discount = 0]])
-cmd:option('-eps_greedy', 0, [[If = 1, do epsilon greedy with schedule 1/epoch for hard attention]])
---cmd:option('-greedy_eps', 0.1, [[Epsilon greedy, in hard attention sampling do random with prob eps
-                                 --and argmax with prob 1-eps]]) -- for now let's do a schedule 1/epoch
+cmd:option('-num_samples', 10, [[Number of times to sample for each data point (most people do 1)]])
 
 cmd:text("")
 cmd:text("**Optimization options**")
@@ -456,12 +454,6 @@ function train(train_data, valid_data)
             end
           end
         end
-        if opt.eps_greedy == 1 then
-          for _, module in ipairs(sampler_layers) do
-            -- exploration schedule
-            module.eps_prob = 1/epoch
-          end
-        end
 
         local preds = {}
         local decoder_input
@@ -742,6 +734,7 @@ function train(train_data, valid_data)
           torch.save(savefile, {{encoder, decoder, generator, encoder_bwd}, opt})
         end
       end      
+
     end
     -- save final model
     local savefile = string.format('%s_final.t7', opt.savefile)
@@ -930,7 +923,11 @@ function main()
       decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
       generator, criterion = make_generator(valid_data, opt)
       if opt.attn_type == 'hard' then
-        baseline_m, reward_criterion = make_reinforce(valid_data, opt)
+        if opt.baseline_method == 'learned' then
+          baseline_m, reward_criterion = make_reinforce(valid_data, opt)
+        else
+          _, reward_criterion = make_reinforce(valid_data, opt)
+        end
         opt.baseline = 0 -- RL average
       end
       if opt.brnn == 1 then
@@ -970,7 +967,7 @@ function main()
    end   
    
    layers = {encoder, decoder, generator}
-   if opt.attn_type == 'hard' then
+   if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
      table.insert(layers, baseline_m)
    end
    if opt.brnn == 1 then
