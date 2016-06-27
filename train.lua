@@ -49,7 +49,7 @@ cmd:option('-reverse_src', 0, [[If = 1, reverse the source sequence. The origina
 cmd:option('-init_dec', 1, [[Initialize the hidden/cell state of the decoder at time 
                            0 to be the last hidden/cell state of the encoder. If 0, 
                            the initial states of the decoder are set to zero vectors]])
-cmd:option('-input_feed', 1, [[If = 1, feed the context vector at each time step as additional
+cmd:option('-input_feed', 0, [[If = 1, feed the context vector at each time step as additional
                              input (vica concatenation with the word embeddings) to the decoder]])
 cmd:option('-multi_attn', 0, [[If > 0, then use a another attention layer on this layer of 
                            the decoder. For example, if num_layers = 3 and `multi_attn = 2`, 
@@ -79,7 +79,7 @@ cmd:text("")
 -- hard attention specs (attn_type == 'hard')
 cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
 cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
-cmd:option('-semi_sampling_p', 0.5, [[Probability of using multinoulli sampling over passing
+cmd:option('-semi_sampling_p', 1, [[Probability of using multinoulli sampling over passing
                                     params through, set 1 to always sample]])
 cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned` and `average`]])
 cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = b_k + lr*(r - b_k)]])
