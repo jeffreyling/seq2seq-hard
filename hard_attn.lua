@@ -86,12 +86,11 @@ end
 ------------------------------------------------------------------------
 local ReinforceCategorical, parent = torch.class("nn.ReinforceCategorical", "nn.Reinforce")
 
-function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, eps_prob)
+function ReinforceCategorical:__init(semi_sampling_p, entropy_scale)
   parent.__init(self)
   self.semi_sampling_p = semi_sampling_p or 1
   self.entropy_scale = entropy_scale or 0
   self.through = false -- pass prob weights through
-  self.eps_prob = eps_prob or 1 -- prob of exploration
 end
 
 function ReinforceCategorical:_doArgmax(input)
@@ -100,7 +99,6 @@ function ReinforceCategorical:_doArgmax(input)
    self.output:scatter(2, self._index, 1)
 end
 
--- many samples???
 function ReinforceCategorical:_doSample(input)
    self._do_sample = (torch.uniform() < self.semi_sampling_p)
    if self._do_sample == false then
@@ -126,16 +124,8 @@ function ReinforceCategorical:updateOutput(input)
      self.output:copy(input)
    else
      if self.train then
-       self._do_explore = (torch.uniform() < self.eps_prob)
-       if self._do_explore == true then
-         -- explore
-         self:_doSample(input)
-         self.explored = true
-       else
-         -- exploit
-         self:_doArgmax(input)
-         self.explored = false
-       end
+       -- sample
+       self:_doSample(input)
      else
        assert(self.train == false)
        -- do argmax at test time
@@ -159,27 +149,21 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      -- identity function
      self.gradInput:copy(gradOutput)
    else 
-     if self.explored then
-       self.gradInput:copy(self.output)
-       self._input = self._input or input.new()
-       -- prevent division by zero error
-       self._input:resizeAs(input):copy(input):add(0.00000001) 
-       self.gradInput:cdiv(self._input)
-       
-       -- multiply by reward 
-       self.gradInput:cmul(self:rewardAs(input))
-       -- add entropy term
-       self._gradEnt = self._input:clone()
-       self._gradEnt:log():add(1)
-       self.gradInput:add(self.entropy_scale, self._gradEnt)
+     self.gradInput:copy(self.output)
+     self._input = self._input or input.new()
+     -- prevent division by zero error
+     self._input:resizeAs(input):copy(input):add(0.00000001) 
+     self.gradInput:cdiv(self._input)
+     
+     -- multiply by reward 
+     self.gradInput:cmul(self:rewardAs(input))
+     -- add entropy term
+     self._gradEnt = self._input:clone()
+     self._gradEnt:log():add(1)
+     self.gradInput:add(self.entropy_scale, self._gradEnt)
 
-       -- multiply by -1 ( gradient descent on input )
-       self.gradInput:mul(-1)
-     else
-       -- ??? is this right?
-       self.gradInput:copy(self.output)
-       self.gradInput:mul(-1)
-     end
+     -- multiply by -1 ( gradient descent on input )
+     self.gradInput:mul(-1)
    end
    return self.gradInput
 end
@@ -222,7 +206,7 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    self.reward = self.reward or input.new()
    self.reward = input:gather(2,target:view(target:size(1), 1))
    self.reward:resize(input:size(1))
-   self.reward:maskedFill(mask, 0) -- zero out padding samples
+   --self.reward:maskedFill(mask, 0) -- zero out padding samples -- NOOOO!O!!!!!
    -- subtract baseline
    self.vrReward = self.vrReward or self.reward.new()
    self.vrReward:resizeAs(self.reward):copy(self.reward)
@@ -235,6 +219,7 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    if self.sizeAverage then
       self.vrReward:div(input:size(1))
    end
+   self.vrReward:maskedFill(mask, 0)
 
    -- loss = -sum(reward) aka NLL
    -- this actually doesn't matter, we won't use it
@@ -242,7 +227,6 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    return self.output
 end
 
--- TODO: consider making the baseline learned
 function ReinforceNLLCriterion:updateGradInput(inputTable, target)
   local input = inputTable[1]
   local b = inputTable[2]
