@@ -79,7 +79,7 @@ cmd:text("")
 -- hard attention specs (attn_type == 'hard')
 cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
 cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
-cmd:option('-semi_sampling_p', 0.5, [[Probability of using multinoulli sampling over passing
+cmd:option('-semi_sampling_p', 1, [[Probability of using multinoulli sampling over passing
                                     params through, set 1 to always sample]])
 cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned` and `average`]])
 cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = b_k + lr*(r - b_k)]])
