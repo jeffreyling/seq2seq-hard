@@ -126,16 +126,7 @@ function ReinforceCategorical:updateOutput(input)
      self.output:copy(input)
    else
      if self.train then
-       self._do_explore = (torch.uniform() < self.eps_prob)
-       if self._do_explore == true then
-         -- explore
-         self:_doSample(input)
-         self.explored = true
-       else
-         -- exploit
-         self:_doArgmax(input)
-         self.explored = false
-       end
+       self:_doSample(input)
      else
        assert(self.train == false)
        -- do argmax at test time
@@ -159,27 +150,21 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      -- identity function
      self.gradInput:copy(gradOutput)
    else 
-     if self.explored then
-       self.gradInput:copy(self.output)
-       self._input = self._input or input.new()
-       -- prevent division by zero error
-       self._input:resizeAs(input):copy(input):add(0.00000001) 
-       self.gradInput:cdiv(self._input)
-       
-       -- multiply by reward 
-       self.gradInput:cmul(self:rewardAs(input))
-       -- add entropy term
-       self._gradEnt = self._input:clone()
-       self._gradEnt:log():add(1)
-       self.gradInput:add(self.entropy_scale, self._gradEnt)
+     self.gradInput:copy(self.output)
+     self._input = self._input or input.new()
+     -- prevent division by zero error
+     self._input:resizeAs(input):copy(input):add(0.00000001) 
+     self.gradInput:cdiv(self._input)
+     
+     -- multiply by reward 
+     self.gradInput:cmul(self:rewardAs(input))
+     -- add entropy term
+     self._gradEnt = self._input:clone()
+     self._gradEnt:log():add(1)
+     self.gradInput:add(self.entropy_scale, self._gradEnt)
 
-       -- multiply by -1 ( gradient descent on input )
-       self.gradInput:mul(-1)
-     else
-       -- ??? is this right?
-       self.gradInput:copy(self.output)
-       self.gradInput:mul(-1)
-     end
+     -- multiply by -1 ( gradient descent on input )
+     self.gradInput:mul(-1)
    end
    return self.gradInput
 end
