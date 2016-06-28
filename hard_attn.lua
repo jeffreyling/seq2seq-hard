@@ -206,7 +206,7 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    self.reward = self.reward or input.new()
    self.reward = input:gather(2,target:view(target:size(1), 1))
    self.reward:resize(input:size(1))
-   --self.reward:maskedFill(mask, 0) -- zero out padding samples -- NOOOO!O!!!!!
+
    -- subtract baseline
    self.vrReward = self.vrReward or self.reward.new()
    self.vrReward:resizeAs(self.reward):copy(self.reward)
