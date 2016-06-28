@@ -83,7 +83,7 @@ cmd:option('-semi_sampling_p', 1, [[Probability of using multinoulli sampling ov
                                     params through, set 1 to always sample]])
 cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned` and `average`]])
 cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = b_k + lr*(r - b_k)]])
--- TODO: note that without input feed, actions at time t do not affect future rewards
+-- note that without input feed, actions at time t do not affect future rewards
 --cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
 cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
 --cmd:option('-sum_reward', 0, [[Only useful with input_feed = 1, makes the reward cumulative
@@ -379,7 +379,25 @@ function train(train_data, valid_data)
       local start_time = timer:time().real
       local num_words_target = 0
       local num_words_source = 0
+      local num_samples = opt.num_samples
       
+      local cur_soft_anneal = false
+      if opt.soft_anneal > 0 then
+        if epoch == 1 then
+          -- train with soft attention
+          for _,module in ipairs(sampler_layers) do
+            module.through = true
+          end
+        elseif epoch == opt.soft_anneal + 1 then
+          for _,module in ipairs(sampler_layers) do
+            module.through = false
+          end
+        end
+        if epoch <= opt.soft_anneal then
+          cur_soft_anneal = true
+        end
+      end
+
       for i = 1, data:size() do
         zero_table(grad_params, 'zero')
         local d
@@ -396,7 +414,7 @@ function train(train_data, valid_data)
         for t = 1, #opt.baseline do
           baseline_updates[t] = 0
         end
-        for sample_i = 1, opt.num_samples do
+        for sample_i = 1, num_samples do
           local encoder_grads = encoder_grad_proto[{{1, batch_l}, {1, source_l}}]
           local encoder_bwd_grads 
           if opt.brnn == 1 then
@@ -448,19 +466,6 @@ function train(train_data, valid_data)
             context2:copy(context)
             context = context2
           end	 
-
-          if opt.soft_anneal > 0 then
-            if epoch == 1 then
-              -- train with soft attention
-              for _,module in ipairs(sampler_layers) do
-                module.through = true
-              end
-            elseif epoch == opt.soft_anneal + 1 then
-              for _,module in ipairs(sampler_layers) do
-                module.through = false
-              end
-            end
-          end
 
           local preds = {}
           for t = 1, target_l do
@@ -608,6 +613,11 @@ function train(train_data, valid_data)
             word_vec_layers[1].gradWeight:zero()
           end
 
+          if cur_soft_anneal then
+            -- no need to sample many times with soft
+            num_samples = 1
+            break
+          end
         end -- end sampling
 
         if opt.baseline_method == 'learned' then
@@ -617,13 +627,13 @@ function train(train_data, valid_data)
           baseline_m:backward(preds[t], dl_db)
         elseif opt.baseline_method == 'average' then
           for t = 1, #baseline_updates do
-            opt.baseline[t] = opt.baseline[t] + opt.baseline_lr * (baseline_updates[t]/opt.num_samples - opt.baseline[t])
+            opt.baseline[t] = opt.baseline[t] + opt.baseline_lr * (baseline_updates[t]/num_samples - opt.baseline[t])
           end
         end
 
         -- normalize by number of samples
         for j = 1, #grad_params do
-          grad_params[j]:div(opt.num_samples)
+          grad_params[j]:div(num_samples)
         end
 
         local grad_norm = 0
