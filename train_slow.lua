@@ -4,7 +4,7 @@ require 'hdf5'
 
 require 'data.lua'
 require 'util.lua'
-require 'models.lua'
+require 'models_slow.lua'
 require 'model_utils.lua'
 
 cmd = torch.CmdLine()
@@ -256,7 +256,7 @@ function train(train_data, valid_data)
      sampler_layers = {}
      -- save stochastic layers
      for i = 1, opt.max_sent_l_targ do
-       attn_layer_model:apply(get_RL_layer)
+       decoder_clones[i]:apply(get_RL_layer)
        decoder_attn_layers[i]:apply(get_RL_layer)
      end
 
@@ -311,8 +311,7 @@ function train(train_data, valid_data)
       table.insert(init_bwd_dec, h_init:clone())      
    end      
 
-   --dec_offset = 3 -- offset depends on input feeding
-   dec_offset = 2 -- offset depends on input feeding
+   dec_offset = 3 -- offset depends on input feeding
    if opt.input_feed == 1 then
       dec_offset = dec_offset + 1
    end
@@ -463,22 +462,19 @@ function train(train_data, valid_data)
             end
           end
 
-          local decoder_outs = {}
           local preds = {}
           local decoder_input
           for t = 1, target_l do
             decoder_clones[t]:training()
-            attn_layer_model:training()
             local decoder_input
             if opt.attn == 1 then
-              decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
+              decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
             else
-              decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
+              decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec[t-1])}
             end	    
             local out = decoder_clones[t]:forward(decoder_input)
             local next_state = {}
-            table.insert(preds, out[#out]) -- temporary: makes table the right size
-            table.insert(decoder_outs, out[#out])
+            table.insert(preds, out[#out])
             --if opt.input_feed == 1 then
               --table.insert(next_state, out[#out])
             --end
@@ -497,9 +493,6 @@ function train(train_data, valid_data)
           local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
           --local sum_reward -- for hard attn
           for t = target_l, 1, -1 do
-            local dl_dattn_dec
-            -- do many samples for hard attn
-            preds[t] = attn_layer_model:forward({decoder_outs[t], context}) -- sample
             local pred = generator:forward(preds[t])
             if opt.attn_type == 'hard' then
               -- broadcast reward
@@ -525,11 +518,9 @@ function train(train_data, valid_data)
             loss = loss + criterion:forward(pred, target_out[t])
             local dl_dpred = criterion:backward(pred, target_out[t])
             local dl_dtarget = generator:backward(preds[t], dl_dpred)
-            local dl_dattn_cur = attn_layer_model:backward({decoder_outs[t], context}, dl_dtarget)
-            encoder_grads:add(dl_dattn_cur[2]) -- context
 
-            drnn_state_dec[#drnn_state_dec]:add(dl_dattn_cur[1])
-            local decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
+            drnn_state_dec[#drnn_state_dec]:add(dl_dtarget)
+            local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
             -- accumulate encoder/decoder grads
             drnn_state_dec[#drnn_state_dec]:zero()
@@ -539,7 +530,7 @@ function train(train_data, valid_data)
             end
             for j = dec_offset, #dlst do
               drnn_state_dec[j-dec_offset+1]:copy(dlst[j])
-            end	    
+            end
           end
           word_vec_layers[2].gradWeight[1]:zero()
           if opt.fix_word_vecs_dec == 1 then
@@ -627,7 +618,6 @@ function train(train_data, valid_data)
 
         local grad_norm = 0
         grad_norm = grad_norm + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
-        grad_norm = grad_norm + grad_params[4]:norm()^2 -- attn_layer
         --if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
           --grad_norm = grad_norm + grad_params[4]:norm()^2
         --end
@@ -737,7 +727,7 @@ function train(train_data, valid_data)
         print('saving checkpoint to ' .. savefile)
         clean_layer(generator)
         if opt.brnn == 0 then
-          torch.save(savefile, {{encoder, decoder, generator, attn_layer_model}, opt})
+          torch.save(savefile, {{encoder, decoder, generator}, opt})
         else
           torch.save(savefile, {{encoder, decoder, generator, encoder_bwd}, opt})
         end
@@ -749,7 +739,7 @@ function train(train_data, valid_data)
     clean_layer(generator)
     print('saving final model to ' .. savefile)
     if opt.brnn == 0 then
-      torch.save(savefile, {{encoder:double(), decoder:double(), generator:double(), attn_layer_model:double()}, opt})
+      torch.save(savefile, {{encoder:double(), decoder:double(), generator:double()}, opt})
     else
       torch.save(savefile, {{encoder:double(), decoder:double(), generator:double(),
       encoder_bwd:double()}, opt})
@@ -760,7 +750,6 @@ function train(train_data, valid_data)
     encoder_clones[1]:evaluate()   
     decoder_clones[1]:evaluate() -- just need one clone
     generator:evaluate()
-    attn_layer_model:evaluate()
     if opt.brnn == 1 then
       encoder_bwd_clones[1]:evaluate()
     end
@@ -817,9 +806,9 @@ function train(train_data, valid_data)
       for t = 1, target_l do
         local decoder_input
         if opt.attn == 1 then
-          decoder_input = {target[t], table.unpack(rnn_state_dec)}
+          decoder_input = {target[t], context, table.unpack(rnn_state_dec)}
         else
-          decoder_input = {target[t], table.unpack(rnn_state_dec)}
+          decoder_input = {target[t], context[{{},source_l}], table.unpack(rnn_state_dec)}
         end	 
         local out = decoder_clones[1]:forward(decoder_input)
         rnn_state_dec = {}
@@ -829,8 +818,7 @@ function train(train_data, valid_data)
         for j = 1, #out-1 do
           table.insert(rnn_state_dec, out[j])
         end
-        local attn_out = attn_layer_model:forward({out[#out], context})
-        local pred = generator:forward(attn_out)
+        local pred = generator:forward(out[#out])
         loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
       end
       nll = nll + loss
@@ -916,7 +904,6 @@ function main()
    if opt.train_from:len() == 0 then
       encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
       decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
-      attn_layer_model = make_attn_layer(valid_data, opt) -- attn layer above lstm
       generator, criterion = make_generator(valid_data, opt)
       if opt.attn_type == 'hard' then
         if opt.baseline_method == 'learned' then
@@ -962,7 +949,7 @@ function main()
       end
    end   
    
-   layers = {encoder, decoder, generator, attn_layer_model}
+   layers = {encoder, decoder, generator}
    if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
      table.insert(layers, baseline_m)
    end
