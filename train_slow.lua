@@ -177,7 +177,7 @@ function train(train_data, valid_data)
       end      
       local p, gp = layers[i]:getParameters()
       if opt.train_from:len() == 0 then
-	 p:uniform(-opt.param_init, opt.param_init)
+   p:uniform(-opt.param_init, opt.param_init)
       end
       num_params = num_params + p:size(1)
       params[i] = p
@@ -463,7 +463,6 @@ function train(train_data, valid_data)
           end
 
           local preds = {}
-          local decoder_input
           for t = 1, target_l do
             decoder_clones[t]:training()
             local decoder_input
@@ -523,6 +522,17 @@ function train(train_data, valid_data)
             local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
             -- accumulate encoder/decoder grads
+            if opt.attn == 1 then
+              encoder_grads:add(dlst[2])
+              if opt.brnn == 1 then
+                encoder_bwd_grads:add(dlst[2])
+              end
+            else
+              encoder_grads[{{}, source_l}]:add(dlst[2])
+              if opt.brnn == 1 then
+                encoder_bwd_grads[{{}, 1}]:add(dlst[2])
+              end
+            end 
             drnn_state_dec[#drnn_state_dec]:zero()
             if opt.input_feed == 1 then
               assert(false, 'no input feed allowed right now!')

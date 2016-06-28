@@ -177,7 +177,7 @@ function train(train_data, valid_data)
       end      
       local p, gp = layers[i]:getParameters()
       if opt.train_from:len() == 0 then
-	 p:uniform(-opt.param_init, opt.param_init)
+   p:uniform(-opt.param_init, opt.param_init)
       end
       num_params = num_params + p:size(1)
       params[i] = p
@@ -252,13 +252,16 @@ function train(train_data, valid_data)
    end   
 
    if opt.attn_type == 'hard' then
-     decoder_attn_layers = {}
-     sampler_layers = {}
      -- save stochastic layers
-     for i = 1, opt.max_sent_l_targ do
-       attn_layer_model:apply(get_RL_layer)
-       decoder_attn_layers[i]:apply(get_RL_layer)
-     end
+     attn_layer_model:apply(get_RL_layer)
+     decoder_attn_layer:apply(get_RL_layer)
+
+     --decoder_attn_layers = {}
+     --sampler_layers = {}
+     --for i = 1, opt.max_sent_l_targ do
+       --attn_layer_model:apply(get_RL_layer)
+       --decoder_attn_layers[i]:apply(get_RL_layer)
+     --end
 
      if opt.baseline_method == 'average' then
        -- baseline should be time dependent on target
@@ -447,24 +450,22 @@ function train(train_data, valid_data)
         if opt.soft_anneal > 0 then
           if epoch == 1 then
             -- train with soft attention
-            for _,module in ipairs(sampler_layers) do
-              module.through = true
-            end
+            --for _,module in ipairs(sampler_layers) do
+              --module.through = true
+            --end
+            sampler_layer.through = true
           elseif epoch == opt.soft_anneal + 1 then
-            for _,module in ipairs(sampler_layers) do
-              module.through = false
-            end
+            sampler_layer.through = false
           end
         end
 
         local decoder_outs = {}
         local preds = {}
-        local decoder_input
         for t = 1, target_l do
           decoder_clones[t]:training()
-          attn_layer_model:training()
           local decoder_input
           if opt.attn == 1 then
+            -- context removed
             decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
           else
             decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
@@ -515,12 +516,12 @@ function train(train_data, valid_data)
               cur_reward:div(opt.num_samples)
               if sum_reward == nil then
                 -- single time step reward
-                sum_reward = cur_reward
+                sum_reward = cur_reward:clone()
               else
                 sum_reward:add(cur_reward)
               end
               -- broadcast
-              sampler_layers[t]:reinforce(cur_reward:clone())
+              sampler_layer:reinforce(cur_reward)
             end
 
             -- standard backprop
@@ -531,7 +532,7 @@ function train(train_data, valid_data)
             local dl_dattn_cur = attn_layer_model:backward({decoder_outs[t], context}, dl_dtarget)
             -- accumulate for further backprop
             if dl_dattn_dec == nil then
-              dl_dattn_dec = dl_dattn_cur[1]
+              dl_dattn_dec = dl_dattn_cur[1]:clone()
             else
               dl_dattn_dec:add(dl_dattn_cur[1])
             end
@@ -722,6 +723,7 @@ function train(train_data, valid_data)
     local total_loss, total_nonzeros, batch_loss, batch_nonzeros
     for epoch = opt.start_epoch, opt.epochs do
       generator:training()
+      attn_layer_model:training()
       if opt.num_shards > 0 then
         total_loss = 0
         total_nonzeros = 0	 
@@ -877,9 +879,9 @@ end
 function get_RL_layer(layer)
    if layer.name ~= nil then
       if layer.name == 'decoder_attn' then
-        table.insert(decoder_attn_layers, layer)
+        decoder_attn_layer = layer
       elseif layer.name == 'sampler' then
-        table.insert(sampler_layers, layer)
+        sampler_layer = layer
       end
    end
 end
