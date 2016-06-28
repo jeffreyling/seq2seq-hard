@@ -501,7 +501,6 @@ function train(train_data, valid_data)
             -- do many samples for hard attn
             preds[t] = attn_layer_model:forward({decoder_outs[t], context}) -- sample
             local pred = generator:forward(preds[t])
-            local cur_reward
             if opt.attn_type == 'hard' then
               -- broadcast reward
               local b
@@ -515,7 +514,7 @@ function train(train_data, valid_data)
               local inp = {pred, b, mask}
               reward_criterion:forward(inp, target_out[t])
 
-              cur_reward = reward_criterion.vrReward
+              local cur_reward = reward_criterion.vrReward
               -- broadcast
               sampler_layers[t]:reinforce(cur_reward:clone())
               -- update baselines
@@ -622,8 +621,8 @@ function train(train_data, valid_data)
         end
 
         -- normalize by number of samples
-        for _,gp in ipairs(grad_params) do
-          gp:div(opt.num_samples)
+        for j = 1, #grad_params do
+          grad_params[j]:div(opt.num_samples)
         end
 
         local grad_norm = 0
