@@ -78,7 +78,7 @@ cmd:text("")
 
 -- hard attention specs (attn_type == 'hard')
 cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
-cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
+cmd:option('-entropy_scale', 0, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 1, [[Probability of using multinoulli sampling over passing
                                     params through, set 1 to always sample]])
 cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned` and `average`]])
@@ -258,6 +258,9 @@ function train(train_data, valid_data)
      for i = 1, opt.max_sent_l_targ do
        decoder_clones[i]:apply(get_RL_layer)
        decoder_attn_layers[i]:apply(get_RL_layer)
+       sampler_layers[i].time_step = i -- very stupid hack
+       sampler_layers[i].entropy_scale = 0 -- control
+       sampler_layers[i].semi_sampling_p = 1 -- control
      end
 
      if opt.baseline_method == 'average' then
@@ -514,6 +517,7 @@ function train(train_data, valid_data)
               local cur_reward = reward_criterion.vrReward
               -- broadcast
               sampler_layers[t]:reinforce(cur_reward:clone())
+              --print('after reinforce:', sampler_layers[t].reward)
               -- update baselines
               baseline_updates[t] = baseline_updates[t] + cur_reward:sum()
             end
@@ -528,6 +532,11 @@ function train(train_data, valid_data)
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
             -- accumulate encoder/decoder grads
             if opt.attn == 1 then
+              --print('source length:', source_l, 'time step:', t)
+              --print('attn grads:')
+              ----print(dlst[2]:select(1,1))
+              --print(sampler_layers[t].gradInput)
+              --io.read()
               encoder_grads:add(dlst[2])
               if opt.brnn == 1 then
                 encoder_bwd_grads:add(dlst[2])
@@ -735,6 +744,8 @@ function train(train_data, valid_data)
       local train_score = math.exp(total_loss/total_nonzeros)
       print('Train', train_score)
       print(opt.train_perf)
+      print('baselines:')
+      print(opt.baseline)
       opt.train_perf[#opt.train_perf + 1] = train_score
       local score = eval(valid_data)
       opt.val_perf[#opt.val_perf + 1] = score
