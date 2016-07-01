@@ -27,15 +27,14 @@ function make_lstm(data, opt, model, use_chars)
   -- there will be 2*n+3 inputs
    local inputs = {}
    table.insert(inputs, nn.Identity()()) -- x (batch_size x max_word_l)
-   -- offset stays 0
-   --if model == 'dec' then
-      --table.insert(inputs, nn.Identity()()) -- all context (batch_size x source_l x rnn_size)
-      --offset = offset + 1
-      --if opt.input_feed == 1 then
-	 --table.insert(inputs, nn.Identity()()) -- prev context_attn (batch_size x rnn_size)
-	 --offset = offset + 1
-      --end
-   --end
+   if model == 'dec' then
+      table.insert(inputs, nn.Identity()()) -- all context (batch_size x source_l x rnn_size)
+      offset = offset + 1
+      if opt.input_feed == 1 then
+   table.insert(inputs, nn.Identity()()) -- prev context_attn (batch_size x rnn_size)
+   offset = offset + 1
+      end
+   end
    for L = 1,n do
       table.insert(inputs, nn.Identity()()) -- prev_c[L]
       table.insert(inputs, nn.Identity()()) -- prev_h[L]
@@ -118,45 +117,21 @@ function make_lstm(data, opt, model, use_chars)
   end
   if model == 'dec' then
      local top_h = outputs[#outputs]
-     local decoder_out = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(top_h) -- stupid hack
-     --if opt.attn == 1 then
-        --local decoder_attn = make_decoder_attn(data, opt)
-        --decoder_attn.name = 'decoder_attn'
-        --decoder_out = decoder_attn({top_h, inputs[2]})
-     --else
-        --decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
-        --decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
-     --end
-     --if dropout > 0 then
-        --decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
-     --end     
+     local decoder_out
+     if opt.attn == 1 then
+        local decoder_attn = make_decoder_attn(data, opt)
+        decoder_attn.name = 'decoder_attn'
+        decoder_out = decoder_attn({top_h, inputs[2]})
+     else
+        decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
+        decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
+     end
+     if dropout > 0 then
+        decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
+     end     
      table.insert(outputs, decoder_out)
   end
   return nn.gModule(inputs, outputs)
-end
-
-function make_attn_layer(data, opt)
-   local inputs = {}
-   table.insert(inputs, nn.Identity()()) -- lstm hidden state, plus hack
-   table.insert(inputs, nn.Identity()()) -- encoder context
-   local top_h = inputs[1]
-   local context = inputs[2]
-
-   local dropout = opt.dropout or 0
-
-   local decoder_out
-   if opt.attn == 1 then
-      local decoder_attn = make_decoder_attn(data, opt)
-      decoder_attn.name = 'decoder_attn'
-      decoder_out = decoder_attn({top_h, context})
-   else
-      decoder_out = nn.JoinTable(2)({top_h, context})
-      decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
-   end
-   if dropout > 0 then
-      decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
-   end     
-   return nn.gModule(inputs, {decoder_out})
 end
 
 function make_decoder_attn(data, opt, simple)
@@ -166,14 +141,16 @@ function make_decoder_attn(data, opt, simple)
    local inputs = {}
    table.insert(inputs, nn.Identity()())
    table.insert(inputs, nn.Identity()())
-   --local target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
-   local target_t = inputs[1]
+   local target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
    local context = inputs[2]
    simple = simple or 0
    -- get attention
 
    local attn = nn.MM()({context, nn.Replicate(1,3)(target_t)}) -- batch_l x source_l x 1
    attn = nn.Sum(3)(attn)
+   local mul_constant = nn.MulConstant(opt.temperature) -- multiply for temperature
+   mul_constant.name = 'mul_constant'
+   attn = mul_constant(attn)
    local softmax_attn = nn.SoftMax()
    softmax_attn.name = 'softmax_attn'
    attn = softmax_attn(attn)

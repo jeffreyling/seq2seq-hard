@@ -23,6 +23,22 @@ function nn.Module:reinforce(reward)
   end
 end
 
+-- for calculating optimal baselines
+function nn.Module:__init()
+  self.gradInput = torch.Tensor()
+  self.output = torch.Tensor()
+  self._type = self.output:type()
+
+  self.grad_params_list = {}
+end
+
+function nn.Module:backward(input, gradOutput, scale)
+  scale = scale or 1
+  self:updateGradInput(input, gradOutput)
+  self:accGradParameters(input, gradOutput, lr)
+  return self.gradInput
+end
+
 nn.Criterion.toBatch = nn.Module.toBatch
 
 --
@@ -124,19 +140,19 @@ function ReinforceCategorical:updateOutput(input)
      -- identity
      self.output:copy(input)
    else
-     if self.train then
-        --sample
-       --if self.time_step > self.output:size(2) then
-         self:_doSample(input)
-       --else
-         --self.output:zero()
-         --self.output:select(2,self.time_step):fill(1) -- very stupid hack
-       --end
-     else
-       assert(self.train == false)
-       -- do argmax at test time
-       self:_doArgmax(input)
-     end
+     --if self.time_step > self.output:size(2) then -- stupid hack
+       if self.train then
+          --sample
+          self:_doSample(input)
+       else
+         assert(self.train == false)
+         -- do argmax at test time
+         self:_doArgmax(input)
+       end
+     --else
+       --self.output:zero()
+       --self.output:select(2,self.time_step):fill(1) -- very stupid hack
+     --end
    end
    return self.output
 end
@@ -179,6 +195,12 @@ function ReinforceCategorical:type(type, tc)
    return parent.type(self, type, tc)
 end
 
+-- stupid hack
+function nn.MulConstant:updateGradInput(input, gradOutput)
+  self.gradInput:resizeAs(gradOutput)
+  self.gradInput:copy(gradOutput)
+  return self.gradInput
+end
 
 -- Modified ClassNLLCriterion
 local ReinforceNLLCriterion, parent = torch.class("nn.ReinforceNLLCriterion", "nn.Criterion")

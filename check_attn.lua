@@ -47,6 +47,7 @@ cmd:option('-cudnn', 0, [[If using character model, this should be = 1 if the ch
 
 -- check attn options
 cmd:option('-view_attn', 0, [[View attention weights at each time step]])
+cmd:option('-identity', 1, [[Autoencoder or not]])
 
 opt = cmd:parse(arg)
 
@@ -225,6 +226,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       else
          decoder_input = {decoder_input1, context[{{}, source_l}], table.unpack(rnn_state_dec)}
       end      
+      sampler_layer.time_step = i-1
       local out_decoder = model[2]:forward(decoder_input)
       local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
       
@@ -255,7 +257,12 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
        local decoder_max_attn, decoder_max_idx = decoder_softmax.output:max(2)
        
        if i <= source_l + 1 then
-         local ref_attn = (2*(i-1)) % source_l
+         local ref_attn
+         if opt.identity == 1 then
+           ref_attn = i-1
+         else
+           ref_attn = (2*(i-1)) % source_l
+         end
          if ref_attn == 0 then ref_attn = source_l end
          if decoder_max_idx[1][1] == ref_attn then
            correct_attn_counts = correct_attn_counts + 1
@@ -399,6 +406,8 @@ function get_layer(layer)
          word_vecs_enc = layer
       elseif layer.name == 'word_vecs_dec' then
          word_vecs_dec = layer
+      elseif layer.name == 'sampler' then
+         sampler_layer = layer
       end       
    end
 end
