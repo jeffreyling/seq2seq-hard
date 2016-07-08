@@ -135,6 +135,7 @@ cmd:option('-semi_sampling_p', 1, [[Probability of using multinoulli sampling ov
                                     params through, set 1 to always sample]])
 cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned` and `average`]])
 cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = b_k + lr*(r - b_k)]])
+cmd:option('-baseline_time_dep', 1, [[Make baselines time dependent]])
 -- note that without input feed, actions at time t do not affect future rewards
 cmd:option('-discount', 1.0, [[Discount factor for rewards, between 0 and 1]])
 cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
@@ -151,6 +152,7 @@ cmd:option('-save_batch', 0, [[Save at this batch]])
 cmd:option('-print_batch', 0, [[Print at this batch attention weights and stuff]])
 cmd:option('-reinit_encoder', 0, [[Reinit encoder weights]])
 cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
+cmd:option('-oracle_epochs', 0, [[Number of oracle epochs]])
 
 
 opt = cmd:parse(arg)
@@ -304,7 +306,7 @@ function train(train_data, valid_data)
 
      if opt.baseline_method == 'average' then
        -- baseline should be time dependent on target
-       if type(opt.baseline) == 'number' then
+       if opt.baseline_time_dep == 1 and type(opt.baseline) == 'number' then
          opt.baseline = {}
          for t = 1, opt.max_sent_l_targ do
            opt.baseline[t] = 0
@@ -442,12 +444,27 @@ function train(train_data, valid_data)
           cur_soft_anneal = true
         end
       end
+      
+      local curric_length = 13 -- starting length of curriculum
+      curric_length = curric_length + 10 * (epoch-1) -- reach max after 5 epochs
+      local max_curric_i = 0
+      if epoch <= opt.curriculum then
+        for i = 1, data:size() do
+          local d = data[i]
+          if d[7] > curric_length then break end -- check source_l
+          max_curric_i = i
+        end
+      end
 
       for i = 1, data:size() do
         zero_table(grad_params, 'zero')
         local d
         if epoch <= opt.curriculum then
-          d = data[i]
+          if torch.uniform() < 0.1 then
+            d = data[torch.random(1,data.length)]
+          else
+            d = data[torch.random(1, max_curric_i)]
+          end
         else
           d = data[batch_order[i]]
         end
@@ -518,6 +535,23 @@ function train(train_data, valid_data)
             context = context2
           end	 
 
+          if opt.oracle_epochs > 0 then
+            if epoch <= opt.oracle_epochs then
+              -- cheating oracle for attn
+              for t = 1, target_l do
+                sampler_layers[t].oracle = true
+                sampler_layers[t].time_step = t
+              end
+            else
+              for t = 1, target_l do
+                sampler_layers[t].oracle = false
+              end
+              -- fix encoder, decoder
+              opt.fix_encoder = 1
+              opt.fix_decoder = 1
+            end
+          end
+
           local preds = {}
           local attn_outs = {}
           for t = 1, target_l do
@@ -567,7 +601,11 @@ function train(train_data, valid_data)
                 assert(false, 'not working yet')
                 b = baseline_m:forward(preds[t])
               elseif opt.baseline_method == 'average' then
-                b = opt.baseline[t]
+                if opt.baseline_time_dep == 1 then
+                  b = opt.baseline[t]
+                else
+                  b = opt.baseline
+                end
               end
               local mask = target_l_all:lt(t)
               local inp = {pred, b, mask}
@@ -587,10 +625,15 @@ function train(train_data, valid_data)
 
               -- broadcast
               sampler_layers[t]:reinforce(cur_reward:clone())
-              sampler_layers[t].time_step = t
 
               -- update baselines
-              opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*cur_reward:sum()
+              if opt.baseline_method == 'average' then
+                if opt.baseline_time_dep == 1 then
+                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*cur_reward:sum()
+                else
+                  opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*cur_reward:sum()
+                end
+              end
             end
 
             -- standard backprop
@@ -872,7 +915,7 @@ function train(train_data, valid_data)
       local train_score = math.exp(total_loss/total_nonzeros)
       print('Train', train_score)
       print(opt.train_perf)
-      print('baselines:')
+      print('baseline:')
       print(opt.baseline)
       opt.train_perf[#opt.train_perf + 1] = train_score
       local score = eval(valid_data)

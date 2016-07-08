@@ -91,7 +91,9 @@ function ReinforceCategorical:__init(semi_sampling_p, entropy_scale)
   self.semi_sampling_p = semi_sampling_p or 1
   self.entropy_scale = entropy_scale or 0
   self.through = false -- pass prob weights through
-  self.time_step = 0 -- very stupid hack
+
+  self.time_step = 0
+  self.oracle = false -- stupid hack
 end
 
 function ReinforceCategorical:_doArgmax(input)
@@ -124,7 +126,10 @@ function ReinforceCategorical:updateOutput(input)
      -- identity
      self.output:copy(input)
    else
-     --if self.time_step > self.output:size(2) then -- stupid hack
+     if self.oracle and self.time_step <= self.output:size(2) then -- stupid hack
+       self.output:zero()
+       self.output:select(2,self.time_step):fill(1) -- very stupid hack
+     else
        if self.train then
           --sample
           self:_doSample(input)
@@ -133,10 +138,7 @@ function ReinforceCategorical:updateOutput(input)
          -- do argmax at test time
          self:_doArgmax(input)
        end
-     --else
-       --self.output:zero()
-       --self.output:select(2,self.time_step):fill(1) -- very stupid hack
-     --end
+     end
    end
    return self.output
 end
