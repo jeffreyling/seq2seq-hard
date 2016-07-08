@@ -48,6 +48,7 @@ cmd:option('-cudnn', 0, [[If using character model, this should be = 1 if the ch
 -- check attn options
 cmd:option('-view_attn', 0, [[View attention weights at each time step]])
 cmd:option('-identity', 1, [[Autoencoder or not]])
+cmd:option('-sup_attn', 0, [[Supervised attention]])
 
 opt = cmd:parse(arg)
 
@@ -234,7 +235,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       if model_opt.input_feed == 1 then
          table.insert(rnn_state_dec, out_decoder[#out_decoder])
       end      
-      for j = 1, #out_decoder - 1 do
+      for j = 1, #out_decoder - 1-opt.sup_attn do
          table.insert(rnn_state_dec, out_decoder[j])
       end
       out_float:resize(out:size()):copy(out)

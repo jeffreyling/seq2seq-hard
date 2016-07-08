@@ -23,22 +23,6 @@ function nn.Module:reinforce(reward)
   end
 end
 
--- for calculating optimal baselines
-function nn.Module:__init()
-  self.gradInput = torch.Tensor()
-  self.output = torch.Tensor()
-  self._type = self.output:type()
-
-  self.grad_params_list = {}
-end
-
-function nn.Module:backward(input, gradOutput, scale)
-  scale = scale or 1
-  self:updateGradInput(input, gradOutput)
-  self:accGradParameters(input, gradOutput, lr)
-  return self.gradInput
-end
-
 nn.Criterion.toBatch = nn.Module.toBatch
 
 --

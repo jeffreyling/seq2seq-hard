@@ -41,6 +41,7 @@ function make_lstm(data, opt, model, use_chars)
    end
 
    local x, input_size_L
+   local word_embed
    local outputs = {}
   for L = 1,n do
      -- c,h from previous timesteps
@@ -57,6 +58,7 @@ function make_lstm(data, opt, model, use_chars)
 	  end	  
 	  word_vecs.name = 'word_vecs' .. name
 	  x = word_vecs(inputs[1]) -- batch_size x word_vec_size
+    word_embed = x
        else
 	  local char_vecs = nn.LookupTable(data.char_size, opt.char_vec_size)
 	  char_vecs.name = 'word_vecs' .. name
@@ -70,12 +72,12 @@ function make_lstm(data, opt, model, use_chars)
 	  end	  
        end
        input_size_L = input_size
-       --if model == 'dec' then
-		--if opt.input_feed == 1 then
-			 --x = nn.JoinTable(2)({x, inputs[1+offset]}) -- batch_size x (word_vec_size + rnn_size)
-			 --input_size_L = input_size + rnn_size
-		--end	  
-       --end
+       if model == 'dec' then
+    if opt.input_feed == 1 then
+       x = nn.JoinTable(2)({x, inputs[1+offset]}) -- batch_size x (word_vec_size + rnn_size)
+       input_size_L = input_size + rnn_size
+    end	  
+       end
     else
        x = outputs[(L-1)*2]
        if opt.res_net == 1 and L > 2 then
@@ -118,10 +120,19 @@ function make_lstm(data, opt, model, use_chars)
   if model == 'dec' then
      local top_h = outputs[#outputs]
      local decoder_out
+     local attn_out
      if opt.attn == 1 then
         local decoder_attn = make_decoder_attn(data, opt)
         decoder_attn.name = 'decoder_attn'
-        decoder_out = decoder_attn({top_h, inputs[2]})
+        if opt.no_recur == 1 then -- HACK
+          decoder_out = decoder_attn({word_embed, inputs[2]})
+        else
+          decoder_out = decoder_attn({top_h, inputs[2]})
+        end
+        if opt.sup_attn == 1 then
+          attn_out = nn.SelectTable(1)(decoder_out)
+          decoder_out = nn.SelectTable(2)(decoder_out)
+        end
      else
         decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
         decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
@@ -129,9 +140,29 @@ function make_lstm(data, opt, model, use_chars)
      if dropout > 0 then
         decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
      end     
+     
+     if opt.sup_attn == 1 then
+       table.insert(outputs, attn_out)
+     end
      table.insert(outputs, decoder_out)
   end
   return nn.gModule(inputs, outputs)
+end
+
+function make_no_recur_encoder(data, opt)
+   local rnn_size = opt.rnn_size
+   local input_size = opt.word_vec_size
+    assert(rnn_size == input_size, 'size mismatch')
+
+   local inputs = {}
+   table.insert(inputs, nn.Identity()()) -- x (batch_size x max_word_l)
+
+   local x
+	  local word_vecs = nn.LookupTable(data.source_size, input_size)
+	  word_vecs.name = 'word_vecs_enc'
+	  x = word_vecs(inputs[1]) -- batch_size x word_vec_size
+    --local out = nn.Linear(input_size, rnn_size)(x)
+  return nn.gModule(inputs, {x})
 end
 
 function make_decoder_attn(data, opt, simple)
@@ -139,14 +170,22 @@ function make_decoder_attn(data, opt, simple)
    -- 3D tensor for context (batch_l x source_l x rnn_size)
 
    local inputs = {}
+   local outputs = {}
    table.insert(inputs, nn.Identity()())
    table.insert(inputs, nn.Identity()())
-   local target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
+   local target_t
+   if opt.no_recur == 1 then
+      target_t = inputs[1]
+   else
+      target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
+   end
    local context = inputs[2]
    simple = simple or 0
    -- get attention
 
-   local attn = nn.MM()({context, nn.Replicate(1,3)(target_t)}) -- batch_l x source_l x 1
+   local mm = nn.MM()
+   mm.name = 'MM'
+   local attn = mm({context, nn.Replicate(1,3)(target_t)}) -- batch_l x source_l x 1
    attn = nn.Sum(3)(attn)
    local mul_constant = nn.MulConstant(opt.temperature) -- multiply for temperature
    mul_constant.name = 'mul_constant'
@@ -154,6 +193,10 @@ function make_decoder_attn(data, opt, simple)
    local softmax_attn = nn.SoftMax()
    softmax_attn.name = 'softmax_attn'
    attn = softmax_attn(attn)
+   if opt.sup_attn == 1 then
+     table.insert(outputs, attn)
+   end
+
 
    -- sample (hard attention)
    if opt.attn_type == 'hard' then
@@ -163,7 +206,6 @@ function make_decoder_attn(data, opt, simple)
      sampler.entropy_scale = opt.entropy_scale
      sampler.name = 'sampler'
      attn = sampler(attn) -- one hot
-     -- TODO: temperature?
    end
    attn = nn.Replicate(1,2)(attn) -- batch_l x  1 x source_l
 
@@ -178,7 +220,9 @@ function make_decoder_attn(data, opt, simple)
    else
       context_output = nn.CAddTable()({context_combined,inputs[1]})
    end
-   return nn.gModule(inputs, {context_output})   
+   table.insert(outputs, context_output)
+   --return nn.gModule(inputs, {context_output})   
+   return nn.gModule(inputs, outputs)   
 end
 
 function make_generator(data, opt)
