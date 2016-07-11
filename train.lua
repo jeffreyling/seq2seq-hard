@@ -153,6 +153,9 @@ cmd:option('-print_batch', 0, [[Print at this batch attention weights and stuff]
 cmd:option('-reinit_encoder', 0, [[Reinit encoder weights]])
 cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
 cmd:option('-oracle_epochs', 0, [[Number of oracle epochs]])
+cmd:option('-zero_one', 0, [[Use zero-one loss instead of log-prob]])
+
+cmd:option('-stupid_hack', 0, [[Stupid hack]])
 
 
 opt = cmd:parse(arg)
@@ -427,6 +430,17 @@ function train(train_data, valid_data)
       local num_words_target = 0
       local num_words_source = 0
       local num_samples = opt.num_samples
+
+      if opt.stupid_hack == 1 then
+        if epoch == 2 then
+          opt.curriculum = 2
+        elseif epoch == 1 then
+          opt.oracle_epochs = 1
+        end
+        print('curric:', opt.curriculum)
+        print('oracle:', opt.oracle_epochs)
+      end
+
       
       local cur_soft_anneal = false
       if opt.soft_anneal > 0 then
@@ -612,6 +626,7 @@ function train(train_data, valid_data)
               reward_criterion:forward(inp, target_out[t])
 
               local cur_reward = reward_criterion.vrReward
+              local unnorm_reward = reward_criterion.reward
               if opt.input_feed == 1 then
                 if t == target_l then
                   -- cumulative reward
@@ -629,9 +644,9 @@ function train(train_data, valid_data)
               -- update baselines
               if opt.baseline_method == 'average' then
                 if opt.baseline_time_dep == 1 then
-                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*cur_reward:sum()
+                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*unnorm_reward:sum()
                 else
-                  opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*cur_reward:sum()
+                  opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*unnorm_reward:sum()
                 end
               end
             end

@@ -191,9 +191,10 @@ end
 -- Modified ClassNLLCriterion
 local ReinforceNLLCriterion, parent = torch.class("nn.ReinforceNLLCriterion", "nn.Criterion")
 
-function ReinforceNLLCriterion:__init(scale, criterion)
+function ReinforceNLLCriterion:__init(scale, zero_one, criterion)
    parent.__init(self)
    self.scale = scale or 1 -- scale of reward
+   self.zero_one = zero_one or 0 -- use zero one loss
    self.sizeAverage = true
    self.criterion = criterion or nn.MSECriterion() -- baseline criterion
 
@@ -218,7 +219,12 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    end
 
    self.reward = self.reward or input.new()
-   self.reward = input:gather(2,target:view(target:size(1), 1))
+   if self.zero_one == 1 then
+      local _, m_idx = input:max(2)
+      self.reward = m_idx:eq(target) -- check this
+   else
+     self.reward = input:gather(2,target:view(target:size(1), 1))
+   end
    self.reward:resize(input:size(1))
 
    -- subtract baseline
@@ -233,7 +239,7 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    if self.sizeAverage then
       self.vrReward:div(input:size(1))
    end
-   self.vrReward:maskedFill(mask, 0)
+   self.vrReward:maskedFill(mask, 0) -- mask
 
    -- loss = -sum(reward) aka NLL
    -- this actually doesn't matter, we won't use it
