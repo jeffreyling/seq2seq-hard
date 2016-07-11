@@ -154,6 +154,7 @@ cmd:option('-reinit_encoder', 0, [[Reinit encoder weights]])
 cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
 cmd:option('-oracle_epochs', 0, [[Number of oracle epochs]])
 cmd:option('-zero_one', 0, [[Use zero-one loss instead of log-prob]])
+cmd:option('-moving_stddev', 0, [[Use moving variance to normalize rewards (thus ignoring reward_scale)]])
 
 cmd:option('-stupid_hack', 0, [[Stupid hack]])
 
@@ -316,6 +317,12 @@ function train(train_data, valid_data)
          end
        end
      end
+     if opt.moving_stddev == 1 then
+       if opt.baseline_time_dep == 1 and type(opt.reward_variance) == 'number' then
+         opt.reward_variance = torch.zeros(opt.max_sent_l_targ)
+       end
+     end
+
    end
 
    local h_init = torch.zeros(opt.max_batch_l, opt.rnn_size)
@@ -621,8 +628,20 @@ function train(train_data, valid_data)
                   b = opt.baseline
                 end
               end
+
+              local scale
+              if opt.moving_stddev == 1 then
+                if type(opt.reward_variance) == 'number' then
+                  scale = 1/math.sqrt(opt.reward_variance + 1e-8)
+                else
+                  scale = 1/math.sqrt(opt.reward_variance + 1e-8)
+                end
+              else
+                scale = opt.reward_scale
+              end
+
               local mask = target_l_all:lt(t)
-              local inp = {pred, b, mask}
+              local inp = {pred, b, scale, mask}
               reward_criterion:forward(inp, target_out[t])
 
               local cur_reward = reward_criterion.vrReward
@@ -642,8 +661,18 @@ function train(train_data, valid_data)
               sampler_layers[t]:reinforce(cur_reward:clone())
 
               -- update baselines
+              if opt.moving_stddev == 1 then
+                if opt.baseline_time_dep == 1 then
+                  local update_var = (unnorm_reward:sum() - opt.baseline[t])^2
+                  opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*update_var
+                else
+                  local update_var = (unnorm_reward:sum() - opt.baseline)^2
+                  opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*update_var
+                end
+              end
               if opt.baseline_method == 'average' then
                 if opt.baseline_time_dep == 1 then
+                  -- use sum since we average within the reward criterion
                   opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*unnorm_reward:sum()
                 else
                   opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*unnorm_reward:sum()
@@ -1160,6 +1189,10 @@ function main()
           _, reward_criterion = make_reinforce(valid_data, opt)
         end
         opt.baseline = 0 -- RL average
+
+        if opt.moving_stddev == 1 then
+          opt.reward_variance = 0 -- RL stddev
+        end
       end
       if opt.brnn == 1 then
 	 encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
@@ -1190,6 +1223,10 @@ function main()
       end
       if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'average' then
         opt.baseline = model_opt.baseline
+        if model_opt.moving_stddev == 1 then
+          opt.moving_stddev = 1 
+          opt.reward_variance = model_opt.reward_variance
+        end
       end
       _, criterion = make_generator(valid_data, opt)
       if opt.attn_type == 'hard' then

@@ -191,9 +191,8 @@ end
 -- Modified ClassNLLCriterion
 local ReinforceNLLCriterion, parent = torch.class("nn.ReinforceNLLCriterion", "nn.Criterion")
 
-function ReinforceNLLCriterion:__init(scale, zero_one, criterion)
+function ReinforceNLLCriterion:__init(zero_one, criterion)
    parent.__init(self)
-   self.scale = scale or 1 -- scale of reward
    self.zero_one = zero_one or 0 -- use zero one loss
    self.sizeAverage = true
    self.criterion = criterion or nn.MSECriterion() -- baseline criterion
@@ -205,7 +204,8 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    assert(torch.type(inputTable) == 'table')
    local input = inputTable[1]
    local b = inputTable[2]
-   local mask = inputTable[3]
+   local scale = inputTable[3]
+   local mask = inputTable[4]
 
    if type(target) == 'number' then
      if input:type() ~= 'torch.CudaTensor' then
@@ -220,8 +220,9 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
 
    self.reward = self.reward or input.new()
    if self.zero_one == 1 then
+      -- zero one loss
       local _, m_idx = input:max(2)
-      self.reward = m_idx:eq(target) -- check this
+      self.reward = m_idx:eq(target)
    else
      self.reward = input:gather(2,target:view(target:size(1), 1))
    end
@@ -235,11 +236,15 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    else
      self.vrReward:add(-1, b)
    end
-   self.vrReward:mul(self.scale)
+   self.vrReward:mul(scale)
+
    if self.sizeAverage then
-      self.vrReward:div(input:size(1))
+     -- divide!
+     self.reward:div(input:size(1))
+     self.vrReward:div(input:size(1))
    end
-   self.vrReward:maskedFill(mask, 0) -- mask
+   self.reward:maskedFill(mask, 0) -- mask
+   self.vrReward:maskedFill(mask, 0)
 
    -- loss = -sum(reward) aka NLL
    -- this actually doesn't matter, we won't use it
@@ -250,7 +255,8 @@ end
 function ReinforceNLLCriterion:updateGradInput(inputTable, target)
   local input = inputTable[1]
   local b = inputTable[2]
-  local mask = inputTable[3]
+  local scale = inputTable[3]
+  local mask = inputTable[4]
 
   -- zero gradInput
   self.gradInput[1]:resizeAs(input):zero()
