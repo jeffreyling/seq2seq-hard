@@ -129,10 +129,6 @@ function make_lstm(data, opt, model, use_chars)
         else
           decoder_out = decoder_attn({top_h, inputs[2]})
         end
-        if opt.sup_attn == 1 then
-          attn_out = nn.SelectTable(1)(decoder_out)
-          decoder_out = nn.SelectTable(2)(decoder_out)
-        end
      else
         decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
         decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
@@ -141,9 +137,6 @@ function make_lstm(data, opt, model, use_chars)
         decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
      end     
      
-     if opt.sup_attn == 1 then
-       table.insert(outputs, attn_out)
-     end
      table.insert(outputs, decoder_out)
   end
   return nn.gModule(inputs, outputs)
@@ -193,14 +186,9 @@ function make_decoder_attn(data, opt, simple)
    local softmax_attn = nn.SoftMax()
    softmax_attn.name = 'softmax_attn'
    attn = softmax_attn(attn)
-   if opt.sup_attn == 1 then
-     table.insert(outputs, attn)
-   end
-
 
    -- sample (hard attention)
    if opt.attn_type == 'hard' then
-     -- false for stochastic on valid
      local sampler = nn.ReinforceCategorical()
      sampler.semi_sampling_p = opt.semi_sampling_p
      sampler.entropy_scale = opt.entropy_scale
@@ -234,7 +222,7 @@ function make_generator(data, opt)
    local w = torch.ones(data.target_size)
    w[1] = 0
    criterion = nn.ClassNLLCriterion(w)
-   --criterion.sizeAverage = false -- why is this here?
+   criterion.sizeAverage = false
    return model, criterion
 end
 

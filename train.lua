@@ -16,7 +16,6 @@ cmd:option('-input_feed', 0, [[If = 1, feed the context vector at each time step
                              input (vica concatenation with the word embeddings) to the decoder]])
 
 -- crazy hacks
-cmd:option('-sup_attn', 0, [[Supervised attention (for autoencoder)]])
 cmd:option('-share_embed', 0, [[ Autoencoder mode: share enc/dec embeddings ]])
 cmd:option('-no_recur', 0, [[ No encoder recurrence]])
 cmd:option('-fix_encoder', 0, [[Fix encoder]])
@@ -308,8 +307,7 @@ function train(train_data, valid_data)
       for i = 1, #p do
         p[i]:copy(save_params[i])
       end
-     end
-
+    end
 
      if opt.baseline_method == 'average' then
        -- baseline should be time dependent on target
@@ -323,8 +321,6 @@ function train(train_data, valid_data)
          end
        end
      end
-
-
    end
 
    local h_init = torch.zeros(opt.max_batch_l, opt.rnn_size)
@@ -353,9 +349,6 @@ function train(train_data, valid_data)
    init_bwd_dec = {}
    if opt.input_feed == 1 then
       table.insert(init_fwd_dec, h_init:clone())
-   end
-   if opt.sup_attn == 1 then
-     table.insert(init_bwd_dec, h_init:clone())
    end
    table.insert(init_bwd_dec, h_init:clone())
    
@@ -584,7 +577,6 @@ function train(train_data, valid_data)
           end
 
           local preds = {}
-          local attn_outs = {}
           for t = 1, target_l do
             decoder_clones[t]:training()
             local decoder_input
@@ -599,15 +591,8 @@ function train(train_data, valid_data)
             if opt.input_feed == 1 then
               table.insert(next_state, out[#out])
             end
-            if opt.sup_attn == 1 then
-              table.insert(attn_outs, out[#out-1])
-              for j = 1, #out-2 do
-                table.insert(next_state, out[j])
-              end
-            else
-              for j = 1, #out-1 do
-                table.insert(next_state, out[j])
-              end
+            for j = 1, #out-1 do
+              table.insert(next_state, out[j])
             end
             rnn_state_dec[t] = next_state
           end
@@ -618,7 +603,6 @@ function train(train_data, valid_data)
             encoder_bwd_grads:zero()
           end
 
-          --local one_hot = torch.zeros(source_l):cuda()
           local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
           local sum_reward -- for hard attn
           local discount = opt.discount
@@ -702,25 +686,10 @@ function train(train_data, valid_data)
             end
 
             -- standard backprop
-            loss = loss + criterion:forward(pred, target_out[t])
+            loss = loss + criterion:forward(pred, target_out[t])/batch_l
             local dl_dpred = criterion:backward(pred, target_out[t])
+            dl_dpred:div(batch_l)
             local dl_dtarget = generator:backward(preds[t], dl_dpred)
-
-            local sup_attn_grad
-            if opt.sup_attn == 1 then
-              sup_attn_grad = attn_outs[t]:clone()
-              sup_attn_grad:zero()
-              if t <= target_l - 2 then
-                one_hot:zero()
-                one_hot[t] = 1 -- is this the right way to do it?
-                new_crit:forward(attn_outs[t], one_hot)
-                sup_attn_grad = new_crit:backward(attn_outs[t], one_hot)
-              end
-
-              -- pass back supervised grad
-              drnn_state_dec[#drnn_state_dec-1] = sup_attn_grad
-            end
-
             drnn_state_dec[#drnn_state_dec]:add(dl_dtarget)
             local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
@@ -862,9 +831,9 @@ function train(train_data, valid_data)
             end
           end	    
         end	 
-          if opt.share_embed == 1 then
-            word_vec_layers[1].gradWeight:add(word_vec_layers[2].gradWeight)
-          end
+        if opt.share_embed == 1 then
+          word_vec_layers[1].gradWeight:add(word_vec_layers[2].gradWeight)
+        end
 
         if opt.fix_encoder == 1 then
           grad_params[1]:zero()
@@ -1093,14 +1062,8 @@ function train(train_data, valid_data)
         if opt.input_feed == 1 then
           table.insert(rnn_state_dec, out[#out])
         end	 
-        if opt.sup_attn == 1 then
-          for j = 1, #out-2 do
-            table.insert(rnn_state_dec, out[j])
-          end
-        else
-          for j = 1, #out-1 do
-            table.insert(rnn_state_dec, out[j])
-          end
+        for j = 1, #out-1 do
+          table.insert(rnn_state_dec, out[j])
         end
         local pred = generator:forward(out[#out])
         loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
@@ -1199,9 +1162,6 @@ function main()
       end
       decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
       generator, criterion = make_generator(valid_data, opt)
-      if opt.sup_attn == 1 then
-        new_crit = nn.ClassNLLCriterion() -- HACK
-      end
 
       if opt.attn_type == 'hard' then
         if opt.baseline_method == 'learned' then
