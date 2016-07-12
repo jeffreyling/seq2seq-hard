@@ -1066,7 +1066,7 @@ function train(train_data, valid_data)
           table.insert(rnn_state_dec, out[j])
         end
         local pred = generator:forward(out[#out])
-        loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
+        loss = loss + criterion:forward(pred, target_out[t])
       end
       nll = nll + loss
       total = total + nonzeros
