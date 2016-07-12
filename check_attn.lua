@@ -230,6 +230,21 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       sampler_layer.time_step = i-1
       local out_decoder = model[2]:forward(decoder_input)
       local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+      if opt.view_attn == 1 then
+        local probs = torch.exp(out)[1]
+        if i-1 <= source_l then
+          local w
+          if opt.identity == 1 then
+            w = source_input[i-1][1]
+          else
+            local idx = 2*(i-1)%source_l
+            if idx == 0 then idx = source_l end
+            w = source_input[idx][1]
+          end
+          print('prob of correct word:', probs[w])
+        end
+        print('prob of EOS:', probs[END])
+      end
       
       rnn_state_dec = {} -- to be modified later
       if model_opt.input_feed == 1 then
@@ -289,7 +304,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
              if i < 2 or diff then
                 if model_opt.attn == 1 then
                   if opt.view_attn == 1 then
-                    print('decoder output at time ', i)
+                    print('decoder attention at time ', i)
                     print(decoder_softmax.output)
                      io.read()
                    end
@@ -354,9 +369,30 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
          end
          local decoder_input = {decoder_input1, context[{{1}}], table.unpack(rnn_state_dec)}
          local out_decoder = model[2]:forward(decoder_input)
-         local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+         local out = model[3]:forward(out_decoder[#out_decoder]) -- 1 x vocab_size
+         if opt.view_attn == 1 then
+           local probs = torch.exp(out)[1]
+           if t-1 <= source_l then
+             local w
+             if opt.identity == 1 then
+               w = source_input[t-1][1]
+             else
+               local idx = (2*(t-1))%source_l
+               if idx == 0 then idx = source_l end
+               w = source_input[idx][1]
+             end
+             print('GOLD prob of correct word:', probs[w])
+           end
+           print('GOLD prob of EOS:', probs[END])
+           print('GOLD decoder attention at time ', t)
+           print(decoder_softmax.output)
+           io.read()
+         end
+
          rnn_state_dec = {} -- to be modified later
-         table.insert(rnn_state_dec, out_decoder[#out_decoder])
+         if model_opt.input_feed == 1 then
+           table.insert(rnn_state_dec, out_decoder[#out_decoder])
+         end
          for j = 1, #out_decoder - 1 do
             table.insert(rnn_state_dec, out_decoder[j])
          end

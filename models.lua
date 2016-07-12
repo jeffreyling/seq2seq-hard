@@ -220,6 +220,7 @@ function make_decoder_attn(data, opt, simple)
    else
       context_output = nn.CAddTable()({context_combined,inputs[1]})
    end
+
    table.insert(outputs, context_output)
    --return nn.gModule(inputs, {context_output})   
    return nn.gModule(inputs, outputs)   

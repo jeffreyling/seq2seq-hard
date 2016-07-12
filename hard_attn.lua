@@ -88,7 +88,7 @@ local ReinforceCategorical, parent = torch.class("nn.ReinforceCategorical", "nn.
 
 function ReinforceCategorical:__init(semi_sampling_p, entropy_scale)
   parent.__init(self)
-  self.semi_sampling_p = semi_sampling_p or 1
+  self.semi_sampling_p = semi_sampling_p or 0
   self.entropy_scale = entropy_scale or 0
   self.through = false -- pass prob weights through
 
@@ -103,8 +103,8 @@ function ReinforceCategorical:_doArgmax(input)
 end
 
 function ReinforceCategorical:_doSample(input)
-   self._do_sample = (torch.uniform() < self.semi_sampling_p)
-   if self._do_sample == false then
+   self._do_through = (torch.uniform() < self.semi_sampling_p)
+   if self._do_through == true then
       -- use p
       self.output:copy(input)
    else
@@ -153,7 +153,7 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
    -- ------------ =   
    --     d p          0         otherwise
    self.gradInput:resizeAs(input):zero()
-   if self.through then
+   if self.through or self._do_through == true then
      -- identity function
      self.gradInput:copy(gradOutput)
    else 
@@ -194,7 +194,8 @@ local ReinforceNLLCriterion, parent = torch.class("nn.ReinforceNLLCriterion", "n
 function ReinforceNLLCriterion:__init(zero_one, criterion)
    parent.__init(self)
    self.zero_one = zero_one or 0 -- use zero one loss
-   self.sizeAverage = true
+   -- TODO: include sizeAverage?
+   --self.sizeAverage = true
    self.criterion = criterion or nn.MSECriterion() -- baseline criterion
 
    self.gradInput = {torch.Tensor()}
@@ -238,11 +239,11 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    end
    self.vrReward:mul(scale)
 
-   if self.sizeAverage then
-     -- divide!
-     self.reward:div(input:size(1))
-     self.vrReward:div(input:size(1))
-   end
+   --if self.sizeAverage then
+     ---- divide!
+     --self.reward:div(input:size(1))
+     --self.vrReward:div(input:size(1))
+   --end
    self.reward:maskedFill(mask, 0) -- mask
    self.vrReward:maskedFill(mask, 0)
 

@@ -8,6 +8,30 @@ require 'models.lua'
 require 'model_utils.lua'
 
 cmd = torch.CmdLine()
+-- FIX THESE FOR TRANSLATION
+cmd:option('-init_dec', 0, [[Initialize the hidden/cell state of the decoder at time 
+                           0 to be the last hidden/cell state of the encoder. If 0, 
+                           the initial states of the decoder are set to zero vectors]])
+cmd:option('-input_feed', 0, [[If = 1, feed the context vector at each time step as additional
+                             input (vica concatenation with the word embeddings) to the decoder]])
+
+-- crazy hacks
+cmd:option('-sup_attn', 0, [[Supervised attention (for autoencoder)]])
+cmd:option('-share_embed', 0, [[ Autoencoder mode: share enc/dec embeddings ]])
+cmd:option('-no_recur', 0, [[ No encoder recurrence]])
+cmd:option('-fix_encoder', 0, [[Fix encoder]])
+cmd:option('-fix_decoder', 0, [[Fix decoder]])
+cmd:option('-save_batch', 0, [[Save at this batch]])
+cmd:option('-print_batch', 0, [[Print at this batch attention weights and stuff]])
+cmd:option('-reinit_encoder', 0, [[Reinit encoder weights]])
+cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
+cmd:option('-oracle_epoch', 0, [[Do oracle training on this epoch]])
+cmd:option('-zero_one', 0, [[Use zero-one loss instead of log-prob]])
+cmd:option('-moving_variance', 1, [[Use moving variance to normalize rewards (thus ignoring reward_scale)]])
+cmd:option('-soft_curriculum', 0, [[Anneal semi_sampling_p if set to 1]])
+
+cmd:option('-stupid_hack', 0, [[Stupid hack]])
+
 
 -- data files
 cmd:text("")
@@ -46,11 +70,6 @@ cmd:option('-reverse_src', 0, [[If = 1, reverse the source sequence. The origina
                               sequence-to-sequence paper found that this was crucial to 
                               achieving good performance, but with attention models this
                               does not seem necessary. Recommend leaving it to 0]])
-cmd:option('-init_dec', 1, [[Initialize the hidden/cell state of the decoder at time 
-                           0 to be the last hidden/cell state of the encoder. If 0, 
-                           the initial states of the decoder are set to zero vectors]])
-cmd:option('-input_feed', 0, [[If = 1, feed the context vector at each time step as additional
-                             input (vica concatenation with the word embeddings) to the decoder]])
 cmd:option('-multi_attn', 0, [[If > 0, then use a another attention layer on this layer of 
                            the decoder. For example, if num_layers = 3 and `multi_attn = 2`, 
                            then the model will do an attention over the source sequence
@@ -131,32 +150,16 @@ cmd:text("")
 -- hard attention specs (attn_type == 'hard')
 cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
 cmd:option('-entropy_scale', 0, [[Scale entropy term]])
-cmd:option('-semi_sampling_p', 1, [[Probability of using multinoulli sampling over passing
-                                    params through, set 1 to always sample]])
-cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned` and `average`]])
+cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
+                                    set 0 to always sample]])
+cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned`, `average`, `exact`]])
 cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = b_k + lr*(r - b_k)]])
-cmd:option('-baseline_time_dep', 1, [[Make baselines time dependent]])
+cmd:option('-baseline_time_dep', 0, [[Make baselines time dependent]])
 -- note that without input feed, actions at time t do not affect future rewards
 cmd:option('-discount', 1.0, [[Discount factor for rewards, between 0 and 1]])
 cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
 cmd:option('-num_samples', 1, [[Number of times to sample for each data point (most people do 1)]])
 cmd:option('-temperature', 1, [[Temperature for sampling]])
-
--- crazy hacks
-cmd:option('-sup_attn', 0, [[Supervised attention (for autoencoder)]])
-cmd:option('-share_embed', 0, [[ Autoencoder mode: share enc/dec embeddings ]])
-cmd:option('-no_recur', 0, [[ No encoder recurrence]])
-cmd:option('-fix_encoder', 0, [[Fix encoder]])
-cmd:option('-fix_decoder', 0, [[Fix decoder]])
-cmd:option('-save_batch', 0, [[Save at this batch]])
-cmd:option('-print_batch', 0, [[Print at this batch attention weights and stuff]])
-cmd:option('-reinit_encoder', 0, [[Reinit encoder weights]])
-cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
-cmd:option('-oracle_epochs', 0, [[Number of oracle epochs]])
-cmd:option('-zero_one', 0, [[Use zero-one loss instead of log-prob]])
-cmd:option('-moving_stddev', 0, [[Use moving variance to normalize rewards (thus ignoring reward_scale)]])
-
-cmd:option('-stupid_hack', 0, [[Stupid hack]])
 
 
 opt = cmd:parse(arg)
@@ -311,17 +314,16 @@ function train(train_data, valid_data)
      if opt.baseline_method == 'average' then
        -- baseline should be time dependent on target
        if opt.baseline_time_dep == 1 and type(opt.baseline) == 'number' then
-         opt.baseline = {}
-         for t = 1, opt.max_sent_l_targ do
-           opt.baseline[t] = 0
+         opt.baseline = torch.zeros(opt.max_sent_l_targ)
+       end
+
+       if opt.moving_variance == 1 then
+         if opt.baseline_time_dep == 1 and type(opt.reward_variance) == 'number' then
+           opt.reward_variance = torch.zeros(opt.max_sent_l_targ)
          end
        end
      end
-     if opt.moving_stddev == 1 then
-       if opt.baseline_time_dep == 1 and type(opt.reward_variance) == 'number' then
-         opt.reward_variance = torch.zeros(opt.max_sent_l_targ)
-       end
-     end
+
 
    end
 
@@ -448,7 +450,7 @@ function train(train_data, valid_data)
         print('oracle:', opt.oracle_epochs)
       end
 
-      
+      -- soft anneal 
       local cur_soft_anneal = false
       if opt.soft_anneal > 0 then
         if epoch == 1 then
@@ -463,6 +465,14 @@ function train(train_data, valid_data)
         end
         if epoch <= opt.soft_anneal then
           cur_soft_anneal = true
+        end
+      end
+
+      -- soft curriculum
+      if opt.soft_curriculum == 1 then
+        print(string.format('soft curriculum sampling p = %.2f', 1/math.sqrt(epoch)))
+        for _,module in ipairs(sampler_layers) do
+          module.semi_sampling_p = 1/math.sqrt(epoch)
         end
       end
       
@@ -556,8 +566,8 @@ function train(train_data, valid_data)
             context = context2
           end	 
 
-          if opt.oracle_epochs > 0 then
-            if epoch <= opt.oracle_epochs then
+          if opt.oracle_epoch > 0 then
+            if epoch == opt.oracle_epoch then
               -- cheating oracle for attn
               for t = 1, target_l do
                 sampler_layers[t].oracle = true
@@ -568,8 +578,8 @@ function train(train_data, valid_data)
                 sampler_layers[t].oracle = false
               end
               -- fix encoder, decoder
-              opt.fix_encoder = 1
-              opt.fix_decoder = 1
+              --opt.fix_encoder = 1
+              --opt.fix_decoder = 1
             end
           end
 
@@ -616,8 +626,9 @@ function train(train_data, valid_data)
           for t = target_l, 1, -1 do
             local pred = generator:forward(preds[t])
             if opt.attn_type == 'hard' then
-              -- broadcast reward
+              -- reward stuff
               local b
+              local scale = opt.reward_scale -- default
               if opt.baseline_method == 'learned' then
                 assert(false, 'not working yet')
                 b = baseline_m:forward(preds[t])
@@ -627,17 +638,22 @@ function train(train_data, valid_data)
                 else
                   b = opt.baseline
                 end
-              end
 
-              local scale
-              if opt.moving_stddev == 1 then
-                if type(opt.reward_variance) == 'number' then
-                  scale = 1/math.sqrt(opt.reward_variance + 1e-8)
-                else
-                  scale = 1/math.sqrt(opt.reward_variance + 1e-8)
+                if opt.moving_variance == 1 then
+                  if type(opt.reward_variance) == 'number' then
+                    scale = 1/math.sqrt(opt.reward_variance + 1e-8)
+                  else
+                    scale = 1/math.sqrt(opt.reward_variance[t] + 1e-8)
+                  end
                 end
-              else
-                scale = opt.reward_scale
+              elseif opt.baseline_method == 'exact' then
+                -- exact mean
+                b = opt.exact_stats['x'] / opt.exact_stats['n']
+
+                if opt.moving_variance == 1 then
+                  scale = opt.exact_stats['x^2'] / opt.exact_stats['n'] - b*b
+                  scale = 1/math.sqrt(scale + 1e-8)
+                end
               end
 
               local mask = target_l_all:lt(t)
@@ -645,7 +661,7 @@ function train(train_data, valid_data)
               reward_criterion:forward(inp, target_out[t])
 
               local cur_reward = reward_criterion.vrReward
-              local unnorm_reward = reward_criterion.reward
+              cur_reward:div(batch_l)
               if opt.input_feed == 1 then
                 if t == target_l then
                   -- cumulative reward
@@ -661,22 +677,27 @@ function train(train_data, valid_data)
               sampler_layers[t]:reinforce(cur_reward:clone())
 
               -- update baselines
-              if opt.moving_stddev == 1 then
-                if opt.baseline_time_dep == 1 then
-                  local update_var = (unnorm_reward:sum() - opt.baseline[t])^2
-                  opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*update_var
-                else
-                  local update_var = (unnorm_reward:sum() - opt.baseline)^2
-                  opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*update_var
-                end
-              end
+              local unnorm_reward = reward_criterion.reward
               if opt.baseline_method == 'average' then
                 if opt.baseline_time_dep == 1 then
-                  -- use sum since we average within the reward criterion
-                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*unnorm_reward:sum()
+                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*unnorm_reward:mean()
                 else
-                  opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*unnorm_reward:sum()
+                  opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*unnorm_reward:mean()
                 end
+
+                if opt.moving_variance == 1 then
+                  if opt.baseline_time_dep == 1 then
+                    local update_var = (unnorm_reward:mean() - opt.baseline[t])^2
+                    opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*update_var
+                  else
+                    local update_var = (unnorm_reward:mean() - opt.baseline)^2
+                    opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*update_var
+                  end
+                end
+              elseif opt.baseline_method == 'exact' then
+                opt.exact_stats['n'] = opt.exact_stats['n'] + unnorm_reward:size(1)
+                opt.exact_stats['x'] = opt.exact_stats['x'] + unnorm_reward:sum()
+                opt.exact_stats['x^2'] = opt.exact_stats['x^2'] + torch.pow(unnorm_reward, 2):sum()
               end
             end
 
@@ -709,10 +730,6 @@ function train(train_data, valid_data)
                 print('attn forwards:')
                 print(softmax_attn_layers[t].output)
                 print('source length:', source_l, 'time step:', t)
-                --print('attn grads:')
-                --print(sampler_layers[t].gradInput)
-                --print('softmax attn grads:')
-                --print(softmax_attn_layers[t].gradInput)
                 io.read()
               end
               encoder_grads:add(dlst[2])
@@ -961,6 +978,10 @@ function train(train_data, valid_data)
       print(opt.train_perf)
       print('baseline:')
       print(opt.baseline)
+      if opt.moving_variance == 1 then
+        print('variance:')
+        print(opt.reward_variance)
+      end
       opt.train_perf[#opt.train_perf + 1] = train_score
       local score = eval(valid_data)
       opt.val_perf[#opt.val_perf + 1] = score
@@ -1189,8 +1210,13 @@ function main()
           _, reward_criterion = make_reinforce(valid_data, opt)
         end
         opt.baseline = 0 -- RL average
+        opt.exact_stats = {} -- RL exact stats: \sum x, \sum x^2, n
+        opt.exact_stats['n'] = 0
+        opt.exact_stats['x'] = 0
+        opt.exact_stats['x^2'] = 0
+        -- TODO: allow this to be time dependent
 
-        if opt.moving_stddev == 1 then
+        if opt.moving_variance == 1 then
           opt.reward_variance = 0 -- RL stddev
         end
       end
@@ -1223,10 +1249,13 @@ function main()
       end
       if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'average' then
         opt.baseline = model_opt.baseline
-        if model_opt.moving_stddev == 1 then
-          opt.moving_stddev = 1 
+        if model_opt.moving_variance == 1 then
+          opt.moving_variance = 1 
           opt.reward_variance = model_opt.reward_variance
         end
+      end
+      if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'exact' then
+        opt.exact_stats = model_opt.exact_stats
       end
       _, criterion = make_generator(valid_data, opt)
       if opt.attn_type == 'hard' then
