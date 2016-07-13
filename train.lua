@@ -27,7 +27,22 @@ cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
 cmd:option('-oracle_epoch', 0, [[Do oracle training on this epoch]])
 cmd:option('-zero_one', 0, [[Use zero-one loss instead of log-prob]])
 cmd:option('-moving_variance', 1, [[Use moving variance to normalize rewards (thus ignoring reward_scale)]])
-cmd:option('-soft_curriculum', 0, [[Anneal semi_sampling_p if set to 1]])
+cmd:option('-soft_curriculum', 1, [[Anneal semi_sampling_p as 1/sqrt(epoch) if set to 1]])
+
+-- hard attention specs (attn_type == 'hard')
+cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
+cmd:option('-entropy_scale', 0, [[Scale entropy term]])
+cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
+                                    set 0 to always sample]])
+cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned`, `average`, `exact`]])
+cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = (1-lr)*b_k + lr*r]])
+cmd:option('-global_baseline', 0, [[Baseline global instead of time dependent. Time dependent baseline is better]])
+cmd:option('-global_variance', 1, [[Variance global instead of time dependent. Global variance is better]])
+-- note that without input feed, actions at time t do not affect future rewards
+cmd:option('-discount', 1.0, [[Discount factor for rewards, between 0 and 1]])
+cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
+cmd:option('-num_samples', 1, [[Number of times to sample for each data point (most people do 1)]])
+cmd:option('-temperature', 1, [[Temperature for sampling]])
 
 cmd:option('-stupid_hack', 0, [[Stupid hack]])
 
@@ -95,7 +110,7 @@ cmd:text("**Optimization options**")
 cmd:text("")
 
 -- optimization
-cmd:option('-epochs', 10, [[Number of training epochs]])
+cmd:option('-epochs', 13, [[Number of training epochs]])
 cmd:option('-start_epoch', 1, [[If loading from a checkpoint, the epoch from which to start]])
 cmd:option('-param_init', 0.1, [[Parameters are initialized over uniform distribution with support
                                (-param_init, param_init)]])
@@ -146,19 +161,6 @@ cmd:text("")
 cmd:text("Options for hard attention")
 cmd:text("")
 
--- hard attention specs (attn_type == 'hard')
-cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
-cmd:option('-entropy_scale', 0, [[Scale entropy term]])
-cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
-                                    set 0 to always sample]])
-cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned`, `average`, `exact`]])
-cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = b_k + lr*(r - b_k)]])
-cmd:option('-baseline_time_dep', 0, [[Make baselines time dependent]])
--- note that without input feed, actions at time t do not affect future rewards
-cmd:option('-discount', 1.0, [[Discount factor for rewards, between 0 and 1]])
-cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
-cmd:option('-num_samples', 1, [[Number of times to sample for each data point (most people do 1)]])
-cmd:option('-temperature', 1, [[Temperature for sampling]])
 
 
 opt = cmd:parse(arg)
@@ -311,12 +313,12 @@ function train(train_data, valid_data)
 
      if opt.baseline_method == 'average' then
        -- baseline should be time dependent on target
-       if opt.baseline_time_dep == 1 and type(opt.baseline) == 'number' then
+       if opt.global_baseline == 0 and type(opt.baseline) == 'number' then
          opt.baseline = torch.zeros(opt.max_sent_l_targ)
        end
 
        if opt.moving_variance == 1 then
-         if opt.baseline_time_dep == 1 and type(opt.reward_variance) == 'number' then
+         if opt.global_variance == 0 and type(opt.reward_variance) == 'number' then
            opt.reward_variance = torch.zeros(opt.max_sent_l_targ)
          end
        end
@@ -463,9 +465,10 @@ function train(train_data, valid_data)
 
       -- soft curriculum
       if opt.soft_curriculum == 1 then
-        print(string.format('soft curriculum sampling p = %.2f', 1/math.sqrt(epoch)))
+        local p = 1/math.sqrt(epoch)
+        print(string.format('soft curriculum sampling p = %.2f', p))
         for _,module in ipairs(sampler_layers) do
-          module.semi_sampling_p = 1/math.sqrt(epoch)
+          module.semi_sampling_p = p
         end
       end
       
@@ -617,14 +620,14 @@ function train(train_data, valid_data)
                 assert(false, 'not working yet')
                 b = baseline_m:forward(preds[t])
               elseif opt.baseline_method == 'average' then
-                if opt.baseline_time_dep == 1 then
-                  b = opt.baseline[t]
-                else
+                if opt.global_baseline == 1 then
                   b = opt.baseline
+                else
+                  b = opt.baseline[t]
                 end
 
                 if opt.moving_variance == 1 then
-                  if type(opt.reward_variance) == 'number' then
+                  if opt.global_variance == 1 then
                     scale = 1/math.sqrt(opt.reward_variance + 1e-8)
                   else
                     scale = 1/math.sqrt(opt.reward_variance[t] + 1e-8)
@@ -663,19 +666,24 @@ function train(train_data, valid_data)
               -- update baselines
               local unnorm_reward = reward_criterion.reward
               if opt.baseline_method == 'average' then
-                if opt.baseline_time_dep == 1 then
-                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*unnorm_reward:mean()
-                else
+                if opt.global_baseline == 1 then
                   opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*unnorm_reward:mean()
+                else
+                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*unnorm_reward:mean()
                 end
 
                 if opt.moving_variance == 1 then
-                  if opt.baseline_time_dep == 1 then
+                  if opt.global_variance == 1 then
+                    local update_var
+                    if opt.global_baseline == 1 then
+                      update_var = (unnorm_reward:mean() - opt.baseline)^2
+                    else
+                      update_var = (unnorm_reward:mean() - opt.baseline:mean())^2
+                    end
+                    opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*update_var
+                  else
                     local update_var = (unnorm_reward:mean() - opt.baseline[t])^2
                     opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*update_var
-                  else
-                    local update_var = (unnorm_reward:mean() - opt.baseline)^2
-                    opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*update_var
                   end
                 end
               elseif opt.baseline_method == 'exact' then
@@ -1222,6 +1230,9 @@ function main()
         _, reward_criterion = make_reinforce(valid_data, opt)
       end
    end   
+
+   print('init dec:', opt.init_dec)
+   print('input feed:', opt.input_feed)
    
    layers = {encoder, decoder, generator}
    if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then

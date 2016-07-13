@@ -165,13 +165,12 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      
      -- multiply by reward 
      self.gradInput:cmul(self:rewardAs(input))
-     -- add entropy term
-     self._gradEnt = self._input:clone()
-     self._gradEnt:log():add(1)
-     self.gradInput:add(self.entropy_scale, self._gradEnt)
-
      -- multiply by -1 ( gradient descent on input )
      self.gradInput:mul(-1)
+
+     -- add entropy term
+     local grad_ent = self._input:log():add(1)
+     self.gradInput:add(self.entropy_scale, grad_ent)
    end
    return self.gradInput
 end
@@ -232,11 +231,8 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    -- subtract baseline
    self.vrReward = self.vrReward or self.reward.new()
    self.vrReward:resizeAs(self.reward):copy(self.reward)
-   if type(b) == 'number' then
-     self.vrReward:add(-b)
-   else
-     self.vrReward:add(-1, b)
-   end
+   assert(type(b) == 'number', 'non-number b')
+   self.vrReward:add(-b)
    self.vrReward:mul(scale)
 
    --if self.sizeAverage then

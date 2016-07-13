@@ -12,6 +12,11 @@ stringx = require('pl.stringx')
 
 cmd = torch.CmdLine()
 
+-- check attn options
+cmd:option('-view_attn', 0, [[View attention weights at each time step]])
+cmd:option('-identity', 1, [[Autoencoder or not]])
+cmd:option('-mixture', 0, [[With hard attention, train as mixture instead of argmax]])
+
 -- file location
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])
 cmd:option('-src_file', '',[[Source sequence to decode (one line per sequence)]])
@@ -45,12 +50,17 @@ cmd:option('-gpuid2', -1, [[Second GPU ID]])
 cmd:option('-cudnn', 0, [[If using character model, this should be = 1 if the character model
                           was trained using cudnn]])
 
--- check attn options
-cmd:option('-view_attn', 0, [[View attention weights at each time step]])
-cmd:option('-identity', 1, [[Autoencoder or not]])
-cmd:option('-sup_attn', 0, [[Supervised attention]])
 
 opt = cmd:parse(arg)
+
+if opt.mixture == 1 then
+  function nn.ReinforceCategorical:updateOutput(input)
+    assert(self.train == false)
+    self.output:resizeAs(input)
+    self.output:copy(input)
+    return self.output
+  end
+end
 
 function copy(orig)
    local orig_type = type(orig)
@@ -250,7 +260,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       if model_opt.input_feed == 1 then
          table.insert(rnn_state_dec, out_decoder[#out_decoder])
       end      
-      for j = 1, #out_decoder - 1-opt.sup_attn do
+      for j = 1, #out_decoder - 1 do
          table.insert(rnn_state_dec, out_decoder[j])
       end
       out_float:resize(out:size()):copy(out)
