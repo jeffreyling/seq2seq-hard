@@ -8,6 +8,49 @@ require 'models.lua'
 require 'model_utils.lua'
 
 cmd = torch.CmdLine()
+-- FIX THESE FOR TRANSLATION
+cmd:option('-init_dec', 1, [[Initialize the hidden/cell state of the decoder at time 
+                           0 to be the last hidden/cell state of the encoder. If 0, 
+                           the initial states of the decoder are set to zero vectors]])
+cmd:option('-input_feed', 1, [[If = 1, feed the context vector at each time step as additional
+                             input (vica concatenation with the word embeddings) to the decoder]])
+
+-- crazy hacks
+cmd:option('-share_embed', 0, [[ Autoencoder mode: share enc/dec embeddings ]])
+cmd:option('-no_recur', 0, [[ No encoder recurrence]])
+cmd:option('-fix_encoder', 0, [[Fix encoder]])
+cmd:option('-fix_decoder', 0, [[Fix decoder]])
+cmd:option('-save_batch', 0, [[Save at this batch]])
+cmd:option('-print_batch', 0, [[Print at this batch attention weights and stuff]])
+cmd:option('-reinit_encoder', 0, [[Reinit encoder weights]])
+cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
+cmd:option('-oracle_epoch', 0, [[Do oracle training on this epoch]])
+cmd:option('-zero_one', 0, [[Use zero-one loss instead of log-prob]])
+cmd:option('-moving_variance', 1, [[Use moving variance to normalize rewards (thus ignoring reward_scale)]])
+cmd:option('-soft_curriculum', 1, [[Anneal semi_sampling_p as 1/sqrt(epoch) if set to 1]])
+
+-- hard attention specs (attn_type == 'hard')
+cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
+cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
+cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
+                                    set 0 to always sample]])
+
+cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned`, `average`, `exact`]])
+cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = (1-lr)*b_k + lr*r]])
+cmd:option('-global_baseline', 0, [[Baseline global instead of time dependent. Time dependent baseline is better]])
+cmd:option('-global_variance', 1, [[Variance global instead of time dependent. Global variance is better]])
+cmd:option('-second_baseline', 0, [[Have a secondary learned baseline]])
+
+-- note that without input feed, actions at time t do not affect future rewards
+cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
+cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
+cmd:option('-num_samples', 1, [[Number of times to sample for each data point (most people do 1)]])
+cmd:option('-temperature', 1, [[Temperature for sampling]])
+
+cmd:option('-stupid_hack', 0, [[Stupid hack]])
+cmd:option('-brnn', 1, [[If = 1, use a bidirectional RNN. Hidden states of the fwd/bwd
+                              RNNs are summed.]])
+
 
 -- data files
 cmd:text("")
@@ -36,8 +79,6 @@ cmd:option('-word_vec_size', 500, [[Word embedding sizes]])
 cmd:option('-attn', 1, [[If = 1, use attention on the decoder side. If = 0, it uses the last
                        hidden state of the decoder as context at each time step.]])
 cmd:option('-attn_type', 'hard', [[Hard or soft attention on decoder side]])
-cmd:option('-brnn', 0, [[If = 1, use a bidirectional RNN. Hidden states of the fwd/bwd
-                              RNNs are summed.]])
 cmd:option('-use_chars_enc', 0, [[If = 1, use character on the encoder 
                                 side (instead of word embeddings]])
 cmd:option('-use_chars_dec', 0, [[If = 1, use character on the decoder 
@@ -46,11 +87,6 @@ cmd:option('-reverse_src', 0, [[If = 1, reverse the source sequence. The origina
                               sequence-to-sequence paper found that this was crucial to 
                               achieving good performance, but with attention models this
                               does not seem necessary. Recommend leaving it to 0]])
-cmd:option('-init_dec', 1, [[Initialize the hidden/cell state of the decoder at time 
-                           0 to be the last hidden/cell state of the encoder. If 0, 
-                           the initial states of the decoder are set to zero vectors]])
-cmd:option('-input_feed', 0, [[If = 1, feed the context vector at each time step as additional
-                             input (vica concatenation with the word embeddings) to the decoder]])
 cmd:option('-multi_attn', 0, [[If > 0, then use a another attention layer on this layer of 
                            the decoder. For example, if num_layers = 3 and `multi_attn = 2`, 
                            then the model will do an attention over the source sequence
@@ -71,23 +107,6 @@ cmd:option('-kernel_width', 6, [[Size (i.e. width) of the convolutional filter]]
 cmd:option('-num_kernels', 1000, [[Number of convolutional filters (feature maps). So the
                                  representation from characters will have this many dimensions]])
 cmd:option('-num_highway_layers', 2, [[Number of highway layers in the character model]])
-
-cmd:text("")
-cmd:text("Options for hard attention")
-cmd:text("")
-
--- hard attention specs (attn_type == 'hard')
-cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
-cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
-cmd:option('-semi_sampling_p', 1, [[Probability of using multinoulli sampling over passing
-                                    params through, set 1 to always sample]])
-cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned` and `average`]])
-cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = b_k + lr*(r - b_k)]])
-cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
-cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
-cmd:option('-sum_reward', 0, [[Only useful with input_feed = 1, makes the reward cumulative
-                               over end of sequence. Equivalent to discount = 0]])
-cmd:option('-num_samples', 10, [[Number of times to sample for each data point (most people do 1)]])
 
 cmd:text("")
 cmd:text("**Optimization options**")
@@ -141,6 +160,12 @@ cmd:option('-save_every', 1, [[Save every this many epochs]])
 cmd:option('-print_every', 50, [[Print stats after this many batches]])
 cmd:option('-seed', 3435, [[Seed for random initialization]])
 
+cmd:text("")
+cmd:text("Options for hard attention")
+cmd:text("")
+
+
+
 opt = cmd:parse(arg)
 torch.manualSeed(opt.seed)
 
@@ -158,7 +183,6 @@ function zero_table(t)
 end
 
 function train(train_data, valid_data)
-
    local timer = torch.Timer()
    local num_params = 0
    local start_decay = 0
@@ -176,7 +200,7 @@ function train(train_data, valid_data)
       end      
       local p, gp = layers[i]:getParameters()
       if opt.train_from:len() == 0 then
-	 p:uniform(-opt.param_init, opt.param_init)
+   p:uniform(-opt.param_init, opt.param_init)
       end
       num_params = num_params + p:size(1)
       params[i] = p
@@ -197,6 +221,12 @@ function train(train_data, valid_data)
 	 word_vec_layers[2].weight[i]:copy(pre_word_vecs[i])
       end      
    end
+
+   if opt.share_embed == 1 then
+     -- share word vecs
+     word_vec_layers[2].weight:copy(word_vec_layers[1].weight)
+   end
+
    if opt.brnn == 1 then --subtract shared params for brnn
       num_params = num_params - word_vec_layers[1].weight:nElement()
       word_vec_layers[3].weight:copy(word_vec_layers[1].weight)
@@ -251,20 +281,47 @@ function train(train_data, valid_data)
    end   
 
    if opt.attn_type == 'hard' then
-     -- save stochastic layers
      decoder_attn_layers = {}
      sampler_layers = {}
+     softmax_attn_layers = {}
+     mul_constant_layers = {}
+     mm_layers = {}
+     -- save stochastic layers
      for i = 1, opt.max_sent_l_targ do
        decoder_clones[i]:apply(get_RL_layer)
        decoder_attn_layers[i]:apply(get_RL_layer)
+       sampler_layers[i].time_step = i -- very stupid hack
+       sampler_layers[i].entropy_scale = opt.entropy_scale -- control
+       sampler_layers[i].semi_sampling_p = opt.semi_sampling_p -- control
+       mul_constant_layers[i].constant_scalar = opt.temperature -- reset temperature
      end
+
+     if opt.reinit_encoder == 1 then
+       params[1]:uniform(-opt.param_init, opt.param_init)
+     end
+     if opt.reinit_decoder == 1 then
+        -- don't reinit attention weights though
+       local p, _ = decoder_attn_layers[1]:parameters()
+
+       local save_params = {}
+       for i = 1, #p do
+         table.insert(save_params, p[i]:clone())
+       end
+       params[2]:uniform(-opt.param_init, opt.param_init)
+      for i = 1, #p do
+        p[i]:copy(save_params[i])
+      end
+    end
 
      if opt.baseline_method == 'average' then
        -- baseline should be time dependent on target
-       if type(opt.baseline) == 'number' then
-         opt.baseline = {}
-         for t = 1, opt.max_sent_l_targ do
-           opt.baseline[t] = 0
+       if opt.global_baseline == 0 and type(opt.baseline) == 'number' then
+         opt.baseline = torch.zeros(opt.max_sent_l_targ)
+       end
+
+       if opt.moving_variance == 1 then
+         if opt.global_variance == 0 and type(opt.reward_variance) == 'number' then
+           opt.reward_variance = torch.zeros(opt.max_sent_l_targ)
          end
        end
      end
@@ -378,260 +435,407 @@ function train(train_data, valid_data)
       local start_time = timer:time().real
       local num_words_target = 0
       local num_words_source = 0
+      local num_samples = opt.num_samples
+
+      -- soft anneal 
+      local cur_soft_anneal = false
+      if opt.soft_anneal > 0 then
+        if epoch == 1 then
+          -- train with soft attention
+          for _,module in ipairs(sampler_layers) do
+            module.through = true
+          end
+        elseif epoch == opt.soft_anneal + 1 then
+          for _,module in ipairs(sampler_layers) do
+            module.through = false
+          end
+        end
+        if epoch <= opt.soft_anneal then
+          cur_soft_anneal = true
+        end
+      end
+
+      -- soft curriculum
+      if opt.soft_curriculum == 1 then
+        local p = 1/math.sqrt(epoch)
+        print(string.format('soft curriculum sampling p = %.2f', p))
+        for _,module in ipairs(sampler_layers) do
+          module.semi_sampling_p = p
+        end
+      end
       
+      local curric_length = 13 -- starting length of curriculum
+      curric_length = curric_length + 10 * (epoch-1) -- reach max after 5 epochs
+      local max_curric_i = 0
+      if epoch <= opt.curriculum then
+        print(string.format('curriculum length: %d', curric_length))
+        for i = 1, data:size() do
+          local d = data[i]
+          if d[7] > curric_length then break end -- check source_l
+          max_curric_i = i
+        end
+      end
+
       for i = 1, data:size() do
         zero_table(grad_params, 'zero')
         local d
         if epoch <= opt.curriculum then
-          d = data[i]
+          if torch.uniform() < 0.1 then
+            d = data[torch.random(1,data.length)]
+          else
+            d = data[torch.random(1, max_curric_i)]
+          end
         else
           d = data[batch_order[i]]
         end
         local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
         local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
 
-        local encoder_grads = encoder_grad_proto[{{1, batch_l}, {1, source_l}}]
-        local encoder_bwd_grads 
-        if opt.brnn == 1 then
-          encoder_bwd_grads = encoder_bwd_grad_proto[{{1, batch_l}, {1, source_l}}]
-        end	 
-        local rnn_state_enc = reset_state(init_fwd_enc, batch_l, 0)
-        local context = context_proto[{{1, batch_l}, {1, source_l}}]
-        if opt.gpuid >= 0 then
-          cutorch.setDevice(opt.gpuid)
-        end	 
-        -- forward prop encoder
-        for t = 1, source_l do
-          encoder_clones[t]:training()
-          local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
-          local out = encoder_clones[t]:forward(encoder_input)
-          rnn_state_enc[t] = out
-          context[{{},t}]:copy(out[#out])
-        end
-        -- forward prop decoder
-        local rnn_state_dec = reset_state(init_fwd_dec, batch_l, 0)
-        if opt.init_dec == 1 then
-          for L = 1, opt.num_layers do
-            rnn_state_dec[0][L*2-1+opt.input_feed]:copy(rnn_state_enc[source_l][L*2-1])
-            rnn_state_dec[0][L*2+opt.input_feed]:copy(rnn_state_enc[source_l][L*2])
-          end
-        end
+        local loss = 0 -- added by Jeffrey
+        for sample_i = 1, num_samples do
+          local encoder_grads = encoder_grad_proto[{{1, batch_l}, {1, source_l}}]
+          local encoder_bwd_grads 
+          if opt.brnn == 1 then
+            encoder_bwd_grads = encoder_bwd_grad_proto[{{1, batch_l}, {1, source_l}}]
+          end	 
+          local rnn_state_enc = reset_state(init_fwd_enc, batch_l, 0)
+          local context = context_proto[{{1, batch_l}, {1, source_l}}]
+          if opt.gpuid >= 0 then
+            cutorch.setDevice(opt.gpuid)
+          end	 
+          -- forward prop encoder
+          for t = 1, source_l do
+            encoder_clones[t]:training()
+            local encoder_input
+            if opt.no_recur == 1 then
+              encoder_input = source[t]
+            else
+              encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+            end
 
-        local rnn_state_enc_bwd
-        if opt.brnn == 1  then
-          rnn_state_enc_bwd = reset_state(init_fwd_enc, batch_l, source_l+1)       	   
-          for t = source_l, 1, -1 do
-            encoder_bwd_clones[t]:training()
-            local encoder_input = {source[t], table.unpack(rnn_state_enc_bwd[t+1])}
-            local out = encoder_bwd_clones[t]:forward(encoder_input)
-            rnn_state_enc_bwd[t] = out
-            context[{{},t}]:add(out[#out])	       
+            local out = encoder_clones[t]:forward(encoder_input)
+            if opt.no_recur == 1 then
+              context[{{},t}]:copy(out)
+            else
+              rnn_state_enc[t] = out
+              context[{{},t}]:copy(out[#out])
+            end
           end
+          -- forward prop decoder
+          local rnn_state_dec = reset_state(init_fwd_dec, batch_l, 0)
           if opt.init_dec == 1 then
             for L = 1, opt.num_layers do
-              rnn_state_dec[0][L*2-1+opt.input_feed]:add(rnn_state_enc_bwd[1][L*2-1])
-              rnn_state_dec[0][L*2+opt.input_feed]:add(rnn_state_enc_bwd[1][L*2])
-            end
-          end	 	    
-        end
-
-        if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
-          cutorch.setDevice(opt.gpuid2)	    
-          local context2 = context_proto2[{{1, batch_l}, {1, source_l}}]
-          context2:copy(context)
-          context = context2
-        end	 
-
-        if opt.soft_anneal > 0 then
-          if epoch == 1 then
-            -- train with soft attention
-            for _, module in ipairs(sampler_layers) do
-              module.through = true
-            end
-          elseif epoch == opt.soft_anneal + 1 then
-            for _, module in ipairs(sampler_layers) do
-              module.through = false
+              rnn_state_dec[0][L*2-1+opt.input_feed]:copy(rnn_state_enc[source_l][L*2-1])
+              rnn_state_dec[0][L*2+opt.input_feed]:copy(rnn_state_enc[source_l][L*2])
             end
           end
-        end
 
-        local preds = {}
-        local decoder_input
-        for t = 1, target_l do
-          decoder_clones[t]:training()
-          local decoder_input
-          if opt.attn == 1 then
-            decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
-          else
-            decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec[t-1])}
-          end	    
-          local out = decoder_clones[t]:forward(decoder_input)
-          local next_state = {}
-          table.insert(preds, out[#out])
-          if opt.input_feed == 1 then
-            table.insert(next_state, out[#out])
-          end
-          for j = 1, #out-1 do
-            table.insert(next_state, out[j])
-          end
-          rnn_state_dec[t] = next_state
-        end
-
-        -- backward prop decoder
-        encoder_grads:zero()
-        if opt.brnn == 1 then
-          encoder_bwd_grads:zero()
-        end
-
-        local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
-        local loss = 0
-        local sum_reward -- for hard attn
-        local discount = opt.discount -- discount factor
-        for t = target_l, 1, -1 do
-          local pred = generator:forward(preds[t])
-          if opt.attn_type == 'hard' then
-            local b
-            if opt.baseline_method == 'learned' then
-              b = baseline_m:forward(preds[t])
-            elseif opt.baseline_method == 'average' then
-              b = opt.baseline[t]
+          local rnn_state_enc_bwd
+          if opt.brnn == 1  then
+            rnn_state_enc_bwd = reset_state(init_fwd_enc, batch_l, source_l+1)       	   
+            for t = source_l, 1, -1 do
+              encoder_bwd_clones[t]:training()
+              local encoder_input = {source[t], table.unpack(rnn_state_enc_bwd[t+1])}
+              local out = encoder_bwd_clones[t]:forward(encoder_input)
+              rnn_state_enc_bwd[t] = out
+              context[{{},t}]:add(out[#out])	       
             end
-            local mask = target_l_all:lt(t)
-            local inp = {pred, b, mask}
-            reward_criterion:forward(inp, target_out[t])
-            if opt.sum_reward == 1 then
-              -- cumulative reward
-              if t == target_l then
-                sum_reward = reward_criterion.vrReward
-              else
-                sum_reward:mul(discount)
-                sum_reward:add(reward_criterion.vrReward)
+            if opt.init_dec == 1 then
+              for L = 1, opt.num_layers do
+                rnn_state_dec[0][L*2-1+opt.input_feed]:add(rnn_state_enc_bwd[1][L*2-1])
+                rnn_state_dec[0][L*2+opt.input_feed]:add(rnn_state_enc_bwd[1][L*2])
+              end
+            end	 	    
+          end
+
+          if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
+            cutorch.setDevice(opt.gpuid2)	    
+            local context2 = context_proto2[{{1, batch_l}, {1, source_l}}]
+            context2:copy(context)
+            context = context2
+          end	 
+
+          if opt.oracle_epoch > 0 then
+            if epoch == opt.oracle_epoch then
+              -- cheating oracle for attn
+              for t = 1, target_l do
+                sampler_layers[t].oracle = true
+                sampler_layers[t].time_step = t
               end
             else
-              -- single time step reward
-              sum_reward = reward_criterion.vrReward
-            end
-
-            -- broadcast reward
-            sampler_layers[t]:reinforce(sum_reward:clone())
-            if opt.baseline_method == 'learned' then
-              -- backprop for baseline
-              local dl_db = reward_criterion:backward(inp, target_out[t])[2]
-              baseline_m:backward(preds[t], dl_db)
-            elseif opt.baseline_method == 'average' then
-              opt.baseline[t] = opt.baseline[t] + opt.baseline_lr * (sum_reward:sum() - opt.baseline[t])
+              for t = 1, target_l do
+                sampler_layers[t].oracle = false
+              end
+              -- fix encoder, decoder
+              --opt.fix_encoder = 1
+              --opt.fix_decoder = 1
             end
           end
 
-          -- standard backprop
-          loss = loss + criterion:forward(pred, target_out[t]) -- modified by Jeffrey
-          local dl_dpred = criterion:backward(pred, target_out[t])
-          --dl_dpred:div(batch_l)
-          local dl_dtarget = generator:backward(preds[t], dl_dpred)
-          drnn_state_dec[#drnn_state_dec]:add(dl_dtarget)
-          local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
-          local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
-          -- accumulate encoder/decoder grads
-          if opt.attn == 1 then
-            encoder_grads:add(dlst[2])
-            if opt.brnn == 1 then
-              encoder_bwd_grads:add(dlst[2])
-            end	       
-          else
-            encoder_grads[{{}, source_l}]:add(dlst[2])
-            if opt.brnn == 1 then
-              encoder_bwd_grads[{{}, 1}]:add(dlst[2])
-            end	       
-          end	    
-          drnn_state_dec[#drnn_state_dec]:zero()
-          if opt.input_feed == 1 then
-            drnn_state_dec[#drnn_state_dec]:add(dlst[3])
-          end	    
-          for j = dec_offset, #dlst do
-            drnn_state_dec[j-dec_offset+1]:copy(dlst[j])
-          end	    
-        end
-        word_vec_layers[2].gradWeight[1]:zero()
-        if opt.fix_word_vecs_dec == 1 then
-          word_vec_layers[2].gradWeight:zero()
-        end
-
-        local grad_norm = 0
-        grad_norm = grad_norm + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
-        if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
-          grad_norm = grad_norm + grad_params[4]:norm()^2
-        end
-
-        -- backward prop encoder
-        if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
-          cutorch.setDevice(opt.gpuid)
-          local encoder_grads2 = encoder_grad_proto2[{{1, batch_l}, {1, source_l}}]
-          encoder_grads2:zero()
-          encoder_grads2:copy(encoder_grads)
-          encoder_grads = encoder_grads2 -- batch_l x source_l x rnn_size
-        end
-
-        local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
-        if opt.init_dec == 1 then
-          for L = 1, opt.num_layers do
-            drnn_state_enc[L*2-1]:copy(drnn_state_dec[L*2-1])
-            drnn_state_enc[L*2]:copy(drnn_state_dec[L*2])
-          end	    
-        end
-
-        for t = source_l, 1, -1 do
-          local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
-          if opt.attn == 1 then
-            drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},t}])
-          else
-            if t == source_l then
-              drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},t}])
+          local preds = {}
+          for t = 1, target_l do
+            decoder_clones[t]:training()
+            local decoder_input
+            if opt.attn == 1 then
+              decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
+            else
+              decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec[t-1])}
+            end	    
+            local out = decoder_clones[t]:forward(decoder_input)
+            local next_state = {}
+            table.insert(preds, out[#out])
+            if opt.input_feed == 1 then
+              table.insert(next_state, out[#out])
             end
-          end	    		  
-          local dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
-          for j = 1, #drnn_state_enc do
-            drnn_state_enc[j]:copy(dlst[j+1])
-          end	    
-        end
+            for j = 1, #out-1 do
+              table.insert(next_state, out[j])
+            end
+            rnn_state_dec[t] = next_state
+          end
 
-        if opt.brnn == 1 then
+          -- backward prop decoder
+          encoder_grads:zero()
+          if opt.brnn == 1 then
+            encoder_bwd_grads:zero()
+          end
+
+          local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
+          local sum_reward -- for hard attn
+          local discount = opt.discount
+          local baseline_lr = opt.baseline_lr
+          for t = target_l, 1, -1 do
+            local pred = generator:forward(preds[t])
+            if opt.attn_type == 'hard' then
+              -- reward stuff
+              local b
+              local scale = opt.reward_scale -- default
+              if opt.baseline_method == 'learned' then
+                b = baseline_m:forward(preds[t]):squeeze(2)
+              elseif opt.baseline_method == 'average' then
+                if opt.global_baseline == 1 then
+                  b = opt.baseline
+                else
+                  b = opt.baseline[t]
+                end
+
+                if opt.moving_variance == 1 then
+                  if opt.global_variance == 1 then
+                    scale = 1/math.sqrt(opt.reward_variance + 1e-8)
+                  else
+                    scale = 1/math.sqrt(opt.reward_variance[t] + 1e-8)
+                  end
+                end
+              elseif opt.baseline_method == 'exact' then
+                -- exact mean
+                b = opt.exact_stats['x'] / opt.exact_stats['n']
+
+                if opt.moving_variance == 1 then
+                  scale = opt.exact_stats['x^2'] / opt.exact_stats['n'] - b*b
+                  scale = 1/math.sqrt(scale + 1e-8)
+                end
+              end
+
+              local second_b
+              if opt.second_baseline == 1 then
+                second_b = baseline_m:forward(preds[t]):squeeze(2)
+                b = b - second_b
+              end
+
+              local mask = target_l_all:lt(t)
+              local reward_input = {pred, b, scale, mask}
+              reward_criterion:forward(reward_input, target_out[t])
+
+              local cur_reward = reward_criterion.vrReward
+              cur_reward:div(batch_l)
+              if opt.input_feed == 1 then
+                if t == target_l then
+                  -- cumulative reward
+                  sum_reward = cur_reward
+                else
+                  sum_reward:mul(discount)
+                  sum_reward:add(reward_criterion.vrReward)
+                end
+                cur_reward = sum_reward
+              end
+
+              -- broadcast
+              sampler_layers[t]:reinforce(cur_reward:clone())
+
+              -- update baselines
+              local unnorm_reward = reward_criterion.reward
+              if opt.baseline_method == 'average' then
+                if opt.global_baseline == 1 then
+                  opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*unnorm_reward:mean()
+                else
+                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*unnorm_reward:mean()
+                end
+
+                if opt.moving_variance == 1 then
+                  if opt.global_variance == 1 then
+                    local update_var
+                    if opt.global_baseline == 1 then
+                      update_var = (unnorm_reward:mean() - opt.baseline)^2
+                    else
+                      update_var = (unnorm_reward:mean() - opt.baseline:mean())^2
+                    end
+                    opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*update_var
+                  else
+                    local update_var = (unnorm_reward:mean() - opt.baseline[t])^2
+                    opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*update_var
+                  end
+                end
+              elseif opt.baseline_method == 'learned' then
+                local dl_db = reward_criterion:update_baseline({b, mask}, target_out[t])
+                dl_db:div(batch_l)
+                baseline_m:backward(preds[t], dl_db:view(dl_db:size(1), 1))
+              elseif opt.baseline_method == 'exact' then
+                opt.exact_stats['n'] = opt.exact_stats['n'] + unnorm_reward:size(1)
+                opt.exact_stats['x'] = opt.exact_stats['x'] + unnorm_reward:sum()
+                opt.exact_stats['x^2'] = opt.exact_stats['x^2'] + torch.pow(unnorm_reward, 2):sum()
+              end
+              if opt.second_baseline == 1 then
+                local dl_db = reward_criterion:update_baseline({second_b, mask}, target_out[t])
+                dl_db:div(batch_l)
+                baseline_m:backward(preds[t], dl_db:view(dl_db:size(1), 1))
+              end
+            end
+
+            -- standard backprop
+            loss = loss + criterion:forward(pred, target_out[t])/batch_l
+            local dl_dpred = criterion:backward(pred, target_out[t])
+            dl_dpred:div(batch_l)
+            local dl_dtarget = generator:backward(preds[t], dl_dpred)
+            drnn_state_dec[#drnn_state_dec]:add(dl_dtarget)
+            local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
+            local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
+            -- accumulate encoder/decoder grads
+            if opt.attn == 1 then
+              if i % opt.print_batch == 0 then
+                print('attn forwards:')
+                print(softmax_attn_layers[t].output)
+                print('source length:', source_l, 'time step:', t)
+                io.read()
+              end
+              encoder_grads:add(dlst[2])
+              if opt.brnn == 1 then
+                encoder_bwd_grads:add(dlst[2])
+              end
+            else
+              encoder_grads[{{}, source_l}]:add(dlst[2])
+              if opt.brnn == 1 then
+                encoder_bwd_grads[{{}, 1}]:add(dlst[2])
+              end
+            end 
+            drnn_state_dec[#drnn_state_dec]:zero()
+            if opt.input_feed == 1 then
+              drnn_state_dec[#drnn_state_dec]:add(dlst[3])
+            end
+            for j = dec_offset, #dlst do
+              drnn_state_dec[j-dec_offset+1]:copy(dlst[j])
+            end
+          end
+          word_vec_layers[2].gradWeight[1]:zero()
+          if opt.fix_word_vecs_dec == 1 then
+            word_vec_layers[2].gradWeight:zero()
+          end
+
+          -- backward prop encoder
+          if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
+            cutorch.setDevice(opt.gpuid)
+            local encoder_grads2 = encoder_grad_proto2[{{1, batch_l}, {1, source_l}}]
+            encoder_grads2:zero()
+            encoder_grads2:copy(encoder_grads)
+            encoder_grads = encoder_grads2 -- batch_l x source_l x rnn_size
+          end
+
           local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
           if opt.init_dec == 1 then
             for L = 1, opt.num_layers do
               drnn_state_enc[L*2-1]:copy(drnn_state_dec[L*2-1])
               drnn_state_enc[L*2]:copy(drnn_state_dec[L*2])
+            end	    
+          end
+
+          for t = source_l, 1, -1 do
+            local encoder_input
+            if opt.no_recur == 1 then
+              encoder_input = source[t]
+            else
+              encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+            end
+
+            if opt.attn == 1 then
+              drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},t}])
+            else
+              if t == source_l then
+                drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},t}])
+              end
+            end	    		  
+            local dlst
+            if opt.no_recur == 1 then
+              dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc[#drnn_state_enc])
+              drnn_state_enc[#drnn_state_enc]:zero()
+            else
+              dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
+              for j = 1, #drnn_state_enc do
+                 drnn_state_enc[j]:copy(dlst[j+1])
+              end	    
             end
           end
-          for t = 1, source_l do
-            local encoder_input = {source[t], table.unpack(rnn_state_enc_bwd[t+1])}
-            if opt.attn == 1 then
-              drnn_state_enc[#drnn_state_enc]:add(encoder_bwd_grads[{{},t}])
-            else
-              if t == 1 then
-                drnn_state_enc[#drnn_state_enc]:add(encoder_bwd_grads[{{},t}])
+
+          if opt.brnn == 1 then
+            local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
+            if opt.init_dec == 1 then
+              for L = 1, opt.num_layers do
+                drnn_state_enc[L*2-1]:copy(drnn_state_dec[L*2-1])
+                drnn_state_enc[L*2]:copy(drnn_state_dec[L*2])
               end
             end
-            local dlst = encoder_bwd_clones[t]:backward(encoder_input, drnn_state_enc)
-            for j = 1, #drnn_state_enc do
-              drnn_state_enc[j]:copy(dlst[j+1])
-            end
-          end	      	    
+            for t = 1, source_l do
+              local encoder_input = {source[t], table.unpack(rnn_state_enc_bwd[t+1])}
+              if opt.attn == 1 then
+                drnn_state_enc[#drnn_state_enc]:add(encoder_bwd_grads[{{},t}])
+              else
+                if t == 1 then
+                  drnn_state_enc[#drnn_state_enc]:add(encoder_bwd_grads[{{},t}])
+                end
+              end
+              local dlst = encoder_bwd_clones[t]:backward(encoder_input, drnn_state_enc)
+              for j = 1, #drnn_state_enc do
+                drnn_state_enc[j]:copy(dlst[j+1])
+              end
+            end	      	    
+          end
+
+          word_vec_layers[1].gradWeight[1]:zero()
+          if opt.fix_word_vecs_enc == 1 then
+            word_vec_layers[1].gradWeight:zero()
+          end
+
+          if cur_soft_anneal then
+            -- no need to sample many times with soft
+            num_samples = 1
+            break
+          end
+        end -- end sampling
+
+        -- normalize by number of samples
+        for j = 1, #grad_params do
+          grad_params[j]:div(num_samples)
         end
 
-        word_vec_layers[1].gradWeight[1]:zero()
-        if opt.fix_word_vecs_enc == 1 then
-          word_vec_layers[1].gradWeight:zero()
-        end
-
-        grad_norm = grad_norm + grad_params[1]:norm()^2
+        local grad_norm = 0
+        -- encoder, decoder, generator
+        grad_norm = grad_params[1]:norm()^2 + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
         if opt.brnn == 1 then
-          if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
+          if opt.second_baseline == 1 or opt.baseline_method == 'learned' then
             grad_norm = grad_norm + grad_params[5]:norm()^2
           else
             grad_norm = grad_norm + grad_params[4]:norm()^2
           end
         end
         grad_norm = grad_norm^0.5	 
+
         if opt.brnn == 1 then
           word_vec_layers[1].gradWeight:add(word_vec_layers[3].gradWeight)
           if opt.use_chars_enc == 1 then
@@ -640,26 +844,56 @@ function train(train_data, valid_data)
             end
           end	    
         end	 
+        if opt.share_embed == 1 then
+          word_vec_layers[1].gradWeight:add(word_vec_layers[2].gradWeight)
+        end
+
+        if opt.fix_encoder == 1 then
+          grad_params[1]:zero()
+        end
+        if opt.fix_decoder == 1 then
+          -- don't fix attention weights though
+          local _, g = decoder_attn_layers[1]:parameters()
+          local save_grads = {}
+          for i = 1, #g do
+            table.insert(save_grads, g[i]:clone())
+          end
+          grad_params[2]:zero()
+          for i = 1, #g do
+            g[i]:copy(save_grads[i])
+          end
+        end
+
         -- Shrink norm and update params
         local param_norm = 0
         local shrinkage = opt.max_grad_norm / grad_norm
         for j = 1, #grad_params do
-          if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
-            if j == 1 then
-              cutorch.setDevice(opt.gpuid)
-            else
-              cutorch.setDevice(opt.gpuid2)
+          if j == 4 and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+            -- special case
+            local n = grad_params[4]:norm()
+            local s = opt.max_grad_norm / n
+            if s < 1 then
+              grad_params[4]:mul(s)
             end
-          end
-          if shrinkage < 1 then
-            grad_params[j]:mul(shrinkage)
-          end
-          if opt.adagrad == 1 then
-            adagradStep(params[j], grad_params[j], layer_etas[j], optStates[j])
+            param_norm = param_norm + params[4]:norm()^2
           else
-            params[j]:add(grad_params[j]:mul(-opt.learning_rate))
-          end	    
-          param_norm = param_norm + params[j]:norm()^2
+            if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
+              if j == 1 then
+                cutorch.setDevice(opt.gpuid)
+              else
+                cutorch.setDevice(opt.gpuid2)
+              end
+            end
+            if shrinkage < 1 then
+              grad_params[j]:mul(shrinkage)
+            end
+            if opt.adagrad == 1 then
+              adagradStep(params[j], grad_params[j], layer_etas[j], optStates[j])
+            else
+              params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+            end	    
+            param_norm = param_norm + params[j]:norm()^2
+          end
         end	 
         param_norm = param_norm^0.5
         if opt.brnn == 1 then
@@ -670,11 +904,15 @@ function train(train_data, valid_data)
             end
           end	    
         end
+          if opt.share_embed == 1 then
+            word_vec_layers[2].weight:copy(word_vec_layers[1].weight)
+          end
 
         -- Bookkeeping
         num_words_target = num_words_target + batch_l*target_l
         num_words_source = num_words_source + batch_l*source_l
         train_nonzeros = train_nonzeros + nonzeros
+        loss = loss / num_samples -- normalize
         train_loss = train_loss + loss*batch_l
         local time_taken = timer:time().real - start_time
         if i % opt.print_every == 0 then
@@ -686,9 +924,24 @@ function train(train_data, valid_data)
           (num_words_target+num_words_source) / time_taken,
           num_words_source / time_taken,
           num_words_target / time_taken)			   
+          stats = stats .. string.format(', Sentence length: %d', source_l)
           print(stats)
 
-          --print('baselines:', torch.Tensor(opt.baseline):view(1,#opt.baseline))
+          if i == opt.save_batch then
+            print(string.format('saving at batch %d', i))
+            local savefile = string.format('%s_epoch%d_batch%d_%.2f.t7', opt.savefile, epoch,
+                                            i, math.exp(train_loss/train_nonzeros))      
+            print('saving checkpoint to ' .. savefile)
+            clean_layer(generator)
+            local save_table = {encoder, decoder, generator}
+            if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+              table.insert(save_table, baseline_m)
+            end
+            if opt.brnn == 1 then
+              table.insert(save_table, encoder_bwd)
+            end
+            torch.save(savefile, {save_table, opt})
+          end
         end
         if i % 200 == 0 then
           collectgarbage()
@@ -717,6 +970,13 @@ function train(train_data, valid_data)
       end
       local train_score = math.exp(total_loss/total_nonzeros)
       print('Train', train_score)
+      print(opt.train_perf)
+      print('baseline:')
+      print(opt.baseline)
+      if opt.moving_variance == 1 then
+        print('variance:')
+        print(opt.reward_variance)
+      end
       opt.train_perf[#opt.train_perf + 1] = train_score
       local score = eval(valid_data)
       opt.val_perf[#opt.val_perf + 1] = score
@@ -724,28 +984,32 @@ function train(train_data, valid_data)
         decay_lr(epoch)
       end      
       -- clean and save models
-      local savefile = string.format('%s_epoch%.2f_%.2f.t7', opt.savefile, epoch, score)      
+      local savefile = string.format('%s_epoch%d_%.2f.t7', opt.savefile, epoch, score)      
       if epoch % opt.save_every == 0 then
         print('saving checkpoint to ' .. savefile)
         clean_layer(generator)
-        if opt.brnn == 0 then
-          torch.save(savefile, {{encoder, decoder, generator}, opt})
-        else
-          torch.save(savefile, {{encoder, decoder, generator, encoder_bwd}, opt})
+        local save_table = {encoder, decoder, generator}
+        if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+          table.insert(save_table, baseline_m)
         end
+        if opt.brnn == 1 then
+          table.insert(save_table, encoder_bwd)
+        end
+        torch.save(savefile, {save_table, opt})
       end      
 
     end
+    print('done!')
     -- save final model
-    local savefile = string.format('%s_final.t7', opt.savefile)
-    clean_layer(generator)
-    print('saving final model to ' .. savefile)
-    if opt.brnn == 0 then
-      torch.save(savefile, {{encoder:double(), decoder:double(), generator:double()}, opt})
-    else
-      torch.save(savefile, {{encoder:double(), decoder:double(), generator:double(),
-      encoder_bwd:double()}, opt})
-    end
+    --local savefile = string.format('%s_final.t7', opt.savefile)
+    --clean_layer(generator)
+    --print('saving final model to ' .. savefile)
+    --if opt.brnn == 0 then
+      --torch.save(savefile, {{encoder:double(), decoder:double(), generator:double()}, opt})
+    --else
+      --torch.save(savefile, {{encoder:double(), decoder:double(), generator:double(),
+      --encoder_bwd:double()}, opt})
+    --end
   end
 
   function eval(data)
@@ -758,7 +1022,6 @@ function train(train_data, valid_data)
 
     local nll = 0
     local total = 0
-      --local asdf_bit = 1 -- TODO: delete this
     for i = 1, data:size() do
       local d = data[i]
       local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
@@ -767,10 +1030,20 @@ function train(train_data, valid_data)
       local context = context_proto[{{1, batch_l}, {1, source_l}}]
       -- forward prop encoder
       for t = 1, source_l do
-        local encoder_input = {source[t], table.unpack(rnn_state_enc)}
-        local out = encoder_clones[1]:forward(encoder_input)
-        rnn_state_enc = out
-        context[{{},t}]:copy(out[#out])
+        local encoder_input
+        if opt.no_recur == 1 then
+	 encoder_input = source[t]
+        else
+	 encoder_input = {source[t], table.unpack(rnn_state_enc)}
+        end
+	 local out = encoder_clones[1]:forward(encoder_input)
+
+   if opt.no_recur == 1 then
+     context[{{},t}]:copy(out)
+   else
+     rnn_state_enc = out
+     context[{{},t}]:copy(out[#out])
+   end
       end	 
 
       local rnn_state_dec = reset_state(init_fwd_dec, batch_l)
@@ -812,6 +1085,7 @@ function train(train_data, valid_data)
         else
           decoder_input = {target[t], context[{{},source_l}], table.unpack(rnn_state_dec)}
         end	 
+        sampler_layers[1].time_step = t
         local out = decoder_clones[1]:forward(decoder_input)
         rnn_state_dec = {}
         if opt.input_feed == 1 then
@@ -821,22 +1095,7 @@ function train(train_data, valid_data)
           table.insert(rnn_state_dec, out[j])
         end
         local pred = generator:forward(out[#out])
-          -- TODO: delete this
-          --if asdf_bit == 1 then
-            --local asdf_max, asdf_idx = pred:max(2)
-            --print('attn:', sampler_layers[t].output)
-            --print('pred:', asdf_idx)
-            --print('source:', source)
-            --local x = io.read()
-            --if x == 'asdf' then asdf_bit = 0 end
-          --end
-        --for i = 1, pred:size(1) do
-          --print('attn:', sampler_layers[t].output)
-          --print('pred:', asdf_max[i])
-          --print('source:', source:select(2,i))
-        --end
-        -- TODO: delete this
-        loss = loss + criterion:forward(pred, target_out[t])*batch_l -- added by Jeffrey
+        loss = loss + criterion:forward(pred, target_out[t])
       end
       nll = nll + loss
       total = total + nonzeros
@@ -870,6 +1129,12 @@ function get_RL_layer(layer)
         table.insert(decoder_attn_layers, layer)
       elseif layer.name == 'sampler' then
         table.insert(sampler_layers, layer)
+      elseif layer.name == 'softmax_attn' then
+        table.insert(softmax_attn_layers, layer)
+      elseif layer.name == 'mul_constant' then
+        table.insert(mul_constant_layers, layer)
+      elseif layer.name == 'MM' then
+        table.insert(mm_layers, layer)
       end
    end
 end
@@ -919,16 +1184,31 @@ function main()
    
    -- Build model
    if opt.train_from:len() == 0 then
-      encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
+     if opt.no_recur == 1 then
+       encoder = make_no_recur_encoder(valid_data, opt)
+      else
+        encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
+      end
       decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
       generator, criterion = make_generator(valid_data, opt)
+
       if opt.attn_type == 'hard' then
-        if opt.baseline_method == 'learned' then
+        if opt.baseline_method == 'learned' or opt.second_baseline == 1 then
+          print('using learned baseline method')
           baseline_m, reward_criterion = make_reinforce(valid_data, opt)
         else
           _, reward_criterion = make_reinforce(valid_data, opt)
         end
         opt.baseline = 0 -- RL average
+        opt.exact_stats = {} -- RL exact stats: \sum x, \sum x^2, n
+        opt.exact_stats['n'] = 0
+        opt.exact_stats['x'] = 0
+        opt.exact_stats['x^2'] = 0
+        -- TODO: allow this to be time dependent
+
+        if opt.moving_variance == 1 then
+          opt.reward_variance = 0 -- RL stddev
+        end
       end
       if opt.brnn == 1 then
 	 encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
@@ -947,7 +1227,7 @@ function main()
       encoder = model[1]:double()
       decoder = model[2]:double()      
       generator = model[3]:double()
-      if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'learned' then
+      if model_opt.attn_type == 'hard' and (model_opt.baseline_method == 'learned' or model_opt.second_baseline == 1) then
         baseline_m = model[4]:double()
         if model_opt.brnn == 1 then
      encoder_bwd = model[5]:double()
@@ -959,15 +1239,29 @@ function main()
       end
       if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'average' then
         opt.baseline = model_opt.baseline
+        if model_opt.moving_variance == 1 then
+          opt.moving_variance = 1 
+          opt.reward_variance = model_opt.reward_variance
+        end
+      end
+      if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'exact' then
+        opt.exact_stats = model_opt.exact_stats
       end
       _, criterion = make_generator(valid_data, opt)
       if opt.attn_type == 'hard' then
         _, reward_criterion = make_reinforce(valid_data, opt)
       end
    end   
+
+   print('init dec:', opt.init_dec)
+   print('input feed:', opt.input_feed)
+   if opt.second_baseline == 1 then
+     print('using second learned baseline')
+     assert(opt.baseline_method ~= 'learned', 'can\'t use learned baseline with second learned baseline!')
+   end
    
    layers = {encoder, decoder, generator}
-   if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
+   if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
      table.insert(layers, baseline_m)
    end
    if opt.brnn == 1 then

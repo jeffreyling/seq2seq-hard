@@ -31,8 +31,8 @@ function make_lstm(data, opt, model, use_chars)
       table.insert(inputs, nn.Identity()()) -- all context (batch_size x source_l x rnn_size)
       offset = offset + 1
       if opt.input_feed == 1 then
-	 table.insert(inputs, nn.Identity()()) -- prev context_attn (batch_size x rnn_size)
-	 offset = offset + 1
+   table.insert(inputs, nn.Identity()()) -- prev context_attn (batch_size x rnn_size)
+   offset = offset + 1
       end
    end
    for L = 1,n do
@@ -41,6 +41,7 @@ function make_lstm(data, opt, model, use_chars)
    end
 
    local x, input_size_L
+   local word_embed
    local outputs = {}
   for L = 1,n do
      -- c,h from previous timesteps
@@ -57,6 +58,7 @@ function make_lstm(data, opt, model, use_chars)
 	  end	  
 	  word_vecs.name = 'word_vecs' .. name
 	  x = word_vecs(inputs[1]) -- batch_size x word_vec_size
+    word_embed = x
        else
 	  local char_vecs = nn.LookupTable(data.char_size, opt.char_vec_size)
 	  char_vecs.name = 'word_vecs' .. name
@@ -71,10 +73,10 @@ function make_lstm(data, opt, model, use_chars)
        end
        input_size_L = input_size
        if model == 'dec' then
-	  if opt.input_feed == 1 then
-	     x = nn.JoinTable(2)({x, inputs[1+offset]}) -- batch_size x (word_vec_size + rnn_size)
-	     input_size_L = input_size + rnn_size
-	  end	  
+    if opt.input_feed == 1 then
+       x = nn.JoinTable(2)({x, inputs[1+offset]}) -- batch_size x (word_vec_size + rnn_size)
+       input_size_L = input_size + rnn_size
+    end	  
        end
     else
        x = outputs[(L-1)*2]
@@ -82,11 +84,11 @@ function make_lstm(data, opt, model, use_chars)
 	  x = nn.CAddTable()({x, outputs[(L-2)*2]})       
        end       
        input_size_L = rnn_size
-       if opt.multi_attn == L and model == 'dec' then
-	  local multi_attn = make_decoder_attn(data, opt, 1)
-	  multi_attn.name = 'multi_attn' .. L
-	  x = multi_attn({x, inputs[2]})
-       end
+       --if opt.multi_attn == L and model == 'dec' then
+		--local multi_attn = make_decoder_attn(data, opt, 1)
+		--multi_attn.name = 'multi_attn' .. L
+		--x = multi_attn({x, inputs[2]})
+       --end
        if dropout > 0 then
 	  x = nn.Dropout(dropout, nil, false)(x)
        end       
@@ -118,10 +120,15 @@ function make_lstm(data, opt, model, use_chars)
   if model == 'dec' then
      local top_h = outputs[#outputs]
      local decoder_out
+     local attn_out
      if opt.attn == 1 then
         local decoder_attn = make_decoder_attn(data, opt)
         decoder_attn.name = 'decoder_attn'
-        decoder_out = decoder_attn({top_h, inputs[2]})
+        if opt.no_recur == 1 then -- HACK
+          decoder_out = decoder_attn({word_embed, inputs[2]})
+        else
+          decoder_out = decoder_attn({top_h, inputs[2]})
+        end
      else
         decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
         decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
@@ -129,9 +136,26 @@ function make_lstm(data, opt, model, use_chars)
      if dropout > 0 then
         decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
      end     
+     
      table.insert(outputs, decoder_out)
   end
   return nn.gModule(inputs, outputs)
+end
+
+function make_no_recur_encoder(data, opt)
+   local rnn_size = opt.rnn_size
+   local input_size = opt.word_vec_size
+    assert(rnn_size == input_size, 'size mismatch')
+
+   local inputs = {}
+   table.insert(inputs, nn.Identity()()) -- x (batch_size x max_word_l)
+
+   local x
+	  local word_vecs = nn.LookupTable(data.source_size, input_size)
+	  word_vecs.name = 'word_vecs_enc'
+	  x = word_vecs(inputs[1]) -- batch_size x word_vec_size
+    --local out = nn.Linear(input_size, rnn_size)(x)
+  return nn.gModule(inputs, {x})
 end
 
 function make_decoder_attn(data, opt, simple)
@@ -139,31 +163,40 @@ function make_decoder_attn(data, opt, simple)
    -- 3D tensor for context (batch_l x source_l x rnn_size)
 
    local inputs = {}
+   local outputs = {}
    table.insert(inputs, nn.Identity()())
    table.insert(inputs, nn.Identity()())
-   local target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
+   local target_t
+   if opt.no_recur == 1 then
+      target_t = inputs[1]
+   else
+      target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
+   end
    local context = inputs[2]
    simple = simple or 0
    -- get attention
 
-   local attn = nn.MM()({context, nn.Replicate(1,3)(target_t)}) -- batch_l x source_l x 1
+   local mm = nn.MM()
+   mm.name = 'MM'
+   local attn = mm({context, nn.Replicate(1,3)(target_t)}) -- batch_l x source_l x 1
    attn = nn.Sum(3)(attn)
+   local mul_constant = nn.MulConstant(opt.temperature) -- multiply for temperature
+   mul_constant.name = 'mul_constant'
+   attn = mul_constant(attn)
    local softmax_attn = nn.SoftMax()
    softmax_attn.name = 'softmax_attn'
    attn = softmax_attn(attn)
 
    -- sample (hard attention)
    if opt.attn_type == 'hard' then
-     -- false for stochastic on valid
      local sampler = nn.ReinforceCategorical()
      sampler.semi_sampling_p = opt.semi_sampling_p
      sampler.entropy_scale = opt.entropy_scale
      sampler.name = 'sampler'
      attn = sampler(attn) -- one hot
-     -- TODO: temperature?
    end
    attn = nn.Replicate(1,2)(attn) -- batch_l x  1 x source_l
-   
+
    -- apply attention to context
    local context_combined = nn.MM()({attn, context}) -- batch_l x 1 x rnn_size
    context_combined = nn.Sum(2)(context_combined) -- batch_l x rnn_size
@@ -174,8 +207,11 @@ function make_decoder_attn(data, opt, simple)
 						 opt.rnn_size)(context_combined))
    else
       context_output = nn.CAddTable()({context_combined,inputs[1]})
-   end   
-   return nn.gModule(inputs, {context_output})   
+   end
+
+   table.insert(outputs, context_output)
+   --return nn.gModule(inputs, {context_output})   
+   return nn.gModule(inputs, outputs)   
 end
 
 function make_generator(data, opt)
@@ -186,20 +222,18 @@ function make_generator(data, opt)
    local w = torch.ones(data.target_size)
    w[1] = 0
    criterion = nn.ClassNLLCriterion(w)
-   --criterion.sizeAverage = false -- why is this here?
+   criterion.sizeAverage = false
    return model, criterion
 end
 
 function make_reinforce(data, opt)
-  local baseline = nn.Sequential()
-  local lin = nn.Linear(opt.rnn_size, 1)
-  lin.bias:zero()
-  baseline:add(lin)
+  local baseline_m = nn.Linear(opt.rnn_size, 1)
 
   local reward_criterion = nn.ReinforceNLLCriterion()
-  reward_criterion.scale = opt.reward_scale
+  reward_criterion.zero_one = opt.zero_one
+  reward_criterion.second_baseline = opt.second_baseline
 
-  return baseline, reward_criterion
+  return baseline_m, reward_criterion
 end
 
 -- cnn Unit

@@ -86,12 +86,14 @@ end
 ------------------------------------------------------------------------
 local ReinforceCategorical, parent = torch.class("nn.ReinforceCategorical", "nn.Reinforce")
 
-function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, eps_prob)
+function ReinforceCategorical:__init(semi_sampling_p, entropy_scale)
   parent.__init(self)
-  self.semi_sampling_p = semi_sampling_p or 1
+  self.semi_sampling_p = semi_sampling_p or 0
   self.entropy_scale = entropy_scale or 0
   self.through = false -- pass prob weights through
-  self.eps_prob = eps_prob or 1 -- prob of exploration
+
+  self.time_step = 0
+  self.oracle = false -- stupid hack
 end
 
 function ReinforceCategorical:_doArgmax(input)
@@ -100,10 +102,9 @@ function ReinforceCategorical:_doArgmax(input)
    self.output:scatter(2, self._index, 1)
 end
 
--- many samples???
 function ReinforceCategorical:_doSample(input)
-   self._do_sample = (torch.uniform() < self.semi_sampling_p)
-   if self._do_sample == false then
+   self._do_through = (torch.uniform() < self.semi_sampling_p)
+   if self._do_through == true then
       -- use p
       self.output:copy(input)
    else
@@ -125,12 +126,18 @@ function ReinforceCategorical:updateOutput(input)
      -- identity
      self.output:copy(input)
    else
-     if self.train then
-       self:_doSample(input)
+     if self.oracle and self.time_step <= self.output:size(2) then -- stupid hack
+       self.output:zero()
+       self.output:select(2,self.time_step):fill(1) -- very stupid hack
      else
-       assert(self.train == false)
-       -- do argmax at test time
-       self:_doArgmax(input)
+       if self.train then
+          --sample
+          self:_doSample(input)
+       else
+         assert(self.train == false)
+         -- do argmax at test time
+         self:_doArgmax(input)
+       end
      end
    end
    return self.output
@@ -146,7 +153,7 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
    -- ------------ =   
    --     d p          0         otherwise
    self.gradInput:resizeAs(input):zero()
-   if self.through then
+   if self.through or self._do_through == true then
      -- identity function
      self.gradInput:copy(gradOutput)
    else 
@@ -158,13 +165,12 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      
      -- multiply by reward 
      self.gradInput:cmul(self:rewardAs(input))
-     -- add entropy term
-     self._gradEnt = self._input:clone()
-     self._gradEnt:log():add(1)
-     self.gradInput:add(self.entropy_scale, self._gradEnt)
-
      -- multiply by -1 ( gradient descent on input )
      self.gradInput:mul(-1)
+
+     -- add entropy term
+     local grad_ent = self._input:log():add(1)
+     self.gradInput:add(self.entropy_scale, grad_ent)
    end
    return self.gradInput
 end
@@ -174,15 +180,23 @@ function ReinforceCategorical:type(type, tc)
    return parent.type(self, type, tc)
 end
 
+-- stupid hack
+function nn.MulConstant:updateGradInput(input, gradOutput)
+  self.gradInput:resizeAs(gradOutput)
+  self.gradInput:copy(gradOutput)
+  return self.gradInput
+end
 
 -- Modified ClassNLLCriterion
 local ReinforceNLLCriterion, parent = torch.class("nn.ReinforceNLLCriterion", "nn.Criterion")
 
-function ReinforceNLLCriterion:__init(scale, criterion)
+function ReinforceNLLCriterion:__init(zero_one, criterion, second_baseline)
    parent.__init(self)
-   self.scale = scale or 1 -- scale of reward
-   self.sizeAverage = true
+   self.zero_one = zero_one or 0 -- use zero one loss
+   -- TODO: include sizeAverage?
+   --self.sizeAverage = true
    self.criterion = criterion or nn.MSECriterion() -- baseline criterion
+   self.second_baseline = second_baseline or 0
 
    self.gradInput = {torch.Tensor()}
 end
@@ -191,7 +205,8 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    assert(torch.type(inputTable) == 'table')
    local input = inputTable[1]
    local b = inputTable[2]
-   local mask = inputTable[3]
+   local scale = inputTable[3]
+   local mask = inputTable[4]
 
    if type(target) == 'number' then
      if input:type() ~= 'torch.CudaTensor' then
@@ -205,21 +220,33 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    end
 
    self.reward = self.reward or input.new()
-   self.reward = input:gather(2,target:view(target:size(1), 1))
+   if self.zero_one == 1 then
+      -- zero one loss
+      local _, m_idx = input:max(2)
+      self.reward = m_idx:eq(target)
+   else
+     self.reward = input:gather(2,target:view(target:size(1), 1))
+   end
    self.reward:resize(input:size(1))
+
    -- subtract baseline
    self.vrReward = self.vrReward or self.reward.new()
    self.vrReward:resizeAs(self.reward):copy(self.reward)
    if type(b) == 'number' then
      self.vrReward:add(-b)
    else
+     -- learned case
      self.vrReward:add(-1, b)
    end
-   self.vrReward:mul(self.scale)
-   if self.sizeAverage then
-      self.vrReward:div(input:size(1))
-   end
-   self.vrReward:maskedFill(mask, 0) -- zero out padding samples
+   self.vrReward:mul(scale)
+
+   --if self.sizeAverage then
+     ---- divide!
+     --self.reward:div(input:size(1))
+     --self.vrReward:div(input:size(1))
+   --end
+   self.reward:maskedFill(mask, 0) -- mask
+   self.vrReward:maskedFill(mask, 0)
 
    -- loss = -sum(reward) aka NLL
    -- this actually doesn't matter, we won't use it
@@ -227,19 +254,14 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    return self.output
 end
 
--- TODO: consider making the baseline learned
 function ReinforceNLLCriterion:updateGradInput(inputTable, target)
   local input = inputTable[1]
   local b = inputTable[2]
-  local mask = inputTable[3]
+  local scale = inputTable[3]
+  local mask = inputTable[4]
 
   -- zero gradInput
   self.gradInput[1]:resizeAs(input):zero()
-  -- baseline grad
-  self.criterion:forward(b, self.reward)
-  self.gradInput[2] = self.criterion:backward(b, self.reward)
-  self.gradInput[2]:maskedFill(mask, 0)
-
    -- gradInput
    --self.gradInput:resizeAs(input):zero()
    --local ones = input.new():resize(target:size(1), 1):fill(1)
@@ -250,6 +272,25 @@ function ReinforceNLLCriterion:updateGradInput(inputTable, target)
    --self.gradInput:maskedFill(mask:view(mask:size(1),1):expand(self.gradInput:size()), 0) -- zero out padding samples
 
    return self.gradInput
+end
+
+function ReinforceNLLCriterion:update_baseline(inputTable, target)
+  local b = inputTable[1]
+  local mask = inputTable[2]
+
+  -- baseline grad
+  local gradInput = torch.Tensor()
+  local reward
+  if self.second_baseline == 1 then
+    reward = self.vrReward
+  else
+    reward = self.reward
+  end
+  self.criterion:forward(b, reward)
+  gradInput = self.criterion:backward(b, reward)
+  gradInput:maskedFill(mask, 0)
+
+  return gradInput
 end
 
 function ReinforceNLLCriterion:type(type)
