@@ -9,10 +9,10 @@ require 'model_utils.lua'
 
 cmd = torch.CmdLine()
 -- FIX THESE FOR TRANSLATION
-cmd:option('-init_dec', 0, [[Initialize the hidden/cell state of the decoder at time 
+cmd:option('-init_dec', 1, [[Initialize the hidden/cell state of the decoder at time 
                            0 to be the last hidden/cell state of the encoder. If 0, 
                            the initial states of the decoder are set to zero vectors]])
-cmd:option('-input_feed', 0, [[If = 1, feed the context vector at each time step as additional
+cmd:option('-input_feed', 1, [[If = 1, feed the context vector at each time step as additional
                              input (vica concatenation with the word embeddings) to the decoder]])
 
 -- crazy hacks
@@ -31,20 +31,25 @@ cmd:option('-soft_curriculum', 1, [[Anneal semi_sampling_p as 1/sqrt(epoch) if s
 
 -- hard attention specs (attn_type == 'hard')
 cmd:option('-reward_scale', 0.01, [[Scale reward by this factor]])
-cmd:option('-entropy_scale', 0, [[Scale entropy term]])
+cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
                                     set 0 to always sample]])
+
 cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned`, `average`, `exact`]])
 cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = (1-lr)*b_k + lr*r]])
 cmd:option('-global_baseline', 0, [[Baseline global instead of time dependent. Time dependent baseline is better]])
 cmd:option('-global_variance', 1, [[Variance global instead of time dependent. Global variance is better]])
+cmd:option('-second_baseline', 0, [[Have a secondary learned baseline]])
+
 -- note that without input feed, actions at time t do not affect future rewards
-cmd:option('-discount', 1.0, [[Discount factor for rewards, between 0 and 1]])
+cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
 cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
 cmd:option('-num_samples', 1, [[Number of times to sample for each data point (most people do 1)]])
 cmd:option('-temperature', 1, [[Temperature for sampling]])
 
 cmd:option('-stupid_hack', 0, [[Stupid hack]])
+cmd:option('-brnn', 1, [[If = 1, use a bidirectional RNN. Hidden states of the fwd/bwd
+                              RNNs are summed.]])
 
 
 -- data files
@@ -74,8 +79,6 @@ cmd:option('-word_vec_size', 500, [[Word embedding sizes]])
 cmd:option('-attn', 1, [[If = 1, use attention on the decoder side. If = 0, it uses the last
                        hidden state of the decoder as context at each time step.]])
 cmd:option('-attn_type', 'hard', [[Hard or soft attention on decoder side]])
-cmd:option('-brnn', 0, [[If = 1, use a bidirectional RNN. Hidden states of the fwd/bwd
-                              RNNs are summed.]])
 cmd:option('-use_chars_enc', 0, [[If = 1, use character on the encoder 
                                 side (instead of word embeddings]])
 cmd:option('-use_chars_dec', 0, [[If = 1, use character on the decoder 
@@ -180,7 +183,6 @@ function zero_table(t)
 end
 
 function train(train_data, valid_data)
-
    local timer = torch.Timer()
    local num_params = 0
    local start_decay = 0
@@ -435,16 +437,6 @@ function train(train_data, valid_data)
       local num_words_source = 0
       local num_samples = opt.num_samples
 
-      if opt.stupid_hack == 1 then
-        if epoch == 2 then
-          opt.curriculum = 2
-        elseif epoch == 1 then
-          opt.oracle_epochs = 1
-        end
-        print('curric:', opt.curriculum)
-        print('oracle:', opt.oracle_epochs)
-      end
-
       -- soft anneal 
       local cur_soft_anneal = false
       if opt.soft_anneal > 0 then
@@ -476,6 +468,7 @@ function train(train_data, valid_data)
       curric_length = curric_length + 10 * (epoch-1) -- reach max after 5 epochs
       local max_curric_i = 0
       if epoch <= opt.curriculum then
+        print(string.format('curriculum length: %d', curric_length))
         for i = 1, data:size() do
           local d = data[i]
           if d[7] > curric_length then break end -- check source_l
@@ -617,8 +610,7 @@ function train(train_data, valid_data)
               local b
               local scale = opt.reward_scale -- default
               if opt.baseline_method == 'learned' then
-                assert(false, 'not working yet')
-                b = baseline_m:forward(preds[t])
+                b = baseline_m:forward(preds[t]):squeeze(2)
               elseif opt.baseline_method == 'average' then
                 if opt.global_baseline == 1 then
                   b = opt.baseline
@@ -643,9 +635,15 @@ function train(train_data, valid_data)
                 end
               end
 
+              local second_b
+              if opt.second_baseline == 1 then
+                second_b = baseline_m:forward(preds[t]):squeeze(2)
+                b = b - second_b
+              end
+
               local mask = target_l_all:lt(t)
-              local inp = {pred, b, scale, mask}
-              reward_criterion:forward(inp, target_out[t])
+              local reward_input = {pred, b, scale, mask}
+              reward_criterion:forward(reward_input, target_out[t])
 
               local cur_reward = reward_criterion.vrReward
               cur_reward:div(batch_l)
@@ -686,10 +684,19 @@ function train(train_data, valid_data)
                     opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*update_var
                   end
                 end
+              elseif opt.baseline_method == 'learned' then
+                local dl_db = reward_criterion:update_baseline({b, mask}, target_out[t])
+                dl_db:div(batch_l)
+                baseline_m:backward(preds[t], dl_db:view(dl_db:size(1), 1))
               elseif opt.baseline_method == 'exact' then
                 opt.exact_stats['n'] = opt.exact_stats['n'] + unnorm_reward:size(1)
                 opt.exact_stats['x'] = opt.exact_stats['x'] + unnorm_reward:sum()
                 opt.exact_stats['x^2'] = opt.exact_stats['x^2'] + torch.pow(unnorm_reward, 2):sum()
+              end
+              if opt.second_baseline == 1 then
+                local dl_db = reward_criterion:update_baseline({second_b, mask}, target_out[t])
+                dl_db:div(batch_l)
+                baseline_m:backward(preds[t], dl_db:view(dl_db:size(1), 1))
               end
             end
 
@@ -818,19 +825,17 @@ function train(train_data, valid_data)
         end
 
         local grad_norm = 0
-        grad_norm = grad_norm + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
-        --if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
-          --grad_norm = grad_norm + grad_params[4]:norm()^2
-        --end
-        grad_norm = grad_norm + grad_params[1]:norm()^2
+        -- encoder, decoder, generator
+        grad_norm = grad_params[1]:norm()^2 + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
         if opt.brnn == 1 then
-          if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
+          if opt.second_baseline == 1 or opt.baseline_method == 'learned' then
             grad_norm = grad_norm + grad_params[5]:norm()^2
           else
             grad_norm = grad_norm + grad_params[4]:norm()^2
           end
         end
         grad_norm = grad_norm^0.5	 
+
         if opt.brnn == 1 then
           word_vec_layers[1].gradWeight:add(word_vec_layers[3].gradWeight)
           if opt.use_chars_enc == 1 then
@@ -863,22 +868,32 @@ function train(train_data, valid_data)
         local param_norm = 0
         local shrinkage = opt.max_grad_norm / grad_norm
         for j = 1, #grad_params do
-          if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
-            if j == 1 then
-              cutorch.setDevice(opt.gpuid)
-            else
-              cutorch.setDevice(opt.gpuid2)
+          if j == 4 and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+            -- special case
+            local n = grad_params[4]:norm()
+            local s = opt.max_grad_norm / n
+            if s < 1 then
+              grad_params[4]:mul(s)
             end
-          end
-          if shrinkage < 1 then
-            grad_params[j]:mul(shrinkage)
-          end
-          if opt.adagrad == 1 then
-            adagradStep(params[j], grad_params[j], layer_etas[j], optStates[j])
+            param_norm = param_norm + params[4]:norm()^2
           else
-            params[j]:add(grad_params[j]:mul(-opt.learning_rate))
-          end	    
-          param_norm = param_norm + params[j]:norm()^2
+            if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
+              if j == 1 then
+                cutorch.setDevice(opt.gpuid)
+              else
+                cutorch.setDevice(opt.gpuid2)
+              end
+            end
+            if shrinkage < 1 then
+              grad_params[j]:mul(shrinkage)
+            end
+            if opt.adagrad == 1 then
+              adagradStep(params[j], grad_params[j], layer_etas[j], optStates[j])
+            else
+              params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+            end	    
+            param_norm = param_norm + params[j]:norm()^2
+          end
         end	 
         param_norm = param_norm^0.5
         if opt.brnn == 1 then
@@ -918,11 +933,14 @@ function train(train_data, valid_data)
                                             i, math.exp(train_loss/train_nonzeros))      
             print('saving checkpoint to ' .. savefile)
             clean_layer(generator)
-            if opt.brnn == 0 then
-              torch.save(savefile, {{encoder, decoder, generator}, opt})
-            else
-              torch.save(savefile, {{encoder, decoder, generator, encoder_bwd}, opt})
+            local save_table = {encoder, decoder, generator}
+            if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+              table.insert(save_table, baseline_m)
             end
+            if opt.brnn == 1 then
+              table.insert(save_table, encoder_bwd)
+            end
+            torch.save(savefile, {save_table, opt})
           end
         end
         if i % 200 == 0 then
@@ -970,24 +988,28 @@ function train(train_data, valid_data)
       if epoch % opt.save_every == 0 then
         print('saving checkpoint to ' .. savefile)
         clean_layer(generator)
-        if opt.brnn == 0 then
-          torch.save(savefile, {{encoder, decoder, generator}, opt})
-        else
-          torch.save(savefile, {{encoder, decoder, generator, encoder_bwd}, opt})
+        local save_table = {encoder, decoder, generator}
+        if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+          table.insert(save_table, baseline_m)
         end
+        if opt.brnn == 1 then
+          table.insert(save_table, encoder_bwd)
+        end
+        torch.save(savefile, {save_table, opt})
       end      
 
     end
+    print('done!')
     -- save final model
-    local savefile = string.format('%s_final.t7', opt.savefile)
-    clean_layer(generator)
-    print('saving final model to ' .. savefile)
-    if opt.brnn == 0 then
-      torch.save(savefile, {{encoder:double(), decoder:double(), generator:double()}, opt})
-    else
-      torch.save(savefile, {{encoder:double(), decoder:double(), generator:double(),
-      encoder_bwd:double()}, opt})
-    end
+    --local savefile = string.format('%s_final.t7', opt.savefile)
+    --clean_layer(generator)
+    --print('saving final model to ' .. savefile)
+    --if opt.brnn == 0 then
+      --torch.save(savefile, {{encoder:double(), decoder:double(), generator:double()}, opt})
+    --else
+      --torch.save(savefile, {{encoder:double(), decoder:double(), generator:double(),
+      --encoder_bwd:double()}, opt})
+    --end
   end
 
   function eval(data)
@@ -1000,7 +1022,6 @@ function train(train_data, valid_data)
 
     local nll = 0
     local total = 0
-      --local asdf_bit = 1 -- TODO: delete this
     for i = 1, data:size() do
       local d = data[i]
       local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
@@ -1172,7 +1193,8 @@ function main()
       generator, criterion = make_generator(valid_data, opt)
 
       if opt.attn_type == 'hard' then
-        if opt.baseline_method == 'learned' then
+        if opt.baseline_method == 'learned' or opt.second_baseline == 1 then
+          print('using learned baseline method')
           baseline_m, reward_criterion = make_reinforce(valid_data, opt)
         else
           _, reward_criterion = make_reinforce(valid_data, opt)
@@ -1205,7 +1227,7 @@ function main()
       encoder = model[1]:double()
       decoder = model[2]:double()      
       generator = model[3]:double()
-      if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'learned' then
+      if model_opt.attn_type == 'hard' and (model_opt.baseline_method == 'learned' or model_opt.second_baseline == 1) then
         baseline_m = model[4]:double()
         if model_opt.brnn == 1 then
      encoder_bwd = model[5]:double()
@@ -1233,9 +1255,13 @@ function main()
 
    print('init dec:', opt.init_dec)
    print('input feed:', opt.input_feed)
+   if opt.second_baseline == 1 then
+     print('using second learned baseline')
+     assert(opt.baseline_method ~= 'learned', 'can\'t use learned baseline with second learned baseline!')
+   end
    
    layers = {encoder, decoder, generator}
-   if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
+   if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
      table.insert(layers, baseline_m)
    end
    if opt.brnn == 1 then
@@ -1266,9 +1292,6 @@ function main()
 	 cutorch.setDevice(opt.gpuid2) --criterion on gpu2
       end      
       criterion:cuda()      
-      if opt.sup_attn == 1 then
-        new_crit:cuda() -- HACK
-      end
       if opt.attn_type == 'hard' then
         reward_criterion:cuda()
       end

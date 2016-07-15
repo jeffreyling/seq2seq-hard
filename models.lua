@@ -227,15 +227,13 @@ function make_generator(data, opt)
 end
 
 function make_reinforce(data, opt)
-  local baseline = nn.Sequential()
-  local lin = nn.Linear(opt.rnn_size, 1)
-  lin.bias:zero()
-  baseline:add(lin)
+  local baseline_m = nn.Linear(opt.rnn_size, 1)
 
   local reward_criterion = nn.ReinforceNLLCriterion()
   reward_criterion.zero_one = opt.zero_one
+  reward_criterion.second_baseline = opt.second_baseline
 
-  return baseline, reward_criterion
+  return baseline_m, reward_criterion
 end
 
 -- cnn Unit

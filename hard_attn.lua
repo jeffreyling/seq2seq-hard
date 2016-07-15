@@ -190,12 +190,13 @@ end
 -- Modified ClassNLLCriterion
 local ReinforceNLLCriterion, parent = torch.class("nn.ReinforceNLLCriterion", "nn.Criterion")
 
-function ReinforceNLLCriterion:__init(zero_one, criterion)
+function ReinforceNLLCriterion:__init(zero_one, criterion, second_baseline)
    parent.__init(self)
    self.zero_one = zero_one or 0 -- use zero one loss
    -- TODO: include sizeAverage?
    --self.sizeAverage = true
    self.criterion = criterion or nn.MSECriterion() -- baseline criterion
+   self.second_baseline = second_baseline or 0
 
    self.gradInput = {torch.Tensor()}
 end
@@ -231,8 +232,12 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    -- subtract baseline
    self.vrReward = self.vrReward or self.reward.new()
    self.vrReward:resizeAs(self.reward):copy(self.reward)
-   assert(type(b) == 'number', 'non-number b')
-   self.vrReward:add(-b)
+   if type(b) == 'number' then
+     self.vrReward:add(-b)
+   else
+     -- learned case
+     self.vrReward:add(-1, b)
+   end
    self.vrReward:mul(scale)
 
    --if self.sizeAverage then
@@ -257,11 +262,6 @@ function ReinforceNLLCriterion:updateGradInput(inputTable, target)
 
   -- zero gradInput
   self.gradInput[1]:resizeAs(input):zero()
-  -- baseline grad
-  self.criterion:forward(b, self.reward)
-  self.gradInput[2] = self.criterion:backward(b, self.reward)
-  self.gradInput[2]:maskedFill(mask, 0)
-
    -- gradInput
    --self.gradInput:resizeAs(input):zero()
    --local ones = input.new():resize(target:size(1), 1):fill(1)
@@ -272,6 +272,25 @@ function ReinforceNLLCriterion:updateGradInput(inputTable, target)
    --self.gradInput:maskedFill(mask:view(mask:size(1),1):expand(self.gradInput:size()), 0) -- zero out padding samples
 
    return self.gradInput
+end
+
+function ReinforceNLLCriterion:update_baseline(inputTable, target)
+  local b = inputTable[1]
+  local mask = inputTable[2]
+
+  -- baseline grad
+  local gradInput = torch.Tensor()
+  local reward
+  if self.second_baseline == 1 then
+    reward = self.vrReward
+  else
+    reward = self.reward
+  end
+  self.criterion:forward(b, reward)
+  gradInput = self.criterion:backward(b, reward)
+  gradInput:maskedFill(mask, 0)
+
+  return gradInput
 end
 
 function ReinforceNLLCriterion:type(type)
