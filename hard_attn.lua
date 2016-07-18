@@ -190,13 +190,12 @@ end
 -- Modified ClassNLLCriterion
 local ReinforceNLLCriterion, parent = torch.class("nn.ReinforceNLLCriterion", "nn.Criterion")
 
-function ReinforceNLLCriterion:__init(zero_one, criterion, second_baseline)
+function ReinforceNLLCriterion:__init(zero_one, criterion)
    parent.__init(self)
    self.zero_one = zero_one or 0 -- use zero one loss
    -- TODO: include sizeAverage?
    --self.sizeAverage = true
    self.criterion = criterion or nn.MSECriterion() -- baseline criterion
-   self.second_baseline = second_baseline or 0
 
    self.gradInput = {torch.Tensor()}
 end
@@ -204,9 +203,7 @@ end
 function ReinforceNLLCriterion:updateOutput(inputTable, target)
    assert(torch.type(inputTable) == 'table')
    local input = inputTable[1]
-   local b = inputTable[2]
-   local scale = inputTable[3]
-   local mask = inputTable[4]
+   local mask = inputTable[2]
 
    if type(target) == 'number' then
      if input:type() ~= 'torch.CudaTensor' then
@@ -228,7 +225,15 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
      self.reward = input:gather(2,target:view(target:size(1), 1))
    end
    self.reward:resize(input:size(1))
+   self.reward:maskedFill(mask, 0) -- mask
 
+   -- loss = -sum(reward) aka NLL
+   -- this actually doesn't matter, we won't use it
+   self.output = -self.reward:sum()
+   return self.output
+end
+
+function ReinforceNLLCriterion:variance_reduce(b, scale, mask)
    -- subtract baseline
    self.vrReward = self.vrReward or self.reward.new()
    self.vrReward:resizeAs(self.reward):copy(self.reward)
@@ -238,56 +243,25 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
      -- learned case
      self.vrReward:add(-1, b)
    end
-   self.vrReward:mul(scale)
-
-   --if self.sizeAverage then
-     ---- divide!
-     --self.reward:div(input:size(1))
-     --self.vrReward:div(input:size(1))
-   --end
-   self.reward:maskedFill(mask, 0) -- mask
+   if scale < 1 then
+     -- don't normalize when scale gets too big
+     self.vrReward:mul(scale)
+   end
    self.vrReward:maskedFill(mask, 0)
-
-   -- loss = -sum(reward) aka NLL
-   -- this actually doesn't matter, we won't use it
-   self.output = -self.reward:sum()
-   return self.output
+   return self.vrReward
 end
 
 function ReinforceNLLCriterion:updateGradInput(inputTable, target)
-  local input = inputTable[1]
-  local b = inputTable[2]
-  local scale = inputTable[3]
-  local mask = inputTable[4]
-
-  -- zero gradInput
   self.gradInput[1]:resizeAs(input):zero()
-   -- gradInput
-   --self.gradInput:resizeAs(input):zero()
-   --local ones = input.new():resize(target:size(1), 1):fill(1)
-   --if input:type() == 'torch.CudaTensor' then
-     --ones = ones:cuda()
-   --end
-   --self.gradInput:scatter(2, target:view(target:size(1), 1), -ones)
-   --self.gradInput:maskedFill(mask:view(mask:size(1),1):expand(self.gradInput:size()), 0) -- zero out padding samples
-
    return self.gradInput
 end
 
-function ReinforceNLLCriterion:update_baseline(inputTable, target)
-  local b = inputTable[1]
-  local mask = inputTable[2]
-
+function ReinforceNLLCriterion:update_baseline(b, mask, target)
   -- baseline grad
   local gradInput = torch.Tensor()
-  local reward
-  if self.second_baseline == 1 then
-    reward = self.vrReward
-  else
-    reward = self.reward
-  end
-  self.criterion:forward(b, reward)
-  gradInput = self.criterion:backward(b, reward)
+  --print('crit error:', self.criterion:forward(b, target))
+  --io.read()
+  gradInput = self.criterion:backward(b, target)
   gradInput:maskedFill(mask, 0)
 
   return gradInput

@@ -231,7 +231,6 @@ function make_reinforce(data, opt)
 
   local reward_criterion = nn.ReinforceNLLCriterion()
   reward_criterion.zero_one = opt.zero_one
-  reward_criterion.second_baseline = opt.second_baseline
 
   return baseline_m, reward_criterion
 end

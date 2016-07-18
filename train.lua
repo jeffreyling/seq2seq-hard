@@ -35,11 +35,10 @@ cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
                                     set 0 to always sample]])
 
-cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned`, `average`, `exact`]])
+cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned`, `average`, `exact`, `both`]])
 cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = (1-lr)*b_k + lr*r]])
 cmd:option('-global_baseline', 0, [[Baseline global instead of time dependent. Time dependent baseline is better]])
 cmd:option('-global_variance', 1, [[Variance global instead of time dependent. Global variance is better]])
-cmd:option('-second_baseline', 0, [[Have a secondary learned baseline]])
 
 -- note that without input feed, actions at time t do not affect future rewards
 cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
@@ -313,7 +312,7 @@ function train(train_data, valid_data)
       end
     end
 
-     if opt.baseline_method == 'average' then
+     if opt.baseline_method == 'average' or opt.baseline_method == 'both' then
        -- baseline should be time dependent on target
        if opt.global_baseline == 0 and type(opt.baseline) == 'number' then
          opt.baseline = torch.zeros(opt.max_sent_l_targ)
@@ -606,46 +605,81 @@ function train(train_data, valid_data)
           for t = target_l, 1, -1 do
             local pred = generator:forward(preds[t])
             if opt.attn_type == 'hard' then
-              -- reward stuff
-              local b
+              -- compute reward. reward_criterion will have self.reward
+              local mask = target_l_all:lt(t)
+              local reward_input = {pred, mask}
+              reward_criterion:forward(reward_input, target_out[t])
+              local unnorm_reward = reward_criterion.reward
+
+              -- variance reduction: baselines, etc.
+              local b, b_learned, b_const
               local scale = opt.reward_scale -- default
               if opt.baseline_method == 'learned' then
-                b = baseline_m:forward(preds[t]):squeeze(2)
+                b_learned = baseline_m:forward(preds[t]):squeeze(2)
+                b = b_learned
               elseif opt.baseline_method == 'average' then
+                -- we update the moving averages first
                 if opt.global_baseline == 1 then
+                  opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*unnorm_reward:mean()
                   b = opt.baseline
                 else
+                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*unnorm_reward:mean()
                   b = opt.baseline[t]
                 end
 
                 if opt.moving_variance == 1 then
-                  if opt.global_variance == 1 then
-                    scale = 1/math.sqrt(opt.reward_variance + 1e-8)
-                  else
-                    scale = 1/math.sqrt(opt.reward_variance[t] + 1e-8)
+                  local var_update = unnorm_reward:var()
+                  if var_update == var_update then -- prevent nan
+                    if opt.global_variance == 1 then
+                      opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*var_update
+                      scale = 1/math.sqrt(opt.reward_variance + 1e-8)
+                    else
+                      opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*var_update
+                      scale = 1/math.sqrt(opt.reward_variance[t] + 1e-8)
+                    end
                   end
                 end
               elseif opt.baseline_method == 'exact' then
-                -- exact mean
-                b = opt.exact_stats['x'] / opt.exact_stats['n']
+                -- update first
+                opt.exact_stats['n'] = opt.exact_stats['n'] + unnorm_reward:size(1)
+                opt.exact_stats['x'] = opt.exact_stats['x'] + unnorm_reward:sum()
+                opt.exact_stats['x^2'] = opt.exact_stats['x^2'] + torch.pow(unnorm_reward, 2):sum()
 
+                -- exact mean and variance
+                b = opt.exact_stats['x'] / opt.exact_stats['n']
                 if opt.moving_variance == 1 then
                   scale = opt.exact_stats['x^2'] / opt.exact_stats['n'] - b*b
                   scale = 1/math.sqrt(scale + 1e-8)
                 end
+              elseif opt.baseline_method == 'both' then
+                -- we update the moving averages first
+                b_learned = baseline_m:forward(preds[t]):squeeze(2)
+                local reward_minus_learned = unnorm_reward:clone():add(-1, b_learned) -- use normalized version for update
+                if opt.global_baseline == 1 then
+                  opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*reward_minus_learned:mean()
+                  b_const = opt.baseline
+                else
+                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*reward_minus_learned:mean()
+                  b_const = opt.baseline[t]
+                end
+                b = b_const + b_learned -- add the learned and moving covariates
+
+                if opt.moving_variance == 1 then
+                  local var_update = reward_minus_learned:var()
+                  if var_update == var_update then -- prevent nan
+                    if opt.global_variance == 1 then
+                      opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*var_update
+                      scale = 1/math.sqrt(opt.reward_variance + 1e-8)
+                    else
+                      opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*var_update
+                      scale = 1/math.sqrt(opt.reward_variance[t] + 1e-8)
+                    end
+                  end
+                end
               end
 
-              local second_b
-              if opt.second_baseline == 1 then
-                second_b = baseline_m:forward(preds[t]):squeeze(2)
-                b = b - second_b
-              end
-
-              local mask = target_l_all:lt(t)
-              local reward_input = {pred, b, scale, mask}
-              reward_criterion:forward(reward_input, target_out[t])
-
-              local cur_reward = reward_criterion.vrReward
+              -- get the variance reduced reward
+              local cur_reward = reward_criterion:variance_reduce(b, scale, mask)
               cur_reward:div(batch_l)
               if opt.input_feed == 1 then
                 if t == target_l then
@@ -661,41 +695,14 @@ function train(train_data, valid_data)
               -- broadcast
               sampler_layers[t]:reinforce(cur_reward:clone())
 
-              -- update baselines
-              local unnorm_reward = reward_criterion.reward
-              if opt.baseline_method == 'average' then
-                if opt.global_baseline == 1 then
-                  opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*unnorm_reward:mean()
-                else
-                  opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*unnorm_reward:mean()
-                end
-
-                if opt.moving_variance == 1 then
-                  if opt.global_variance == 1 then
-                    local update_var
-                    if opt.global_baseline == 1 then
-                      update_var = (unnorm_reward:mean() - opt.baseline)^2
-                    else
-                      update_var = (unnorm_reward:mean() - opt.baseline:mean())^2
-                    end
-                    opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*update_var
-                  else
-                    local update_var = (unnorm_reward:mean() - opt.baseline[t])^2
-                    opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*update_var
-                  end
-                end
-              elseif opt.baseline_method == 'learned' then
-                local dl_db = reward_criterion:update_baseline({b, mask}, target_out[t])
-                dl_db:div(batch_l)
+              -- update learned baselines
+              if opt.baseline_method == 'learned' then
+                local dl_db = reward_criterion:update_baseline(b, mask, unnorm_reward)
+                -- no need to divide by batch_l since MSECriterion does it
                 baseline_m:backward(preds[t], dl_db:view(dl_db:size(1), 1))
-              elseif opt.baseline_method == 'exact' then
-                opt.exact_stats['n'] = opt.exact_stats['n'] + unnorm_reward:size(1)
-                opt.exact_stats['x'] = opt.exact_stats['x'] + unnorm_reward:sum()
-                opt.exact_stats['x^2'] = opt.exact_stats['x^2'] + torch.pow(unnorm_reward, 2):sum()
-              end
-              if opt.second_baseline == 1 then
-                local dl_db = reward_criterion:update_baseline({second_b, mask}, target_out[t])
-                dl_db:div(batch_l)
+              elseif opt.baseline_method == 'both' then
+                local target = unnorm_reward:add(-b_const) -- use normalized version for update
+                local dl_db = reward_criterion:update_baseline(b_learned, mask, target)
                 baseline_m:backward(preds[t], dl_db:view(dl_db:size(1), 1))
               end
             end
@@ -828,7 +835,7 @@ function train(train_data, valid_data)
         -- encoder, decoder, generator
         grad_norm = grad_params[1]:norm()^2 + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
         if opt.brnn == 1 then
-          if opt.second_baseline == 1 or opt.baseline_method == 'learned' then
+          if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
             grad_norm = grad_norm + grad_params[5]:norm()^2
           else
             grad_norm = grad_norm + grad_params[4]:norm()^2
@@ -868,7 +875,7 @@ function train(train_data, valid_data)
         local param_norm = 0
         local shrinkage = opt.max_grad_norm / grad_norm
         for j = 1, #grad_params do
-          if j == 4 and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+          if j == 4 and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
             -- special case
             local n = grad_params[4]:norm()
             local s = opt.max_grad_norm / n
@@ -934,7 +941,7 @@ function train(train_data, valid_data)
             print('saving checkpoint to ' .. savefile)
             clean_layer(generator)
             local save_table = {encoder, decoder, generator}
-            if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+            if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
               table.insert(save_table, baseline_m)
             end
             if opt.brnn == 1 then
@@ -989,7 +996,7 @@ function train(train_data, valid_data)
         print('saving checkpoint to ' .. savefile)
         clean_layer(generator)
         local save_table = {encoder, decoder, generator}
-        if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+        if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
           table.insert(save_table, baseline_m)
         end
         if opt.brnn == 1 then
@@ -1193,7 +1200,7 @@ function main()
       generator, criterion = make_generator(valid_data, opt)
 
       if opt.attn_type == 'hard' then
-        if opt.baseline_method == 'learned' or opt.second_baseline == 1 then
+        if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
           print('using learned baseline method')
           baseline_m, reward_criterion = make_reinforce(valid_data, opt)
         else
@@ -1227,7 +1234,7 @@ function main()
       encoder = model[1]:double()
       decoder = model[2]:double()      
       generator = model[3]:double()
-      if model_opt.attn_type == 'hard' and (model_opt.baseline_method == 'learned' or model_opt.second_baseline == 1) then
+      if model_opt.attn_type == 'hard' and (model_opt.baseline_method == 'learned' or model_opt.baseline_method == 'both') then
         baseline_m = model[4]:double()
         if model_opt.brnn == 1 then
      encoder_bwd = model[5]:double()
@@ -1237,7 +1244,7 @@ function main()
      encoder_bwd = model[4]:double()
         end      
       end
-      if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'average' then
+      if model_opt.attn_type == 'hard' and (model_opt.baseline_method == 'average' or model_opt.baseline_method == 'both') then
         opt.baseline = model_opt.baseline
         if model_opt.moving_variance == 1 then
           opt.moving_variance = 1 
@@ -1255,13 +1262,12 @@ function main()
 
    print('init dec:', opt.init_dec)
    print('input feed:', opt.input_feed)
-   if opt.second_baseline == 1 then
-     print('using second learned baseline')
-     assert(opt.baseline_method ~= 'learned', 'can\'t use learned baseline with second learned baseline!')
+   if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
+     print('using learned baseline method')
    end
    
    layers = {encoder, decoder, generator}
-   if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.second_baseline == 1) then
+   if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
      table.insert(layers, baseline_m)
    end
    if opt.brnn == 1 then

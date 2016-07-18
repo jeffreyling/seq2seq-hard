@@ -191,7 +191,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       for t = source_l, 1, -1 do
          local encoder_input = {source_input[t], table.unpack(rnn_state_enc)}
          local out
-         if model_opt.baseline_method == 'learned' or model_opt.second_baseline == 1 then
+         if model_opt.baseline_method == 'learned' or model_opt.baseline_method == 'both' then
            out = model[5]:forward(encoder_input)
          else
            out = model[4]:forward(encoder_input)
