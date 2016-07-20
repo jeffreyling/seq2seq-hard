@@ -59,3 +59,23 @@ function LinearNoBias:accGradParameters(input, gradOutput, scale)
       self.gradWeight:addmm(scale, gradOutput:t(), input)
    end
 end
+
+
+--local ReshapeAs = torch.class('nn.ReshapeAs', 'nn.Module')
+---- Reshapes input[1] based on input[2] size
+
+--function ReshapeAs:__init()
+  --parent.__init(self)
+  --self.gradInput = {torch.Tensor()}
+--end
+
+--function ReshapeAs:updateOutput(input)
+  --assert(#input == 2, 'ReshapeAs can only take 2 inputs!')
+  --self.output = input[1]:viewAs(input[2])
+  --return self.output
+--end
+
+--function ReshapeAs:updateGradInput(input, gradOutput)
+  --self.gradInput[1]:viewAs(gradOutput, input)
+  --return self.gradInput
+--end

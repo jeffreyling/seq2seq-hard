@@ -21,18 +21,19 @@ function make_lstm(data, opt, model, use_chars)
    if use_chars == 0 then
       input_size = opt.word_vec_size
    else
-      input_size = opt.num_kernels
+      --input_size = opt.num_kernels
+      input_size = opt.word_vec_size
    end   
    local offset = 0
   -- there will be 2*n+3 inputs
    local inputs = {}
    table.insert(inputs, nn.Identity()()) -- x (batch_size x max_word_l)
    if model == 'dec' then
-      table.insert(inputs, nn.Identity()()) -- all context (batch_size x source_l x rnn_size)
+      table.insert(inputs, nn.Identity()()) -- all context (batch_size x source_l x source_char_l x rnn_size)
       offset = offset + 1
       if opt.input_feed == 1 then
-   table.insert(inputs, nn.Identity()()) -- prev context_attn (batch_size x rnn_size)
-   offset = offset + 1
+        table.insert(inputs, nn.Identity()()) -- prev context_attn (batch_size x rnn_size)
+        offset = offset + 1
       end
    end
    for L = 1,n do
@@ -41,7 +42,6 @@ function make_lstm(data, opt, model, use_chars)
    end
 
    local x, input_size_L
-   local word_embed
    local outputs = {}
   for L = 1,n do
      -- c,h from previous timesteps
@@ -58,25 +58,25 @@ function make_lstm(data, opt, model, use_chars)
 	  end	  
 	  word_vecs.name = 'word_vecs' .. name
 	  x = word_vecs(inputs[1]) -- batch_size x word_vec_size
-    word_embed = x
        else
-	  local char_vecs = nn.LookupTable(data.char_size, opt.char_vec_size)
+	  local char_vecs = nn.LookupTable(data.char_size, opt.word_vec_size)
 	  char_vecs.name = 'word_vecs' .. name
-	  local charcnn = make_cnn(opt.char_vec_size,  opt.kernel_width, opt.num_kernels)
-	  charcnn.name = 'charcnn' .. name
-	  x = charcnn(char_vecs(inputs[1]))
-	  if opt.num_highway_layers > 0 then
-	     local mlp = make_highway(input_size, opt.num_highway_layers)
-	     mlp.name = 'mlp' .. name
-	     x = mlp(x)
-	  end	  
+	  x = nn.Reshape(-1, opt.word_vec_size, false)(char_vecs(inputs[1])) -- (batch_size*char_length) x word_vec_size
+	  --local charcnn = make_cnn(opt.char_vec_size,  opt.kernel_width, opt.num_kernels)
+	  --charcnn.name = 'charcnn' .. name
+	  --x = charcnn(char_vecs(inputs[1]))
+	  --if opt.num_highway_layers > 0 then
+	     --local mlp = make_highway(input_size, opt.num_highway_layers)
+	     --mlp.name = 'mlp' .. name
+	     --x = mlp(x)
+	  --end	  
        end
        input_size_L = input_size
        if model == 'dec' then
-    if opt.input_feed == 1 then
-       x = nn.JoinTable(2)({x, inputs[1+offset]}) -- batch_size x (word_vec_size + rnn_size)
-       input_size_L = input_size + rnn_size
-    end	  
+          if opt.input_feed == 1 then
+             x = nn.JoinTable(2)({x, inputs[1+offset]}) -- batch_size x (word_vec_size + rnn_size)
+             input_size_L = input_size + rnn_size
+          end	  
        end
     else
        x = outputs[(L-1)*2]
@@ -98,7 +98,7 @@ function make_lstm(data, opt, model, use_chars)
     local h2h = nn.LinearNoBias(rnn_size, 4 * rnn_size):reuseMem()(prev_h)
     local all_input_sums = nn.CAddTable()({i2h, h2h})
 
-    local reshaped = nn.Reshape(4, rnn_size)(all_input_sums)
+    local reshaped = nn.Reshape(4, rnn_size, true)(all_input_sums)
     local n1, n2, n3, n4 = nn.SplitTable(2)(reshaped):split(4)
     -- decode the gates
     local in_gate = nn.Sigmoid():reuseMem()(n1)
@@ -124,11 +124,7 @@ function make_lstm(data, opt, model, use_chars)
      if opt.attn == 1 then
         local decoder_attn = make_decoder_attn(data, opt)
         decoder_attn.name = 'decoder_attn'
-        if opt.no_recur == 1 then -- HACK
-          decoder_out = decoder_attn({word_embed, inputs[2]})
-        else
-          decoder_out = decoder_attn({top_h, inputs[2]})
-        end
+        decoder_out = decoder_attn({top_h, inputs[2]})
      else
         decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
         decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
@@ -160,25 +156,18 @@ end
 
 function make_decoder_attn(data, opt, simple)
    -- 2D tensor target_t (batch_l x rnn_size) and
-   -- 3D tensor for context (batch_l x source_l x rnn_size)
+   -- 4D tensor for context (batch_l x source_l x source_char_l x rnn_size)
 
    local inputs = {}
    local outputs = {}
    table.insert(inputs, nn.Identity()())
    table.insert(inputs, nn.Identity()())
-   local target_t
-   if opt.no_recur == 1 then
-      target_t = inputs[1]
-   else
-      target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
-   end
-   local context = inputs[2]
+   local target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
+   local context = nn.Reshape(-1, opt.rnn_size, true)(inputs[2]) -- batch_l x (source_l*source_char_l) x rnn_size
    simple = simple or 0
    -- get attention
 
-   local mm = nn.MM()
-   mm.name = 'MM'
-   local attn = mm({context, nn.Replicate(1,3)(target_t)}) -- batch_l x source_l x 1
+   local attn = nn.MM()({context, nn.Replicate(1,3)(target_t)}) -- batch_l x (source_l*source_char_l) x 1
    attn = nn.Sum(3)(attn)
    local mul_constant = nn.MulConstant(opt.temperature) -- multiply for temperature
    mul_constant.name = 'mul_constant'
@@ -195,7 +184,7 @@ function make_decoder_attn(data, opt, simple)
      sampler.name = 'sampler'
      attn = sampler(attn) -- one hot
    end
-   attn = nn.Replicate(1,2)(attn) -- batch_l x  1 x source_l
+   attn = nn.Replicate(1,2)(attn) -- batch_l x  1 x (source_l*source_char_l)
 
    -- apply attention to context
    local context_combined = nn.MM()({attn, context}) -- batch_l x 1 x rnn_size

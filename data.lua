@@ -22,14 +22,16 @@ function data:__init(opt, data_file)
    self.batch_idx = f:read('batch_idx'):all()
    
    self.target_size = f:read('target_size'):all()[1]
-   self.source_size = f:read('source_size'):all()[1]
+   --self.source_size = f:read('source_size'):all()[1]
    self.target_nonzeros = f:read('target_nonzeros'):all()
   
    if opt.use_chars_enc == 1 then
-      self.source_char = f:read('source_char'):all()
+      self.source_char = f:read('source_char'):all() -- N x max_sent_l x max_word_l
+      self.source_char_l = f:read('source_char_l'):all() -- max source word each batch
       self.char_size = f:read('char_size'):all()[1]
-      self.char_length = self.source_char:size(3)
+      --self.char_length = self.source_char:size(3)
       if opt.start_symbol == 0 then
+         self.source_char_l:add(-2)
 	 self.source_char = self.source_char[{{}, {2, self.source_char:size(2)-1}}]
       end      
    end
@@ -57,7 +59,9 @@ function data:__init(opt, data_file)
       if opt.use_chars_enc == 1 then
 	 source_i = self.source_char:sub(self.batch_idx[i],
 					      self.batch_idx[i] + self.batch_l[i]-1, 1,
-					      self.source_l[i]):transpose(1,2):contiguous()
+					      self.source_l[i], 1, self.source_char_l[i]):permute(3,1,2):contiguous()
+                                              -- permute to get words, batch, sents
+                                              -- TODO: is there a way to make the batch size right here?
       else
 	 source_i =  self.source:sub(self.batch_idx[i], self.batch_idx[i]+self.batch_l[i]-1,
 				     1, self.source_l[i]):transpose(1,2)
@@ -82,7 +86,8 @@ function data:__init(opt, data_file)
 				  self.batch_l[i],
 				  self.target_l[i],
 				  self.source_l[i],
-				  target_l_i})
+				  target_l_i,
+                                  self.source_char_l[i]})
    end
 end
 
@@ -102,6 +107,7 @@ function data.__index(self, idx)
       local target_l = self.batches[idx][6]
       local source_l = self.batches[idx][7]
       local target_l_all = self.batches[idx][8]
+      local source_char_l = self.batches[idx][9]
       if opt.gpuid >= 0 then --if multi-gpu, source lives in gpuid1, rest on gpuid2
 	 cutorch.setDevice(opt.gpuid)
 	 source_input = source_input:cuda()
@@ -113,7 +119,7 @@ function data.__index(self, idx)
 	 target_l_all = target_l_all:cuda()
       end
       return {target_input, target_output, nonzeros, source_input,
-	      batch_l, target_l, source_l, target_l_all}
+	      batch_l, target_l, source_l, target_l_all, source_char_l}
    end
 end
 
