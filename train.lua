@@ -10,6 +10,7 @@ require 'model_utils.lua'
 cmd = torch.CmdLine()
 
 cmd:option('-debug', 0, [[Debug]])
+cmd:option('-hierarchical', 0, [[Do hierarchical attention]])
 
 -- FIX THESE FOR TRANSLATION
 cmd:option('-init_dec', 0, [[Initialize the hidden/cell state of the decoder at time 
@@ -170,6 +171,31 @@ cmd:text("")
 opt = cmd:parse(arg)
 torch.manualSeed(opt.seed)
 
+function save_checkpoint(savefile)
+  local save_table = {encoder, decoder, generator, decoder_attn}
+  local save_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
+  local idx = #save_idx + 1
+  if opt.hierarchical == 1 then
+    table.insert(save_table, bow_encoder)
+    save_idx['bow_encoder'] = idx
+    idx = idx + 1
+  end
+  if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
+    table.insert(save_table, baseline_m)
+    save_idx['baseline_m'] = idx
+    idx = idx + 1
+  end
+  if opt.brnn == 1 then
+    table.insert(save_table, encoder_bwd)
+    save_idx['encoder_bwd'] = idx
+    idx = idx + 1
+  end
+  opt.save_idx = save_idx
+  if opt.debug == 0 then
+    torch.save(savefile, {save_table, opt})
+  end
+end
+
 function zero_table(t)
    for i = 1, #t do
       if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
@@ -231,15 +257,22 @@ function train(train_data, valid_data)
    if opt.brnn == 1 then --subtract shared params for brnn
       num_params = num_params - word_vec_layers[1].weight:nElement()
       word_vec_layers[3].weight:copy(word_vec_layers[1].weight)
-      if opt.use_chars_enc == 1 then
-	 for i = 1, charcnn_offset do
-	    num_params = num_params - charcnn_layers[i]:nElement()
-	    charcnn_layers[i+charcnn_offset]:copy(charcnn_layers[i])
-	 end	 
-      end            
+      --if opt.use_chars_enc == 1 then
+	 --for i = 1, charcnn_offset do
+	    --num_params = num_params - charcnn_layers[i]:nElement()
+	    --charcnn_layers[i+charcnn_offset]:copy(charcnn_layers[i])
+	 --end	 
+      --end            
+   end
+
+   if opt.hierarchical == 1 then
+     -- subtract shared params for bow encoder
+     num_params = num_params - word_vecs_bow.weight:nElement()
+     word_vecs_bow.weight:copy(word_vec_layers[1].weight)
    end
    print("Number of parameters: " .. num_params)
    
+   -- padding
    if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
       cutorch.setDevice(opt.gpuid)
       word_vec_layers[1].weight[1]:zero()
@@ -251,6 +284,9 @@ function train(train_data, valid_data)
       if opt.brnn == 1 then
 	 word_vec_layers[3].weight[1]:zero()
       end      
+      if opt.hierarchical == 1 then
+        word_vecs_bow.weight[1]:zero()
+      end
    end         
    
    -- prototypes for gradients so there is no need to clone
@@ -259,9 +295,12 @@ function train(train_data, valid_data)
    local encoder_bwd_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.max_word_l, opt.rnn_size)
    context_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.max_word_l, opt.rnn_size)
    context_proto2 = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.max_word_l, opt.rnn_size)
+   local encoder_bow_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.word_vec_size)
+   context_bow_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.word_vec_size)
    
    -- clone encoder/decoder up to max source/target length   
    decoder_clones = clone_many_times(decoder, opt.max_sent_l_targ)
+   decoder_attn_clones = clone_many_times(decoder_attn, opt.max_sent_l_targ)
    encoder_clones = clone_many_times(encoder, opt.max_word_l)
    if opt.brnn == 1 then
       encoder_bwd_clones = clone_many_times(encoder_bwd, opt.max_word_l)
@@ -282,17 +321,16 @@ function train(train_data, valid_data)
    end   
 
    if opt.attn_type == 'hard' then
-     decoder_attn_layers = {}
      sampler_layers = {}
      softmax_attn_layers = {}
      mul_constant_layers = {}
      -- save stochastic layers
      for i = 1, opt.max_sent_l_targ do
-       decoder_clones[i]:apply(get_RL_layer)
-       decoder_attn_layers[i]:apply(get_RL_layer)
+       decoder_attn_clones[i]:apply(get_RL_layer)
        sampler_layers[i].time_step = i -- very stupid hack
        sampler_layers[i].entropy_scale = opt.entropy_scale -- control
        sampler_layers[i].semi_sampling_p = opt.semi_sampling_p -- control
+       -- TODO: this will break
        mul_constant_layers[i].constant_scalar = opt.temperature -- reset temperature
      end
 
@@ -342,10 +380,14 @@ function train(train_data, valid_data)
 	 context_proto2 = context_proto2:cuda()	 
       else
 	 context_proto = context_proto:cuda()
+         context_bow_proto = context_bow_proto:cuda()
 	 encoder_grad_proto = encoder_grad_proto:cuda()
 	 if opt.brnn == 1 then
 	    encoder_bwd_grad_proto = encoder_bwd_grad_proto:cuda()
 	 end	 
+         if opt.hierarchical == 1 then
+           encoder_bow_grad_proto = encoder_bow_grad_proto:cuda()
+         end
       end
    end
 
@@ -356,7 +398,6 @@ function train(train_data, valid_data)
    if opt.input_feed == 1 then
       table.insert(init_fwd_dec, h_init:clone())
    end
-   table.insert(init_bwd_dec, h_init:clone()) -- context
    
    for L = 1, opt.num_layers do
       table.insert(init_fwd_enc, h_init_enc:clone())
@@ -369,7 +410,8 @@ function train(train_data, valid_data)
       table.insert(init_bwd_dec, h_init:clone())      
    end      
 
-   dec_offset = 3 -- offset depends on input feeding
+   --dec_offset = 3 -- offset depends on input feeding
+   dec_offset = 2 -- offset depends on input feeding
    if opt.input_feed == 1 then
       dec_offset = dec_offset + 1
    end
@@ -505,9 +547,24 @@ function train(train_data, valid_data)
           end	 
           local rnn_state_enc = reset_state(init_fwd_enc, batch_l*source_l, 0) -- different batch size for summary
           local context = context_proto[{{1, batch_l}, {1, source_l}, {1, source_char_l}}]
+
+          local encoder_bow_grads
+          local context_bow
+          if opt.hierarchical == 1 then
+            encoder_bow_grads = encoder_bow_grad_proto[{{1, batch_l}, {1, source_l}}]
+            context_bow = context_bow_proto[{{1, batch_l}, {1, source_l}}]
+          end
           if opt.gpuid >= 0 then
             cutorch.setDevice(opt.gpuid)
           end	 
+
+          -- forward prop encoder bow
+          if opt.hierarchical == 1 then
+            bow_encoder:training()
+            local bow_out = bow_encoder:forward(source:permute(2,3,1))
+            context_bow:copy(bow_out)
+          end
+
           -- forward prop encoder
           for t = 1, source_char_l do
             encoder_clones[t]:training()
@@ -577,21 +634,33 @@ function train(train_data, valid_data)
           end
 
           local preds = {}
+          local decoder_out = {}
           for t = 1, target_l do
             decoder_clones[t]:training()
+            decoder_attn_clones[t]:training()
             local decoder_input
             if opt.attn == 1 then
-              decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
+              decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
             else
-              decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec[t-1])}
+              assert(false)
+              --decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec[t-1])}
             end	    
             local out = decoder_clones[t]:forward(decoder_input)
-            local next_state = {}
-            table.insert(preds, out[#out])
-            if opt.input_feed == 1 then
-              table.insert(next_state, out[#out])
+            table.insert(decoder_out, out[#out]) -- for backprop
+            local decoder_attn_input
+            if opt.hierarchical == 1 then
+              decoder_attn_input = {out[#out], context, context_bow} 
+            else
+              decoder_attn_input = {out[#out], context}
             end
-            for j = 1, #out-1 do
+            local pred = decoder_attn_clones[t]:forward(decoder_attn_input)
+            table.insert(preds, pred)
+
+            local next_state = {}
+            if opt.input_feed == 1 then
+              table.insert(next_state, pred)
+            end
+            for j = 1, #out do
               table.insert(next_state, out[j])
             end
             rnn_state_dec[t] = next_state
@@ -602,6 +671,9 @@ function train(train_data, valid_data)
           if opt.brnn == 1 then
             encoder_bwd_grads:zero()
           end
+          if opt.hierarchical == 1 then
+            encoder_bow_grads:zero()
+          end
 
           local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
           local sum_reward -- for hard attn
@@ -610,6 +682,7 @@ function train(train_data, valid_data)
           for t = target_l, 1, -1 do
             local pred = generator:forward(preds[t])
             if opt.attn_type == 'hard' then
+              -- TODO: try factoring this out?
               -- compute reward. reward_criterion will have self.reward
               local mask = target_l_all:lt(t)
               local reward_input = {pred, mask}
@@ -717,8 +790,17 @@ function train(train_data, valid_data)
             local dl_dpred = criterion:backward(pred, target_out[t])
             dl_dpred:div(batch_l)
             local dl_dtarget = generator:backward(preds[t], dl_dpred)
-            drnn_state_dec[#drnn_state_dec]:add(dl_dtarget)
-            local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
+            local decoder_attn_input
+            if opt.hierarchical == 1 then
+              decoder_attn_input = {decoder_out[t], context, context_bow} 
+            else
+              decoder_attn_input = {decoder_out[t], context}
+            end
+            local dl_dattn = decoder_attn_clones[t]:backward(decoder_attn_input, dl_dtarget)
+
+            drnn_state_dec[#drnn_state_dec]:add(dl_dattn[1])
+            --local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
+            local decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
             -- accumulate encoder/decoder grads
             if opt.attn == 1 then
@@ -730,10 +812,17 @@ function train(train_data, valid_data)
                 print('source length:', source_l, 'time step:', t)
                 io.read()
               end
-              encoder_grads:add(dlst[2])
+              encoder_grads:add(dl_dattn[2])
               if opt.brnn == 1 then
-                encoder_bwd_grads:add(dlst[2])
+                encoder_bwd_grads:add(dl_dattn[2])
               end
+              if opt.hierarchical == 1 then
+                encoder_bow_grads:add(dl_dattn[3])
+              end
+              --encoder_grads:add(dlst[2])
+              --if opt.brnn == 1 then
+                --encoder_bwd_grads:add(dlst[2])
+              --end
             else
               assert(false)
               --encoder_grads[{{}, source_l}]:add(dlst[2])
@@ -743,7 +832,8 @@ function train(train_data, valid_data)
             end 
             drnn_state_dec[#drnn_state_dec]:zero()
             if opt.input_feed == 1 then
-              drnn_state_dec[#drnn_state_dec]:add(dlst[3])
+              --drnn_state_dec[#drnn_state_dec]:add(dlst[3])
+              drnn_state_dec[#drnn_state_dec]:add(dlst[2])
             end
             for j = dec_offset, #dlst do
               drnn_state_dec[j-dec_offset+1]:copy(dlst[j])
@@ -816,6 +906,15 @@ function train(train_data, valid_data)
           if opt.fix_word_vecs_enc == 1 then
             word_vec_layers[1].gradWeight:zero()
           end
+          if opt.brnn == 1 then
+            word_vec_layers[3].gradWeight[1]:zero()
+          end
+
+          -- encoder bow
+          if opt.hierarchical == 1 then
+            bow_encoder:backward(source:permute(2,3,1), encoder_bow_grads)
+            word_vecs_bow.gradWeight[1]:zero()
+          end
 
           if cur_soft_anneal then
             -- no need to sample many times with soft
@@ -832,23 +931,26 @@ function train(train_data, valid_data)
         local grad_norm = 0
         -- encoder, decoder, generator
         grad_norm = grad_params[1]:norm()^2 + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
+        grad_norm = grad_norm + grad_params[layers_idx['decoder_attn']]:norm()^2
+        if opt.hierarchical == 1 then
+          grad_norm = grad_norm + grad_params[layers_idx['bow_encoder']]:norm()^2
+        end
         if opt.brnn == 1 then
-          if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
-            grad_norm = grad_norm + grad_params[5]:norm()^2
-          else
-            grad_norm = grad_norm + grad_params[4]:norm()^2
-          end
+          grad_norm = grad_norm + grad_params[layers_idx['encoder_bwd']]:norm()^2
         end
         grad_norm = grad_norm^0.5	 
 
         if opt.brnn == 1 then
           word_vec_layers[1].gradWeight:add(word_vec_layers[3].gradWeight)
-          if opt.use_chars_enc == 1 then
-            for j = 1, charcnn_offset do
-              charcnn_grad_layers[j]:add(charcnn_grad_layers[j+charcnn_offset])
-            end
-          end	    
+          --if opt.use_chars_enc == 1 then
+            --for j = 1, charcnn_offset do
+              --charcnn_grad_layers[j]:add(charcnn_grad_layers[j+charcnn_offset])
+            --end
+          --end	    
         end	 
+        if opt.hierarchical == 1 then
+          word_vec_layers[1].gradWeight:add(word_vecs_bow.gradWeight)
+        end
         if opt.share_embed == 1 then
           word_vec_layers[1].gradWeight:add(word_vec_layers[2].gradWeight)
         end
@@ -873,7 +975,7 @@ function train(train_data, valid_data)
         local param_norm = 0
         local shrinkage = opt.max_grad_norm / grad_norm
         for j = 1, #grad_params do
-          if j == 4 and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
+          if j == layers_idx['baseline_m'] and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
             -- special case
             local n = grad_params[4]:norm()
             local s = opt.max_grad_norm / n
@@ -903,11 +1005,14 @@ function train(train_data, valid_data)
         param_norm = param_norm^0.5
         if opt.brnn == 1 then
           word_vec_layers[3].weight:copy(word_vec_layers[1].weight)
-          if opt.use_chars_enc == 1 then
-            for j = 1, charcnn_offset do
-              charcnn_layers[j+charcnn_offset]:copy(charcnn_layers[j])
-            end
-          end	    
+          --if opt.use_chars_enc == 1 then
+            --for j = 1, charcnn_offset do
+              --charcnn_layers[j+charcnn_offset]:copy(charcnn_layers[j])
+            --end
+          --end	    
+        end
+        if opt.hierarchical == 1 then
+          word_vecs_bow.weight:copy(word_vec_layers[1].weight)
         end
           if opt.share_embed == 1 then
             word_vec_layers[2].weight:copy(word_vec_layers[1].weight)
@@ -937,16 +1042,7 @@ function train(train_data, valid_data)
                                             i, math.exp(train_loss/train_nonzeros))      
             print('saving checkpoint to ' .. savefile)
             clean_layer(generator)
-            local save_table = {encoder, decoder, generator}
-            if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
-              table.insert(save_table, baseline_m)
-            end
-            if opt.brnn == 1 then
-              table.insert(save_table, encoder_bwd)
-            end
-            if opt.debug == 0 then
-              torch.save(savefile, {save_table, opt})
-            end
+            save_checkpoint(savefile)
           end
         end
         if i % 200 == 0 then
@@ -996,14 +1092,7 @@ function train(train_data, valid_data)
       if epoch % opt.save_every == 0 then
         print('saving checkpoint to ' .. savefile)
         clean_layer(generator)
-        local save_table = {encoder, decoder, generator}
-        if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
-          table.insert(save_table, baseline_m)
-        end
-        if opt.brnn == 1 then
-          table.insert(save_table, encoder_bwd)
-        end
-        torch.save(savefile, {save_table, opt})
+        save_checkpoint(savefile)
       end      
 
     end
@@ -1013,9 +1102,13 @@ function train(train_data, valid_data)
   function eval(data)
     encoder_clones[1]:evaluate()   
     decoder_clones[1]:evaluate() -- just need one clone
+    decoder_attn_clones[1]:evaluate()
     generator:evaluate()
     if opt.brnn == 1 then
       encoder_bwd_clones[1]:evaluate()
+    end
+    if opt.hierarchical == 1 then
+      bow_encoder:evaluate()
     end
 
     local nll = 0
@@ -1027,6 +1120,7 @@ function train(train_data, valid_data)
       local source_char_l = d[9]
       local rnn_state_enc = reset_state(init_fwd_enc, batch_l*source_l)
       local context = context_proto[{{1, batch_l}, {1, source_l}, {1, source_char_l}}]
+      local context_bow = context_bow_proto[{{1, batch_l}, {1, source_l}}]
       -- forward prop encoder
       for t = 1, source_char_l do
         local encoder_input = {source[t], table.unpack(rnn_state_enc)}
@@ -1034,6 +1128,10 @@ function train(train_data, valid_data)
         rnn_state_enc = out
         context[{{},{},t}]:copy(out[#out]:view(batch_l, source_l, opt.rnn_size))
       end	 
+      if opt.hierarchical == 1 then
+        local bow_out = bow_encoder:forward(source:permute(2,3,1))
+        context_bow:copy(bow_out)
+      end
 
       local rnn_state_dec = reset_state(init_fwd_dec, batch_l)
       if opt.init_dec == 1 then
@@ -1071,19 +1169,28 @@ function train(train_data, valid_data)
       for t = 1, target_l do
         local decoder_input
         if opt.attn == 1 then
-          decoder_input = {target[t], context, table.unpack(rnn_state_dec)}
+          --decoder_input = {target[t], context, table.unpack(rnn_state_dec)}
+          decoder_input = {target[t], table.unpack(rnn_state_dec)}
         else
           decoder_input = {target[t], context[{{},source_l}], table.unpack(rnn_state_dec)}
         end	 
         local out = decoder_clones[1]:forward(decoder_input)
+        local decoder_attn_input
+        if opt.hierarchical == 1 then
+          decoder_attn_input = {out[#out], context, context_bow} 
+        else
+          decoder_attn_input = {out[#out], context}
+        end
+        local attn_out = decoder_attn_clones[1]:forward(decoder_attn_input)
+
         rnn_state_dec = {}
         if opt.input_feed == 1 then
-          table.insert(rnn_state_dec, out[#out])
+          table.insert(rnn_state_dec, attn_out)
         end	 
-        for j = 1, #out-1 do
+        for j = 1, #out do
           table.insert(rnn_state_dec, out[j])
         end
-        local pred = generator:forward(out[#out])
+        local pred = generator:forward(attn_out)
         loss = loss + criterion:forward(pred, target_out[t])
       end
       nll = nll + loss
@@ -1176,7 +1283,12 @@ function main()
    if opt.train_from:len() == 0 then
       encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
       decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
-      bow_encoder = make_bow_encoder(valid_data, opt)
+      if opt.hierarchical == 1 then
+        decoder_attn = make_hierarchical_decoder_attn(valid_data, opt)
+        bow_encoder = make_bow_encoder(valid_data, opt)
+      else
+        decoder_attn = make_decoder_attn(valid_data, opt)
+      end
       generator, criterion = make_generator(valid_data, opt)
 
       if opt.attn_type == 'hard' then
@@ -1211,18 +1323,20 @@ function main()
       opt.attn = model_opt.attn
       opt.attn_type = model_opt.attn_type
       opt.brnn = model_opt.brnn
+
+      local save_idx = model_opt.save_idx
       encoder = model[1]:double()
       decoder = model[2]:double()      
       generator = model[3]:double()
+      decoder_attn = model[4]:double()
       if model_opt.attn_type == 'hard' and (model_opt.baseline_method == 'learned' or model_opt.baseline_method == 'both') then
-        baseline_m = model[4]:double()
-        if model_opt.brnn == 1 then
-     encoder_bwd = model[5]:double()
-        end      
-      else
-        if model_opt.brnn == 1 then
-     encoder_bwd = model[4]:double()
-        end      
+        baseline_m = model[save_idx['baseline_m']]:double()
+      end
+      if model_opt.brnn == 1 then
+        encoder_bwd = model[save_idx['encoder_bwd']]:double()
+      end      
+      if model_opt.hierarchical == 1 then
+        bow_encoder = model[save_idx['bow_encoder']]:double()
       end
       if model_opt.attn_type == 'hard' and (model_opt.baseline_method == 'average' or model_opt.baseline_method == 'both') then
         opt.baseline = model_opt.baseline
@@ -1246,12 +1360,23 @@ function main()
      print('using learned baseline method')
    end
    
-   layers = {encoder, decoder, generator}
+   layers = {encoder, decoder, generator, decoder_attn}
+   layers_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
+   idx = #layers_idx + 1
+   if opt.hierarchical == 1 then
+     table.insert(layers, bow_encoder)
+     layers_idx['bow_encoder'] = idx
+     idx = idx + 1
+   end
    if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
      table.insert(layers, baseline_m)
+     layers_idx['baseline_m'] = idx
+     idx = idx + 1
    end
    if opt.brnn == 1 then
       table.insert(layers, encoder_bwd)
+      layers_idx['encoder_bwd'] = idx
+      idx = idx + 1
    end
 
    if opt.adagrad == 1 then
@@ -1291,10 +1416,13 @@ function main()
    end
    encoder:apply(get_layer)   
    decoder:apply(get_layer)
+   if opt.hierarchical == 1 then
+     bow_encoder:apply(get_layer)
+   end
    if opt.brnn == 1 then
-      if opt.use_chars_enc == 1 then
-	 charcnn_offset = #charcnn_layers
-      end      
+      --if opt.use_chars_enc == 1 then
+	 --charcnn_offset = #charcnn_layers
+      --end      
       encoder_bwd:apply(get_layer)
    end   
    train(train_data, valid_data)

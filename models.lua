@@ -29,9 +29,6 @@ function make_lstm(data, opt, model, use_chars)
    local inputs = {}
    table.insert(inputs, nn.Identity()()) -- x (batch_size x source_char_l)
    if model == 'dec' then
-      -- TODO: allow BOW in inputs for decoder
-      table.insert(inputs, nn.Identity()()) -- all context (batch_size x source_l x source_char_l x rnn_size)
-      offset = offset + 1
       if opt.input_feed == 1 then
         table.insert(inputs, nn.Identity()()) -- prev context_attn (batch_size x rnn_size)
         offset = offset + 1
@@ -118,24 +115,6 @@ function make_lstm(data, opt, model, use_chars)
     table.insert(outputs, next_c)
     table.insert(outputs, next_h)
   end
-  if model == 'dec' then
-     local top_h = outputs[#outputs]
-     local decoder_out
-     local attn_out
-     if opt.attn == 1 then
-        local decoder_attn = make_decoder_attn(data, opt)
-        decoder_attn.name = 'decoder_attn'
-        decoder_out = decoder_attn({top_h, inputs[2]})
-     else
-        decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
-        decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
-     end
-     if dropout > 0 then
-        decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
-     end     
-     
-     table.insert(outputs, decoder_out)
-  end
   return nn.gModule(inputs, outputs)
 end
 
@@ -157,13 +136,16 @@ end
 
 function make_bow_encoder(data, opt)
   -- takes 3D tensor input: batch_l x source_l x source_char_l
-  -- output BOW: batch_l x source_l x word_vec_size
   
   local input = nn.Identity()()
   local word_vecs = nn.LookupTable(data.char_size, opt.word_vec_size)
   word_vecs.name = 'word_vecs_bow'
-  local embeds = word_vecs(input)
-  local output = nn.Sum(3)(embeds)
+  local embeds = word_vecs(nn.Reshape(-1, true)(input)) -- batch_l x (source_l*source_char_l) x word_vec_size
+
+  local no_grad_replicate = nn.Replicate(opt.word_vec_size, 4)
+  function do_nothing() end
+  no_grad_replicate.updateGradInput = do_nothing
+  local output = nn.Sum(3)(nn.ViewAs()({embeds, no_grad_replicate(input)})) -- batch_l x source_l x word_vec_size
 
   return nn.gModule({input}, {output})
 end
@@ -179,6 +161,7 @@ function make_decoder_attn(data, opt, simple)
    local target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
    local context = nn.Reshape(-1, opt.rnn_size, true)(inputs[2]) -- batch_l x (source_l*source_char_l) x rnn_size
    simple = simple or 0
+   local dropout = opt.dropout or 0
    -- get attention
 
    local attn = nn.MM()({context, nn.Replicate(1,3)(target_t)}) -- batch_l x (source_l*source_char_l) x 1
@@ -212,14 +195,88 @@ function make_decoder_attn(data, opt, simple)
       context_output = nn.CAddTable()({context_combined,inputs[1]})
    end
 
+   if dropout > 0 then
+      context_output = nn.Dropout(dropout, nil, false)(context_output)
+   end     
+   table.insert(outputs, context_output)
+   --return nn.gModule(inputs, {context_output})   
+   return nn.gModule(inputs, outputs)   
+end
+
+function make_hierarchical_decoder_attn(data, opt, simple)
+   -- inputs:
+   -- 2D tensor target_t (batch_l x rnn_size)
+   -- 4D tensor for context (batch_l x source_l x source_char_l x rnn_size)
+   -- 3D tensor for BOW context (batch_l x source_l x word_vec_size)
+
+   local inputs = {}
+   local outputs = {}
+   table.insert(inputs, nn.Identity()())
+   table.insert(inputs, nn.Identity()())
+   table.insert(inputs, nn.Identity()())
+   local target_t = inputs[1]
+   local context = inputs[2]
+   local bow_context = inputs[3]
+   simple = simple or 0
+   local dropout = opt.dropout or 0
+   -- get attention
+
+   -- attention over sentences
+   local attn1 = nn.MM()({bow_context,
+        nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.word_vec_size)(target_t))}) -- batch_l x source_l x 1
+   attn1 = nn.Sum(3)(attn1)
+   local softmax_attn1 = nn.SoftMax()
+   softmax_attn1.name = 'softmax_attn1'
+   attn1 = softmax_attn1(attn1) -- batch_l x source_l
+   if opt.attn_type == 'hard' then
+     -- sample (hard attention)
+     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale)
+     sampler.name = 'sampler'
+     attn1 = sampler(attn1) -- one hot
+   end
+
+   -- attention over words of each sentence
+   local reshape_context = nn.Reshape(-1, opt.rnn_size, true)(context) -- batch_l x (source_l*source_char_l) x opt.rnn_size
+   local attn2 = nn.MM()({reshape_context,
+        nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(target_t))}) -- batch_l x (source_l*source_char_l) x 1
+   attn2 = nn.Sum(3)(attn2)
+   attn2 = nn.View(-1):setNumInputDims(1)(nn.ViewAs(3)({attn2, context})) -- (batch_l*source_l) x source_char_l
+   local softmax_attn2 = nn.SoftMax()
+   softmax_attn2.name = 'softmax_attn2'
+   attn2 = softmax_attn2(attn2)
+   if opt.attn_type == 'hard' then
+     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale)
+     sampler.name = 'sampler'
+     attn2 = sampler(attn2) -- one hot
+   end
+   attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
+   -- multiply attentions together
+   local mul_attn = nn.CMulTable()({nn.ReplicateAs(3,3)({attn1, attn2}), attn2}) -- batch_l x source_l x source_char_l
+   mul_attn = nn.Replicate(1,2)(nn.View(-1):setNumInputDims(2)(mul_attn)) -- batch_l x 1 x (source_l*source_char_l)
+
+   -- apply attention to context
+   local context_combined = nn.MM()({mul_attn, reshape_context}) -- batch_l x 1 x rnn_size
+   context_combined = nn.Sum(2)(context_combined) -- batch_l x rnn_size
+   local context_output
+   if simple == 0 then
+      context_combined = nn.JoinTable(2)({context_combined, inputs[1]}) -- batch_l x rnn_size*2
+      context_output = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2,
+						 opt.rnn_size)(context_combined))
+   else
+      context_output = nn.CAddTable()({context_combined,inputs[1]})
+   end
+
+   if dropout > 0 then
+      context_output = nn.Dropout(dropout, nil, false)(context_output)
+   end     
    table.insert(outputs, context_output)
    --return nn.gModule(inputs, {context_output})   
    return nn.gModule(inputs, outputs)   
 end
 
 function make_init_dec_module(opt, batch_l, source_l)
-  local init_dec_module =  nn.Sequential()
-  init_dec_module:add(nn.Reshape(batch_l, source_l, opt.rnn_size, false))
+  local init_dec_module = nn.Sequential()
+  init_dec_module:add(nn.View(batch_l, source_l, opt.rnn_size))
   init_dec_module:add(nn.Sum(2))
   if opt.gpuid >= 0 then
     init_dec_module:cuda()

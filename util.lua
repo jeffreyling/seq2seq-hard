@@ -61,21 +61,86 @@ function LinearNoBias:accGradParameters(input, gradOutput, scale)
 end
 
 
---local ReshapeAs = torch.class('nn.ReshapeAs', 'nn.Module')
----- Reshapes input[1] based on input[2] size
+local ViewAs = torch.class('nn.ViewAs', 'nn.Module')
+-- Views input[1] based on first ndim sizes of input[2]
 
---function ReshapeAs:__init()
-  --parent.__init(self)
-  --self.gradInput = {torch.Tensor()}
---end
+function ViewAs:__init(ndim)
+  nn.Module.__init(self)
+  self.ndim = ndim
+  self.gradInput = {torch.Tensor()}
+end
 
---function ReshapeAs:updateOutput(input)
-  --assert(#input == 2, 'ReshapeAs can only take 2 inputs!')
-  --self.output = input[1]:viewAs(input[2])
-  --return self.output
---end
+function ViewAs:updateOutput(input)
+  self.output = self.output or input.new()
 
---function ReshapeAs:updateGradInput(input, gradOutput)
-  --self.gradInput[1]:viewAs(gradOutput, input)
-  --return self.gradInput
---end
+  assert(#input == 2, 'ViewAs can only take 2 inputs')
+  if self.ndim then
+    local sizes = {}
+    for i = 1, self.ndim do
+      sizes[#sizes+1] = input[2]:size(i)
+    end
+    self.output:view(input[1], table.unpack(sizes))
+  else
+    local sizes = input[2]:size()
+    self.output:view(input[1], sizes)
+  end
+  return self.output
+end
+
+function ViewAs:updateGradInput(input, gradOutput)
+  self.gradInput[1] = self.gradInput[1] or gradOutput.new()
+  self.gradInput[1]:view(gradOutput, input[1]:size())
+  return self.gradInput
+end
+
+
+
+local ReplicateAs = torch.class('nn.ReplicateAs', 'nn.Module')
+-- Replicates dim m of input[1] based on dim n of input[2]
+-- basically copies Replicate
+
+function ReplicateAs:__init(in_dim, template_dim)
+  nn.Module.__init(self)
+  self.in_dim = in_dim
+  self.template_dim = template_dim
+  self.gradInput = {torch.Tensor()}
+end
+
+function ReplicateAs:updateOutput(input)
+  assert(#input == 2, 'needs 2 inputs')
+  local rdim = self.in_dim
+  local ntimes = input[2]:size(self.template_dim)
+  input = input[1]
+  local sz = torch.LongStorage(input:dim() + 1)
+  sz[rdim] = ntimes
+  for i = 1,input:dim() do
+    local offset = 0
+    if i >= rdim then offset = 1 end
+    sz[i+offset] = input:size(i)
+  end
+  local st = torch.LongStorage(input:dim() + 1)
+  st[rdim] = 0
+  for i = 1,input:dim() do
+    local offset = 0
+    if i >= rdim then offset = 1 end
+    st[i+offset] = input:stride(i)
+  end
+  self.output:set(input:storage(), input:storageOffset(), sz, st)
+  return self.output
+end
+
+function ReplicateAs:updateGradInput(input, gradOutput)
+  input = input[1]
+  self.gradInput[1]:resizeAs(input):zero()
+  local rdim = self.in_dim
+  local sz = torch.LongStorage(input:dim() + 1)
+  sz[rdim] = 1
+  for i = 1, input:dim() do
+    local offset = 0
+    if i >= rdim then offset = 1 end
+    sz[i+offset] = input:size(i)
+  end
+  local gradInput = self.gradInput[1]:view(sz)
+  gradInput:sum(gradOutput, rdim)
+  return self.gradInput
+end
