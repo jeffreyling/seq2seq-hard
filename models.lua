@@ -175,9 +175,7 @@ function make_decoder_attn(data, opt, simple)
 
    -- sample (hard attention)
    if opt.attn_type == 'hard' then
-     local sampler = nn.ReinforceCategorical()
-     sampler.semi_sampling_p = opt.semi_sampling_p
-     sampler.entropy_scale = opt.entropy_scale
+     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale)
      sampler.name = 'sampler'
      attn = sampler(attn) -- one hot
    end
@@ -225,6 +223,9 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    local attn1 = nn.MM()({bow_context,
         nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.word_vec_size)(target_t))}) -- batch_l x source_l x 1
    attn1 = nn.Sum(3)(attn1)
+   local mul_constant1 = nn.MulConstant(opt.temperature) -- multiply for temperature
+   mul_constant1.name = 'mul_constant'
+   attn1 = mul_constant1(attn1)
    local softmax_attn1 = nn.SoftMax()
    softmax_attn1.name = 'softmax_attn1'
    attn1 = softmax_attn1(attn1) -- batch_l x source_l
@@ -241,13 +242,17 @@ function make_hierarchical_decoder_attn(data, opt, simple)
         nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(target_t))}) -- batch_l x (source_l*source_char_l) x 1
    attn2 = nn.Sum(3)(attn2)
    attn2 = nn.View(-1):setNumInputDims(1)(nn.ViewAs(3)({attn2, context})) -- (batch_l*source_l) x source_char_l
+   local mul_constant2 = nn.MulConstant(opt.temperature) -- multiply for temperature
+   mul_constant2.name = 'mul_constant'
+   attn2 = mul_constant2(attn2)
    local softmax_attn2 = nn.SoftMax()
    softmax_attn2.name = 'softmax_attn2'
    attn2 = softmax_attn2(attn2)
-   if opt.attn_type == 'hard' then
-     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale)
-     sampler.name = 'sampler'
-     attn2 = sampler(attn2) -- one hot
+   if opt.attn_word_type == 'hard' then
+     -- word level sampling
+     local sampler_word = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale)
+     sampler_word.name = 'sampler_word'
+     attn2 = sampler_word(attn2) -- one hot
    end
    attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
    -- multiply attentions together

@@ -60,16 +60,18 @@ function Reinforce:rewardAs(input)
    if input:isSameSizeAs(self.reward) then
       return self.reward
    else
-      if self.reward:size(1) ~= input:size(1) then
-         -- assume input is in online-mode
-         input = self:toBatch(input, input:dim())
-         assert(self.reward:size(1) == input:size(1), self.reward:size(1).." ~= "..input:size(1))
-      end
+      --if self.reward:size(1) ~= input:size(1) then
+         ---- assume input is in online-mode
+         --input = self:toBatch(input, input:dim())
+         --assert(self.reward:size(1) == input:size(1), self.reward:size(1).." ~= "..input:size(1))
+      --end
       self._reward = self._reward or self.reward.new()
       self.__reward = self.__reward or self.reward.new()
       local size = input:size():fill(1):totable()
       size[1] = self.reward:size(1)
       self._reward:view(self.reward, table.unpack(size))
+      size[1] = input:size(1) / self.reward:size(1) -- because of weird softmax
+      self._reward:repeatTensor(self._reward, table.unpack(size))
       self.__reward:expandAs(self._reward, input)
       return self.__reward
    end
@@ -233,24 +235,6 @@ function ReinforceNLLCriterion:updateOutput(inputTable, target)
    return self.output
 end
 
-function ReinforceNLLCriterion:variance_reduce(b, scale, mask)
-   -- subtract baseline
-   self.vrReward = self.vrReward or self.reward.new()
-   self.vrReward:resizeAs(self.reward):copy(self.reward)
-   if type(b) == 'number' then
-     self.vrReward:add(-b)
-   else
-     -- learned case
-     self.vrReward:add(-1, b)
-   end
-   if scale < 1 then
-     -- don't normalize when scale gets too big
-     self.vrReward:mul(scale)
-   end
-   self.vrReward:maskedFill(mask, 0)
-   return self.vrReward
-end
-
 function ReinforceNLLCriterion:updateGradInput(inputTable, target)
   self.gradInput[1]:resizeAs(input):zero()
    return self.gradInput
@@ -259,8 +243,6 @@ end
 function ReinforceNLLCriterion:update_baseline(b, mask, target)
   -- baseline grad
   local gradInput = torch.Tensor()
-  --print('crit error:', self.criterion:forward(b, target))
-  --io.read()
   gradInput = self.criterion:backward(b, target)
   gradInput:maskedFill(mask, 0)
 
@@ -274,3 +256,21 @@ function ReinforceNLLCriterion:type(type)
    self.module = module
    return ret
 end
+
+function variance_reduce(reward, b, scale, mask)
+   -- subtract baseline
+   local vrReward = reward:clone()
+   if type(b) == 'number' then
+     vrReward:add(-b)
+   else
+     -- learned case
+     vrReward:add(-1, b)
+   end
+   if scale < 1 then
+     -- don't normalize when scale gets too big
+     vrReward:mul(scale)
+   end
+   vrReward:maskedFill(mask, 0)
+   return vrReward
+end
+
