@@ -27,8 +27,9 @@ function make_lstm(data, opt, model, use_chars)
    local offset = 0
   -- there will be 2*n+3 inputs
    local inputs = {}
-   table.insert(inputs, nn.Identity()()) -- x (batch_size x max_word_l)
+   table.insert(inputs, nn.Identity()()) -- x (batch_size x source_char_l)
    if model == 'dec' then
+      -- TODO: allow BOW in inputs for decoder
       table.insert(inputs, nn.Identity()()) -- all context (batch_size x source_l x source_char_l x rnn_size)
       offset = offset + 1
       if opt.input_feed == 1 then
@@ -154,6 +155,19 @@ function make_no_recur_encoder(data, opt)
   return nn.gModule(inputs, {x})
 end
 
+function make_bow_encoder(data, opt)
+  -- takes 3D tensor input: batch_l x source_l x source_char_l
+  -- output BOW: batch_l x source_l x word_vec_size
+  
+  local input = nn.Identity()()
+  local word_vecs = nn.LookupTable(data.char_size, opt.word_vec_size)
+  word_vecs.name = 'word_vecs_bow'
+  local embeds = word_vecs(input)
+  local output = nn.Sum(3)(embeds)
+
+  return nn.gModule({input}, {output})
+end
+
 function make_decoder_attn(data, opt, simple)
    -- 2D tensor target_t (batch_l x rnn_size) and
    -- 4D tensor for context (batch_l x source_l x source_char_l x rnn_size)
@@ -201,6 +215,17 @@ function make_decoder_attn(data, opt, simple)
    table.insert(outputs, context_output)
    --return nn.gModule(inputs, {context_output})   
    return nn.gModule(inputs, outputs)   
+end
+
+function make_init_dec_module(opt, batch_l, source_l)
+  local init_dec_module =  nn.Sequential()
+  init_dec_module:add(nn.Reshape(batch_l, source_l, opt.rnn_size, false))
+  init_dec_module:add(nn.Sum(2))
+  if opt.gpuid >= 0 then
+    init_dec_module:cuda()
+  end
+
+  return init_dec_module
 end
 
 function make_generator(data, opt)

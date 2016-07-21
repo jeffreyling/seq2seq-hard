@@ -23,6 +23,7 @@ function data:__init(opt, data_file)
    
    self.target_size = f:read('target_size'):all()[1]
    --self.source_size = f:read('source_size'):all()[1]
+   self.source_size = f:read('char_size'):all()[1]
    self.target_nonzeros = f:read('target_nonzeros'):all()
   
    if opt.use_chars_enc == 1 then

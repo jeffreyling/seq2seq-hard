@@ -9,7 +9,7 @@ require 'model_utils.lua'
 
 cmd = torch.CmdLine()
 
-cmd:option('-summary_mode', 0, [[Modifications for document summary]])
+cmd:option('-debug', 0, [[Debug]])
 
 -- FIX THESE FOR TRANSLATION
 cmd:option('-init_dec', 0, [[Initialize the hidden/cell state of the decoder at time 
@@ -509,7 +509,6 @@ function train(train_data, valid_data)
             cutorch.setDevice(opt.gpuid)
           end	 
           -- forward prop encoder
-          --nngraph.setDebug(true)
           for t = 1, source_char_l do
             encoder_clones[t]:training()
             local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
@@ -521,9 +520,13 @@ function train(train_data, valid_data)
           -- forward prop decoder
           local rnn_state_dec = reset_state(init_fwd_dec, batch_l, 0)
           if opt.init_dec == 1 then
+            init_dec_modules = {}
+            for L = 1, 2*opt.num_layers do
+              table.insert(init_dec_modules, make_init_dec_module(opt, batch_l, source_l))
+            end
             for L = 1, opt.num_layers do
-              rnn_state_dec[0][L*2-1+opt.input_feed]:copy(rnn_state_enc[source_char_l][L*2-1])
-              rnn_state_dec[0][L*2+opt.input_feed]:copy(rnn_state_enc[source_char_l][L*2])
+              rnn_state_dec[0][L*2-1+opt.input_feed]:copy(init_dec_modules[L*2-1]:forward(rnn_state_enc[source_char_l][L*2-1]))
+              rnn_state_dec[0][L*2+opt.input_feed]:copy(init_dec_modules[L*2]:forward(rnn_state_enc[source_char_l][L*2]))
             end
           end
 
@@ -538,11 +541,15 @@ function train(train_data, valid_data)
               context[{{},{},t}]:add(out[#out]:view(batch_l, source_l, opt.rnn_size))
             end
             if opt.init_dec == 1 then
-              for L = 1, opt.num_layers do
-                rnn_state_dec[0][L*2-1+opt.input_feed]:add(rnn_state_enc_bwd[1][L*2-1])
-                rnn_state_dec[0][L*2+opt.input_feed]:add(rnn_state_enc_bwd[1][L*2])
+              init_dec_modules_bwd = {}
+              for L = 1, 2*opt.num_layers do
+                table.insert(init_dec_modules_bwd, make_init_dec_module(opt, batch_l, source_l))
               end
-            end	 	    
+              for L = 1, opt.num_layers do
+                rnn_state_dec[0][L*2-1+opt.input_feed]:add(init_dec_modules_bwd[L*2-1]:forward(rnn_state_enc_bwd[1][L*2-1]))
+                rnn_state_dec[0][L*2+opt.input_feed]:add(init_dec_modules_bwd[L*2]:forward(rnn_state_enc_bwd[1][L*2]))
+              end
+            end
           end
 
           if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
@@ -718,6 +725,7 @@ function train(train_data, valid_data)
               if i % opt.print_batch == 0 then
                 --print('attn forwards:')
                 --print(softmax_attn_layers[t].output)
+                print('memory:', cutorch.getMemoryUsage(opt.gpuid))
                 print('i:', i)
                 print('source length:', source_l, 'time step:', t)
                 io.read()
@@ -758,8 +766,8 @@ function train(train_data, valid_data)
           local drnn_state_enc = reset_state(init_bwd_enc, batch_l*source_l)
           if opt.init_dec == 1 then
             for L = 1, opt.num_layers do
-              drnn_state_enc[L*2-1]:copy(drnn_state_dec[L*2-1])
-              drnn_state_enc[L*2]:copy(drnn_state_dec[L*2])
+              drnn_state_enc[L*2-1]:copy(init_dec_modules[L*2-1]:backward(rnn_state_enc[source_char_l][L*2-1], drnn_state_dec[L*2-1]))
+              drnn_state_enc[L*2]:copy(init_dec_modules[L*2]:backward(rnn_state_enc[source_char_l][L*2], drnn_state_dec[L*2]))
             end	    
           end
 
@@ -783,8 +791,8 @@ function train(train_data, valid_data)
             local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
             if opt.init_dec == 1 then
               for L = 1, opt.num_layers do
-                drnn_state_enc[L*2-1]:copy(drnn_state_dec[L*2-1])
-                drnn_state_enc[L*2]:copy(drnn_state_dec[L*2])
+                drnn_state_enc[L*2-1]:copy(init_dec_modules_bwd[L*2-1]:backward(rnn_state_enc_bwd[1][L*2-1], drnn_state_dec[L*2-1]))
+                drnn_state_enc[L*2]:copy(init_dec_modules_bwd[L*2]:backward(rnn_state_enc_bwd[1][L*2], drnn_state_dec[L*2]))
               end
             end
             for t = 1, source_char_l do
@@ -917,7 +925,7 @@ function train(train_data, valid_data)
           epoch, i, data:size(), batch_l, opt.learning_rate)
           stats = stats .. string.format('PPL: %.2f, |Param|: %.2f, |GParam|: %.2f, ',
           math.exp(train_loss/train_nonzeros), param_norm, grad_norm)
-          stats = stats .. string.format('Training: %d/%d/%d total/source/target tokens/sec',
+          stats = stats .. string.format('Training: %d/%d/%d total/(source sentences)/target tokens/sec',
           (num_words_target+num_words_source) / time_taken,
           num_words_source / time_taken,
           num_words_target / time_taken)			   
@@ -936,7 +944,9 @@ function train(train_data, valid_data)
             if opt.brnn == 1 then
               table.insert(save_table, encoder_bwd)
             end
-            torch.save(savefile, {save_table, opt})
+            if opt.debug == 0 then
+              torch.save(savefile, {save_table, opt})
+            end
           end
         end
         if i % 200 == 0 then
@@ -967,11 +977,13 @@ function train(train_data, valid_data)
       local train_score = math.exp(total_loss/total_nonzeros)
       print('Train', train_score)
       print(opt.train_perf)
-      print('baseline:')
-      print(opt.baseline)
-      if opt.moving_variance == 1 then
-        print('variance:')
-        print(opt.reward_variance)
+      if opt.attn_type == 'hard' then
+        print('baseline:')
+        print(opt.baseline)
+        if opt.moving_variance == 1 then
+          print('variance:')
+          print(opt.reward_variance)
+        end
       end
       opt.train_perf[#opt.train_perf + 1] = train_score
       local score = eval(valid_data)
@@ -1025,9 +1037,10 @@ function train(train_data, valid_data)
 
       local rnn_state_dec = reset_state(init_fwd_dec, batch_l)
       if opt.init_dec == 1 then
+        init_dec_module = make_init_dec_module(opt, batch_l, source_l)
         for L = 1, opt.num_layers do
-          rnn_state_dec[L*2-1+opt.input_feed]:copy(rnn_state_enc[L*2-1])
-          rnn_state_dec[L*2+opt.input_feed]:copy(rnn_state_enc[L*2])
+          rnn_state_dec[L*2-1+opt.input_feed]:copy(init_dec_module:forward(rnn_state_enc[L*2-1]))
+          rnn_state_dec[L*2+opt.input_feed]:copy(init_dec_module:forward(rnn_state_enc[L*2]))
         end	 
       end
 
@@ -1041,8 +1054,8 @@ function train(train_data, valid_data)
         end
         if opt.init_dec == 1 then
           for L = 1, opt.num_layers do
-            rnn_state_dec[L*2-1+opt.input_feed]:add(rnn_state_enc[L*2-1])
-            rnn_state_dec[L*2+opt.input_feed]:add(rnn_state_enc[L*2])
+            rnn_state_dec[L*2-1+opt.input_feed]:add(init_dec_module:forward(rnn_state_enc[L*2-1]))
+            rnn_state_dec[L*2+opt.input_feed]:add(init_dec_module:forward(rnn_state_enc[L*2]))
           end
         end	 
       end      	 	 
@@ -1062,7 +1075,6 @@ function train(train_data, valid_data)
         else
           decoder_input = {target[t], context[{{},source_l}], table.unpack(rnn_state_dec)}
         end	 
-        sampler_layers[1].time_step = t
         local out = decoder_clones[1]:forward(decoder_input)
         rnn_state_dec = {}
         if opt.input_feed == 1 then
@@ -1090,6 +1102,8 @@ function get_layer(layer)
          table.insert(word_vec_layers, layer)
       elseif layer.name == 'word_vecs_enc' then
          table.insert(word_vec_layers, layer)
+      elseif layer.name == 'word_vecs_bow' then
+         word_vecs_bow = layer
       elseif layer.name == 'charcnn_enc' or layer.name == 'mlp_enc' then
          local p, gp = layer:parameters()
          for i = 1, #p do
@@ -1162,6 +1176,7 @@ function main()
    if opt.train_from:len() == 0 then
       encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
       decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
+      bow_encoder = make_bow_encoder(valid_data, opt)
       generator, criterion = make_generator(valid_data, opt)
 
       if opt.attn_type == 'hard' then

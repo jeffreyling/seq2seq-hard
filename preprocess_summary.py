@@ -122,11 +122,11 @@ def get_data(args):
             # print targ
             # raw_input()
             if len(src) > seqlength or len(src) < 1 or len(targ) < 1:
-                print src
-                print targ
-                print len(src)
-                print seqlength
-                raw_input()
+                # print src
+                # print targ
+                # print len(src)
+                # print seqlength
+                # raw_input()
                 continue
             num_docs += 1
             for word in targ:
