@@ -118,15 +118,7 @@ def get_data(args):
 
             src = src_orig.strip().strip("</s>").split("</s>") # splits the doc into sentences
             targ = targ_orig.strip().split()
-            # print src
-            # print targ
-            # raw_input()
             if len(src) > seqlength or len(src) < 1 or len(targ) < 1:
-                # print src
-                # print targ
-                # print len(src)
-                # print seqlength
-                # raw_input()
                 continue
             num_docs += 1
             for word in targ:
@@ -243,7 +235,7 @@ def get_data(args):
         #get batch sizes
         curr_idx = 1
         batch_idx = [1]
-        nonzeros = [] # number of non padding entries in the entire batch
+        nonzeros = [] # number of non padding entries
         batch_l = [] # batch lengths (number of docs in the batch)
         batch_w = [] # batch widths (length of the docs in the batch)
         target_l_max = []
@@ -254,9 +246,8 @@ def get_data(args):
         for i in range(len(batch_idx)-1): # iterate over batch_idx
             batch_l.append(batch_idx[i+1] - batch_idx[i])            
             batch_w.append(source_l[batch_idx[i]-1])
-            nonzeros.append((sources[batch_idx[i]-1:batch_idx[i+1]-1] == 1).sum().sum())
+            nonzeros.append((target_output[batch_idx[i]-1:batch_idx[i+1]-1] != 1).sum().sum())
             target_l_max.append(max(target_l[batch_idx[i]-1:batch_idx[i+1]-1]))
-        # NOTE: actual batching is done in data.lua
 
         # Write output
         f = h5py.File(outfile, "w")

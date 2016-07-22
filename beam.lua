@@ -46,6 +46,25 @@ cmd:option('-cudnn', 0, [[If using character model, this should be = 1 if the ch
                           was trained using cudnn]])
 opt = cmd:parse(arg)
 
+function reset_state(state, batch_l, t)
+  if t == nil then
+     local u = {}
+     for i = 1, #state do
+        state[i]:zero()
+        table.insert(u, state[i][{{1, batch_l}}])
+     end
+     return u
+  else
+     local u = {[t] = {}}
+     for i = 1, #state do
+        state[i]:zero()
+        table.insert(u[t], state[i][{{1, batch_l}}])
+     end
+     return u
+  end      
+end
+
+
 function copy(orig)
    local orig_type = type(orig)
    local copy
@@ -123,7 +142,11 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    -- Current Scores.
    local scores = torch.FloatTensor(n, K)
    scores:zero()
-   local source_l = math.min(source:size(1), opt.max_sent_l)
+
+   source = source:t():contiguous() -- get words to dim 1 for LSTM
+   --local source_l = math.min(source:size(1), opt.max_sent_l)
+   local source_char_l = math.min(source:size(1), opt.max_sent_l)
+   local source_sent_l = source:size(2)
    local attn_argmax = {}   -- store attn weights
    attn_argmax[1] = {}
 
@@ -136,23 +159,30 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    end
 
    local source_input
+   -- for batch
    if model_opt.use_chars_enc == 1 then
-      source_input = source:view(source_l, 1, source:size(2)):contiguous()
+      source_input = source:view(source_char_l, 1, source:size(2)):contiguous()
    else
-      source_input = source:view(source_l, 1)
+      source_input = source:view(source_char_l, 1)
    end
 
-   local rnn_state_enc = {}
-   for i = 1, #init_fwd_enc do
-      table.insert(rnn_state_enc, init_fwd_enc[i]:zero())
-   end   
-   local context = context_proto[{{}, {1,source_l}}]:clone() -- 1 x source_l x rnn_size
+   --local rnn_state_enc = {}
+   --for i = 1, #init_fwd_enc do
+      --table.insert(rnn_state_enc, init_fwd_enc[i]:zero())
+   --end   
+   local rnn_state_enc = reset_state(init_fwd_enc, 1*source_sent_l)
+   local context = context_proto[{{}, {1, source_sent_l}, {1,source_char_l}}]:clone() -- 1 x source_l x source_char_l x rnn_size
+   local context_bow = context_bow_proto[{{}, {1, source_sent_l}}]:clone() -- 1 x source_l x word_vec_size
    
-   for t = 1, source_l do
+   for t = 1, source_char_l do
       local encoder_input = {source_input[t], table.unpack(rnn_state_enc)}
       local out = model[1]:forward(encoder_input)
       rnn_state_enc = out
-      context[{{},t}]:copy(out[#out])
+      context[{{},{},t}]:copy(out[#out]:view(1, source_sent_l, model_opt.rnn_size))
+   end
+   if model_opt.hierarchical == 1 then
+     local bow_out = model[layers_idx['bow_encoder']]:forward(source_input)
+     context_bow:copy(bow_out)
    end
    rnn_state_dec = {}
    for i = 1, #init_fwd_dec do
@@ -160,34 +190,39 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    end
 
    if model_opt.init_dec == 1 then
+      init_dec_module = make_init_dec_module(model_opt, 1, source_sent_l)
       for L = 1, model_opt.num_layers do
          rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
-            rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
+            init_dec_module:forward(rnn_state_enc[L*2-1]):expand(K, model_opt.rnn_size))
          rnn_state_dec[L*2+model_opt.input_feed]:copy(
-            rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
+            init_dec_module:forward(rnn_state_enc[L*2]):expand(K, model_opt.rnn_size))
       end
    end
    
    if model_opt.brnn == 1 then
-      for i = 1, #rnn_state_enc do
-         rnn_state_enc[i]:zero()
-      end      
-      for t = source_l, 1, -1 do
+      local rnn_state_enc = reset_state(init_fwd_enc, 1*source_sent_l)
+      --for i = 1, #rnn_state_enc do
+         --rnn_state_enc[i]:zero()
+      --end      
+      for t = source_char_l, 1, -1 do
          local encoder_input = {source_input[t], table.unpack(rnn_state_enc)}
-         local out = model[4]:forward(encoder_input)
+         local out = model[layers_idx['encoder_bwd']]:forward(encoder_input)
          rnn_state_enc = out
-         context[{{},t}]:add(out[#out])
+         context[{{},{},t}]:add(out[#out]:view(1, source_sent_l, model_opt.rnn_size))
       end
       if model_opt.init_dec == 1 then
          for L = 1, model_opt.num_layers do
             rnn_state_dec[L*2-1+model_opt.input_feed]:add(
-               rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
+               init_dec_module:forward(rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size)))
             rnn_state_dec[L*2+model_opt.input_feed]:add(
-               rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))            
+               init_dec_module:forward(rnn_state_enc[L*2]:expand(K, model_opt.rnn_size)))
          end         
       end      
    end   
-   context = context:expand(K, source_l, model_opt.rnn_size)
+   context = context:expand(K, source_sent_l, source_char_l, model_opt.rnn_size)
+   if model_opt.hierarchical == 1 then
+     context_bow = context_bow:expand(K, source_sent_l, model_opt.word_vec_size)
+   end
    
    if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
       cutorch.setDevice(opt.gpuid2)
@@ -215,20 +250,22 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
             decoder_input1 = torch.LongTensor({decoder_input1})
          end        
       end
-      local decoder_input
-      if model_opt.attn == 1 then
-         decoder_input = {decoder_input1, context, table.unpack(rnn_state_dec)}
-      else
-         decoder_input = {decoder_input1, context[{{}, source_l}], table.unpack(rnn_state_dec)}
-      end      
+      local decoder_input = {decoder_input1, table.unpack(rnn_state_dec)}
       local out_decoder = model[2]:forward(decoder_input)
-      local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+      local decoder_attn_input
+      if model_opt.hierarchical == 1 then
+        decoder_attn_input = {out_decoder[#out_decoder], context, context_bow}
+      else
+        decoder_attn_input = {out_decoder[#out_decoder], context}
+      end
+      local attn_out = model[layers_idx['decoder_attn']]:forward(decoder_attn_input)
+      local out = model[3]:forward(attn_out) -- K x vocab_size
       
       rnn_state_dec = {} -- to be modified later
       if model_opt.input_feed == 1 then
-         table.insert(rnn_state_dec, out_decoder[#out_decoder])
+         table.insert(rnn_state_dec, attn_out)
       end      
-      for j = 1, #out_decoder - 1 do
+      for j = 1, #out_decoder do
          table.insert(rnn_state_dec, out_decoder[j])
       end
       out_float:resize(out:size()):copy(out)
@@ -262,10 +299,8 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
              end
              
              if i < 2 or diff then
-                if model_opt.attn == 1 then
-                   max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
-                   attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
-                end                
+                 max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
+                 attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
                 prev_ks[i][k] = prev_k
                 next_ys[i][k] = y_i
                 scores[i][k] = score
@@ -280,9 +315,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
        end
        end_hyp = states[i][1]
        end_score = scores[i][1]
-       if model_opt.attn == 1 then
-          end_attn_argmax = attn_argmax[i][1]
-       end       
+        end_attn_argmax = attn_argmax[i][1]
        if end_hyp[#end_hyp] == END then
           done = true
           found_eos = true
@@ -294,9 +327,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                 if scores[i][k] > max_score then
                    max_hyp = possible_hyp
                    max_score = scores[i][k]
-                   if model_opt.attn == 1 then
-                      max_attn_argmax = attn_argmax[i][k]
-                   end                   
+                    max_attn_argmax = attn_argmax[i][k]
                 end
              end             
           end          
@@ -310,8 +341,10 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       end
       if model_opt.init_dec == 1 then
          for L = 1, model_opt.num_layers do
-            rnn_state_dec[L*2]:copy(rnn_state_enc[L*2-1][{{1}}])
-            rnn_state_dec[L*2+1]:copy(rnn_state_enc[L*2][{{1}}])
+            --rnn_state_dec[L*2]:copy(init_dec_module:forward(rnn_state_enc[L*2-1][{{1}}]))
+            --rnn_state_dec[L*2+1]:copy(init_dec_module:forward(rnn_state_enc[L*2][{{1}}]))
+            rnn_state_dec[L*2]:copy(init_dec_module:forward(rnn_state_enc[L*2-1]))
+            rnn_state_dec[L*2+1]:copy(init_dec_module:forward(rnn_state_enc[L*2]))
          end
       end
       local target_l = gold:size(1) 
@@ -322,12 +355,22 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
          else
             decoder_input1 = gold[{{t-1}}]
          end
-         local decoder_input = {decoder_input1, context[{{1}}], table.unpack(rnn_state_dec)}
+         local decoder_input = {decoder_input1, table.unpack(rnn_state_dec)}
          local out_decoder = model[2]:forward(decoder_input)
-         local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+         local decoder_attn_input
+         if model_opt.hierarchical == 1 then
+           decoder_attn_input = {out_decoder[#out_decoder], context[{{1}}], context_bow[{{1}}]}
+         else
+           decoder_attn_input = {out_decoder[#out_decoder], context[{{1}}]}
+         end
+         local attn_out = model[layers_idx['decoder_attn']]:forward(decoder_attn_input)
+
+         local out = model[3]:forward(attn_out) -- K x vocab_size
          rnn_state_dec = {} -- to be modified later
-         table.insert(rnn_state_dec, out_decoder[#out_decoder])
-         for j = 1, #out_decoder - 1 do
+         if model_opt.input_feed == 1 then
+           table.insert(rnn_state_dec, attn_out)
+         end
+         for j = 1, #out_decoder do
             table.insert(rnn_state_dec, out_decoder[j])
          end
          gold_score = gold_score + out[1][gold[t]]
@@ -401,17 +444,27 @@ function sent2wordidx(sent, word2idx, start_symbol)
    return torch.LongTensor(t), u
 end
 
-function sent2charidx(sent, char2idx, max_word_l, start_symbol)
+function doc2charidx(doc, char2idx, max_word_l, start_symbol)
    local words = {}
-   if start_symbol == 1 then
-      table.insert(words, START_WORD)
-   end   
-   for word in sent:gmatch'([^%s]+)' do
-      table.insert(words, word)
+   local st = 1
+   for idx in doc:gmatch("()(</s>)") do
+     local sent = doc:sub(st, idx-2)
+     st = idx + 5
+     table.insert(words, {})
+     if start_symbol == 1 then
+        table.insert(words[#words], START_WORD)
+     end   
+     for word in sent:gmatch'([^%s]+)' do
+        table.insert(words[#words], word)
+     end
+     if start_symbol == 1 then
+        table.insert(words[#words], END_WORD)
+     end   
    end
-   if start_symbol == 1 then
-      table.insert(words, END_WORD)
-   end   
+   --local chars = torch.ones(#words, max_word_l)
+   --for i = 1, #words do
+      --chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i])
+   --end
    local chars = torch.ones(#words, max_word_l)
    for i = 1, #words do
       chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i])
@@ -422,8 +475,9 @@ end
 function word2charidx(word, char2idx, max_word_l, t)
    t[1] = START
    local i = 2
-   for _, char in utf8.next, word do
-      char = utf8.char(char)
+   --for _, char in utf8.next, word do
+      --char = utf8.char(char)
+   for _,char in ipairs(word) do
       local char_idx = char2idx[char] or UNK
       t[i] = char_idx
       i = i+1
@@ -470,8 +524,8 @@ function clean_sent(sent)
    local s = stringx.replace(sent, UNK_WORD, '')
    s = stringx.replace(s, START_WORD, '')
    s = stringx.replace(s, END_WORD, '')
-   s = stringx.replace(s, START_CHAR, '')
-   s = stringx.replace(s, END_CHAR, '')
+   --s = stringx.replace(s, START_CHAR, '')
+   --s = stringx.replace(s, END_CHAR, '')
    return s
 end
 
@@ -482,7 +536,7 @@ end
 function main()
    -- some globals
    PAD = 1; UNK = 2; START = 3; END = 4
-   PAD_WORD = '<blank>'; UNK_WORD = '<unk>'; START_WORD = '<s>'; END_WORD = '</s>'
+   PAD_WORD = '<blank>'; UNK_WORD = '<unk>'; START_WORD = '<d>'; END_WORD = '</d>'
    START_CHAR = '{'; END_CHAR = '}'
    MAX_SENT_L = opt.max_sent_l
    assert(path.exists(opt.src_file), 'src_file does not exist')
@@ -518,6 +572,7 @@ function main()
    for i = 1, #model do
       model[i]:evaluate()
    end
+   layers_idx = model_opt.save_idx
    
    
    idx2word_src = idx2key(opt.src_dict)
@@ -527,7 +582,7 @@ function main()
    
    -- load character dictionaries if needed
    if model_opt.use_chars_enc == 1 or model_opt.use_chars_dec == 1 then
-      utf8 = require 'lua-utf8'      
+      --utf8 = require 'lua-utf8'      
       char2idx = flip_table(idx2key(opt.char_dict))
       model[1]:apply(get_layer)
    end
@@ -567,16 +622,18 @@ function main()
 
    softmax_layers = {}
    model[2]:apply(get_layer)
-   if model_opt.attn == 1 then
-      decoder_attn:apply(get_layer)
-      decoder_softmax = softmax_layers[1]
-      attn_layer = torch.zeros(opt.beam, MAX_SENT_L)      
-   end
+    decoder_attn = model[layers_idx['decoder_attn']]
+    decoder_attn:apply(get_layer)
+    decoder_softmax = softmax_layers[1]
+    attn_layer = torch.zeros(opt.beam, MAX_SENT_L)      
    
    
-   context_proto = torch.zeros(1, MAX_SENT_L, model_opt.rnn_size)
+   MAX_WORD_L = model_opt.max_word_l
+   context_proto = torch.zeros(1, MAX_SENT_L, MAX_WORD_L, model_opt.rnn_size)
+   context_bow_proto = torch.zeros(1, MAX_SENT_L, model_opt.word_vec_size)
    local h_init_dec = torch.zeros(opt.beam, model_opt.rnn_size)
-   local h_init_enc = torch.zeros(1, model_opt.rnn_size) 
+   --local h_init_enc = torch.zeros(1, model_opt.rnn_size) 
+   local h_init_enc = torch.zeros(MAX_SENT_L, model_opt.rnn_size) 
    if opt.gpuid >= 0 then
       h_init_enc = h_init_enc:cuda()      
       h_init_dec = h_init_dec:cuda()
@@ -588,10 +645,9 @@ function main()
          context_proto2 = torch.zeros(opt.beam, MAX_SENT_L, model_opt.rnn_size):cuda()
       else
          context_proto = context_proto:cuda()
+         context_bow_proto = context_bow_proto:cuda()
       end
-      if model_opt.attn == 1 then
-         attn_layer = attn_layer:cuda()
-      end      
+       attn_layer = attn_layer:cuda()
    end
    init_fwd_enc = {}
    init_fwd_dec = {} -- initial context
@@ -624,7 +680,7 @@ function main()
       if model_opt.use_chars_enc == 0 then
          source, source_str = sent2wordidx(line, word2idx_src, model_opt.start_symbol)
       else
-         source, source_str = sent2charidx(line, char2idx, model_opt.max_word_l, model_opt.start_symbol)
+         source, source_str = doc2charidx(line, char2idx, model_opt.max_word_l, model_opt.start_symbol)
       end
       if opt.score_gold == 1 then
          target, target_str = sent2wordidx(gold[sent_id], word2idx_targ, 1)

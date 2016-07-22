@@ -32,6 +32,7 @@ function data:__init(opt, data_file)
       self.char_size = f:read('char_size'):all()[1]
       --self.char_length = self.source_char:size(3)
       if opt.start_symbol == 0 then
+        -- TODO: there are still sentence start symbols, what to do about it?
          self.source_char_l:add(-2)
 	 self.source_char = self.source_char[{{}, {2, self.source_char:size(2)-1}}]
       end      

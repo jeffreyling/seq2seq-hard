@@ -13,6 +13,9 @@ cmd:option('-debug', 0, [[Debug]])
 cmd:option('-hierarchical', 0, [[Do hierarchical attention]])
 cmd:option('-attn_type', 'soft', [[`soft`, `hard` for first attention on decoder side]])
 cmd:option('-attn_word_type', 'soft', [[`soft`, `hard` for hierarchical second attention]])
+cmd:option('-num_layers', 2, [[Number of layers in the LSTM encoder/decoder]])
+cmd:option('-rnn_size', 500, [[Size of LSTM hidden states]])
+cmd:option('-word_vec_size', 300, [[Word embedding sizes]])
 
 -- FIX THESE FOR TRANSLATION
 cmd:option('-init_dec', 1, [[Initialize the hidden/cell state of the decoder at time 
@@ -20,6 +23,10 @@ cmd:option('-init_dec', 1, [[Initialize the hidden/cell state of the decoder at 
                            the initial states of the decoder are set to zero vectors]])
 cmd:option('-input_feed', 1, [[If = 1, feed the context vector at each time step as additional
                              input (vica concatenation with the word embeddings) to the decoder]])
+
+-- necessary for summary
+cmd:option('-use_chars_enc', 1, [[If = 1, use character on the encoder 
+                                side (instead of word embeddings]])
 
 -- crazy hacks
 cmd:option('-share_embed', 0, [[ Autoencoder mode: share enc/dec embeddings ]])
@@ -77,13 +84,8 @@ cmd:text("")
 cmd:text("**Model options**")
 cmd:text("")
 
-cmd:option('-num_layers', 2, [[Number of layers in the LSTM encoder/decoder]])
-cmd:option('-rnn_size', 500, [[Size of LSTM hidden states]])
-cmd:option('-word_vec_size', 300, [[Word embedding sizes]])
-cmd:option('-attn', 1, [[If = 1, use attention on the decoder side. If = 0, it uses the last
-                       hidden state of the decoder as context at each time step.]])
-cmd:option('-use_chars_enc', 1, [[If = 1, use character on the encoder 
-                                side (instead of word embeddings]])
+--cmd:option('-attn', 1, [[If = 1, use attention on the decoder side. If = 0, it uses the last
+                       --hidden state of the decoder as context at each time step.]])
 cmd:option('-use_chars_dec', 0, [[If = 1, use character on the decoder 
                                 side (instead of word embeddings]])
 cmd:option('-reverse_src', 0, [[If = 1, reverse the source sequence. The original 
@@ -723,13 +725,7 @@ function train(train_data, valid_data)
           for t = 1, target_l do
             decoder_clones[t]:training()
             decoder_attn_clones[t]:training()
-            local decoder_input
-            if opt.attn == 1 then
-              decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
-            else
-              assert(false)
-              --decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec[t-1])}
-            end	    
+            local decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
             local out = decoder_clones[t]:forward(decoder_input)
             table.insert(decoder_out, out[#out]) -- for backprop
             local decoder_attn_input
@@ -766,12 +762,12 @@ function train(train_data, valid_data)
           for t = target_l, 1, -1 do
             local pred = generator:forward(preds[t])
             if opt.attn_type == 'hard' then
+              -- TODO: could still use some cleanup here...
               -- compute and broadcast reward to relevant layers
-              local mask = target_l_all:lt(t)
+              local mask = target_l_all:lt(t) -- for padding
               local reward_input = {pred, mask}
               reward_criterion:forward(reward_input, target_out[t])
               local unnorm_reward = reward_criterion.reward
-              -- TODO: could still use some cleanup here...
               local cur_reward, b, b_learned = compute_VR_reward(unnorm_reward, mask, t, preds[t])
               if opt.input_feed == 1 then
                 if t == target_l then
@@ -822,34 +818,23 @@ function train(train_data, valid_data)
             --local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
             local decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
+            if i % opt.print_batch == 0 then
+              --print('attn forwards:')
+              --print(softmax_attn_layers[t].output)
+              print('memory:', cutorch.getMemoryUsage(opt.gpuid))
+              print('i:', i)
+              print('source length:', source_l, 'time step:', t)
+              io.read()
+            end
             -- accumulate encoder/decoder grads
-            if opt.attn == 1 then
-              if i % opt.print_batch == 0 then
-                --print('attn forwards:')
-                --print(softmax_attn_layers[t].output)
-                print('memory:', cutorch.getMemoryUsage(opt.gpuid))
-                print('i:', i)
-                print('source length:', source_l, 'time step:', t)
-                io.read()
-              end
-              encoder_grads:add(dl_dattn[2])
-              if opt.brnn == 1 then
-                encoder_bwd_grads:add(dl_dattn[2])
-              end
-              if opt.hierarchical == 1 then
-                encoder_bow_grads:add(dl_dattn[3])
-              end
-              --encoder_grads:add(dlst[2])
-              --if opt.brnn == 1 then
-                --encoder_bwd_grads:add(dlst[2])
-              --end
-            else
-              assert(false)
-              --encoder_grads[{{}, source_l}]:add(dlst[2])
-              --if opt.brnn == 1 then
-                --encoder_bwd_grads[{{}, 1}]:add(dlst[2])
-              --end
-            end 
+            encoder_grads:add(dl_dattn[2])
+            if opt.brnn == 1 then
+              encoder_bwd_grads:add(dl_dattn[2])
+            end
+            if opt.hierarchical == 1 then
+              encoder_bow_grads:add(dl_dattn[3])
+            end
+
             drnn_state_dec[#drnn_state_dec]:zero()
             if opt.input_feed == 1 then
               --drnn_state_dec[#drnn_state_dec]:add(dlst[3])
@@ -883,14 +868,7 @@ function train(train_data, valid_data)
 
           for t = source_char_l, 1, -1 do
             local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
-            if opt.attn == 1 then
-              drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},{},t}])
-            else
-              assert(false)
-              --if t == source_l then
-                --drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},t}])
-              --end
-            end	    		  
+            drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},{},t}])
             local dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
             for j = 1, #drnn_state_enc do
               drnn_state_enc[j]:copy(dlst[j+1])
@@ -898,7 +876,7 @@ function train(train_data, valid_data)
           end
 
           if opt.brnn == 1 then
-            local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
+            local drnn_state_enc = reset_state(init_bwd_enc, batch_l*source_l)
             if opt.init_dec == 1 then
               for L = 1, opt.num_layers do
                 drnn_state_enc[L*2-1]:copy(init_dec_modules_bwd[L*2-1]:backward(rnn_state_enc_bwd[1][L*2-1], drnn_state_dec[L*2-1]))
@@ -907,14 +885,7 @@ function train(train_data, valid_data)
             end
             for t = 1, source_char_l do
               local encoder_input = {source[t], table.unpack(rnn_state_enc_bwd[t+1])}
-              if opt.attn == 1 then
-                drnn_state_enc[#drnn_state_enc]:add(encoder_bwd_grads[{{},{},t}])
-              else
-                assert(false)
-                --if t == 1 then
-                  --drnn_state_enc[#drnn_state_enc]:add(encoder_bwd_grads[{{},t}])
-                --end
-              end
+              drnn_state_enc[#drnn_state_enc]:add(encoder_bwd_grads[{{},{},t}])
               local dlst = encoder_bwd_clones[t]:backward(encoder_input, drnn_state_enc)
               for j = 1, #drnn_state_enc do
                 drnn_state_enc[j]:copy(dlst[j+1])
@@ -1187,13 +1158,8 @@ function train(train_data, valid_data)
 
       local loss = 0
       for t = 1, target_l do
-        local decoder_input
-        if opt.attn == 1 then
+        local decoder_input = {target[t], table.unpack(rnn_state_dec)}
           --decoder_input = {target[t], context, table.unpack(rnn_state_dec)}
-          decoder_input = {target[t], table.unpack(rnn_state_dec)}
-        else
-          decoder_input = {target[t], context[{{},source_l}], table.unpack(rnn_state_dec)}
-        end	 
         local out = decoder_clones[1]:forward(decoder_input)
         local decoder_attn_input
         if opt.hierarchical == 1 then
@@ -1340,7 +1306,7 @@ function main()
       opt.num_layers = model_opt.num_layers
       opt.rnn_size = model_opt.rnn_size
       opt.input_feed = model_opt.input_feed
-      opt.attn = model_opt.attn
+      --opt.attn = model_opt.attn
       opt.attn_type = model_opt.attn_type
       opt.brnn = model_opt.brnn
 

@@ -71,7 +71,8 @@ def Tokenize(text, url_hash, tokens_path):
 
 
 # note: kind of specific to CNN+Dailymail
-def format(path, outfile, dataset):
+def format(path, outfile, dataset, max_num_sent=-1):
+    """ dataset: training, validation, test """
     print "Processing dataset:", dataset
     story_path = '%s/stories/%s' % (path, dataset)
     tokens_path = '%s/tokens' % path
@@ -92,9 +93,11 @@ def format(path, outfile, dataset):
             parts = re.sub(r"\d", "#", parts)
             parts = parts.split('@ highlight </s>')
             src = parts[0]
+            if max_num_sent != -1:
+              src = src.split('</s>')[:max_num_sent]
+              src = '</s>'.join(src) + '</s>'
             targ = parts[1].replace('</s>', '').strip()  # TODO: consider making all highlights relevant
 
-            # print url_hash
             # print src
             # print targ
             # raw_input()
@@ -102,7 +105,7 @@ def format(path, outfile, dataset):
             targ_file.write(targ + '\n')
             counter += 1
             if counter % 10000 == 0:
-                print "Processed", counter
+                print "Processed %d/%d" % (counter, files)
 
     src_file.close()
     targ_file.close()
@@ -113,12 +116,14 @@ def main(arguments):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--srcdir', help="Path to source training data. ", type=str, required=True)
     parser.add_argument('--outfile', help="Prefix of the output file names. ", type=str, required=True)
+    parser.add_argument('--max_num_sent', help="We take the first n sentences of each doc", type=int, default=-1)
     args = parser.parse_args(arguments)
 
     src_dir = args.srcdir
     outfile = args.outfile
+    max_num_sent = args.max_num_sent
     for dataset in datasets:
-      format(src_dir, outfile, dataset)
+      format(src_dir, outfile, dataset, max_num_sent)
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv[1:]))
