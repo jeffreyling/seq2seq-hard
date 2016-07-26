@@ -12,6 +12,9 @@ stringx = require('pl.stringx')
 
 cmd = torch.CmdLine()
 
+-- check attn options
+cmd:option('-view_attn', 0, [[View attention weights at each time step]])
+
 -- file location
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])
 cmd:option('-src_file', '',[[Source sequence to decode (one line per sequence)]])
@@ -122,11 +125,29 @@ function StateAll.print(state)
    print()
 end
 
+function pretty_print(t)
+  for i,x in ipairs(t) do
+    if i > 1 then
+      for j = 1, x:size(1) do
+        io.write(string.format("%.4f ", x[j]))
+      end
+      print('')
+    end
+  end
+end
 
 -- Convert a flat index to a row-column tuple.
 function flat_to_rc(v, flat_index)
    local row = math.floor((flat_index - 1) / v:size(2)) + 1
    return row, (flat_index - 1) % v:size(2) + 1
+end
+
+function get_nonzeros(source)
+  local nonzeros = {}
+  for i = 1, source:size(1) do
+    table.insert(nonzeros, source[i]:ne(1):sum())
+  end
+  return nonzeros
 end
 
 function generate_beam(model, initial, K, max_sent_l, source, gold)
@@ -143,25 +164,35 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    local scores = torch.FloatTensor(n, K)
    scores:zero()
 
+   local nonzeros = get_nonzeros(source)
    source = source:t():contiguous() -- get words to dim 1 for LSTM
    --local source_l = math.min(source:size(1), opt.max_sent_l)
    local source_char_l = math.min(source:size(1), opt.max_sent_l)
    local source_sent_l = source:size(2)
    local attn_argmax = {}   -- store attn weights
    attn_argmax[1] = {}
+   local attn_list = {}
+   attn_list[1] = {}
+
+   local attn_argmax_words
+   if model_opt.hierarchical == 1 then
+     attn_argmax_words = {}
+     attn_argmax_words[1] = {}
+   end
 
    local states = {} -- store predicted word idx
    states[1] = {}
    for k = 1, 1 do
       table.insert(states[1], initial)
       table.insert(attn_argmax[1], initial)
+      table.insert(attn_list[1], initial)
       next_ys[1][k] = State.next(initial)
    end
 
    local source_input
    -- for batch
    if model_opt.use_chars_enc == 1 then
-      source_input = source:view(source_char_l, 1, source:size(2)):contiguous()
+      source_input = source:view(source_char_l, 1, source:size(2)):contiguous():cuda()
    else
       source_input = source:view(source_char_l, 1)
    end
@@ -181,7 +212,8 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       context[{{},{},t}]:copy(out[#out]:view(1, source_sent_l, model_opt.rnn_size))
    end
    if model_opt.hierarchical == 1 then
-     local bow_out = model[layers_idx['bow_encoder']]:forward(source_input)
+     --local bow_out = model[layers_idx['bow_encoder']]:forward(source_input:permute(2,3,1))
+     local bow_out = model[5]:forward(source_input:permute(2,3,1))
      context_bow:copy(bow_out)
    end
    rnn_state_dec = {}
@@ -241,6 +273,10 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       i = i+1
       states[i] = {}
       attn_argmax[i] = {}
+      attn_list[i] = {}
+      if model_opt.hierarchical == 1 then
+        attn_argmax_words[i] = {}
+      end
       local decoder_input1
       if model_opt.use_chars_dec == 1 then
          decoder_input1 = word2charidx_targ:index(1, next_ys:narrow(1,i-1,1):squeeze())
@@ -299,8 +335,44 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
              end
              
              if i < 2 or diff then
-                 max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
-                 attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
+                 if opt.view_attn == 1 then
+                   print('decoder attention at time ', i)
+                   if model_opt.hierarchical == 1 then
+                     print('row:', decoder_softmax.output) -- K x source_sent_l
+                     print('words:', decoder_softmax_words.output:view(K, source_sent_l, source_char_l))
+                   else
+                     print('all words:', decoder_softmax.output:view(K, source_sent_l, source_char_l))
+                   end
+                   io.read()
+                 end
+                 if model_opt.hierarchical == 1 then
+                    local row_attn = decoder_softmax.output[prev_k]
+                    local word_attn = decoder_softmax_words.output:reshape(K, source_sent_l, source_char_l)[prev_k]:clone()
+                    local result
+                    for r = 1, row_attn:size(1) do
+                      word_attn[r]:mul(row_attn[r])
+                      local cur = word_attn[r][{{1, nonzeros[r]}}]
+                      if result == nil then
+                        result = cur
+                      else
+                        result = torch.cat(result, cur, 1)
+                      end
+                    end
+                    --print(result)
+                    --print('deficit:', 1-result:sum())
+                    --io.read()
+                    attn_list[i][k] = State.advance(attn_list[i-1][prev_k], result)
+                    max_attn, max_index = result:max(1)
+                    attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
+                 else
+                    assert(false, 'TODO error')
+                    attn_list[i][k] = State.advance(attn_list[i-1][prev_k], decoder_softmax.output[prev_k]:clone())
+                    max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
+                    attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
+                 end
+                 --if model_opt.hierarchical == 1 then
+                   --attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k], m
+
                 prev_ks[i][k] = prev_k
                 next_ys[i][k] = y_i
                 scores[i][k] = score
@@ -316,6 +388,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
        end_hyp = states[i][1]
        end_score = scores[i][1]
         end_attn_argmax = attn_argmax[i][1]
+       end_attn_list = attn_list[i][1]
        if end_hyp[#end_hyp] == END then
           done = true
           found_eos = true
@@ -328,6 +401,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                    max_hyp = possible_hyp
                    max_score = scores[i][k]
                     max_attn_argmax = attn_argmax[i][k]
+                    max_attn_list = attn_list[i][k]
                 end
              end             
           end          
@@ -381,9 +455,10 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       max_hyp = end_hyp
       max_score = end_score
       max_attn_argmax = end_attn_argmax
+      max_attn_list = end_attn_list
    end
 
-   return max_hyp, max_score, max_attn_argmax, gold_score, states[i], scores[i], attn_argmax[i]
+   return max_hyp, max_score, max_attn_argmax, gold_score, states[i], scores[i], attn_argmax[i], max_attn_list
 end
 
 function idx2key(file)   
@@ -467,14 +542,17 @@ function doc2charidx(doc, char2idx, max_word_l, start_symbol)
    --end
    local chars = torch.ones(#words, max_word_l)
    for i = 1, #words do
-      chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i])
+      chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i], start_symbol)
    end
    return chars, words
 end
 
-function word2charidx(word, char2idx, max_word_l, t)
-   t[1] = START
-   local i = 2
+function word2charidx(word, char2idx, max_word_l, t, start_symbol)
+   local i = 1
+   if start_symbol == 1 then
+     t[1] = START
+     i = 2
+   end
    --for _, char in utf8.next, word do
       --char = utf8.char(char)
    for _,char in ipairs(word) do
@@ -482,11 +560,13 @@ function word2charidx(word, char2idx, max_word_l, t)
       t[i] = char_idx
       i = i+1
       if i >= max_word_l then
-         t[i] = END
+         if start_symbol == 1 then
+           t[i] = END
+         end
          break
       end
    end
-   if i < max_word_l then
+   if i < max_word_l and start_symbol == 1 then
       t[i] = END
    end
    return t
@@ -625,6 +705,7 @@ function main()
     decoder_attn = model[layers_idx['decoder_attn']]
     decoder_attn:apply(get_layer)
     decoder_softmax = softmax_layers[1]
+    decoder_softmax_words = softmax_layers[2]
     attn_layer = torch.zeros(opt.beam, MAX_SENT_L)      
    
    
@@ -686,8 +767,8 @@ function main()
          target, target_str = sent2wordidx(gold[sent_id], word2idx_targ, 1)
       end
       state = State.initial(START)
-      pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn = generate_beam(model,
-                  state, opt.beam, MAX_SENT_L, source, target)
+      pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn, attn_list = generate_beam(model,
+                  state, opt.beam, MAX_SENT_L, source, target) -- use attn_list to print attn
       pred_score_total = pred_score_total + pred_score
       pred_words_total = pred_words_total + #pred - 1
       pred_sent = wordidx2sent(pred, idx2word_targ, source_str, attn, true)
@@ -709,7 +790,7 @@ function main()
             out_file:write(out_n .. '\n')
          end         
       end
-      
+
       print('')
    end
    print(string.format("PRED AVG SCORE: %.4f, PRED PPL: %.4f", pred_score_total / pred_words_total,

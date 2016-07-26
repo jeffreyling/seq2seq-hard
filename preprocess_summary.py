@@ -104,6 +104,11 @@ def pad(ls, length, symbol):
         return ls[:length]
     return ls + [symbol] * (length -len(ls))
 
+def pad_front(ls, length, symbol):
+    if len(ls) >= length:
+        return ls[:length]
+    return [symbol] * (length -len(ls)) + ls
+
 def get_data(args):
     src_indexer = Indexer(["<blank>","<unk>","<d>","</d>"]) # dummy
     word_indexer = Indexer(["<blank>","<unk>","<s>", "</s>"]) # for both source and target
@@ -136,7 +141,7 @@ def get_data(args):
         return max_sent_l, num_docs
                 
     def convert(srcfile, targetfile, batchsize, seqlength, outfile, num_docs,
-                max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0):
+                max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0, pad_front=0):
         
         newseqlength = seqlength + 2 #add 2 for EOS and BOS; length in sents of the longest document
         targets = np.zeros((num_docs, newseqlength), dtype=int) # the target sequence
@@ -159,14 +164,20 @@ def get_data(args):
             if len(src) > newseqlength:
                 dropped += 1
                 continue                   
-            targ = pad(targ, newseqlength+1, word_indexer.PAD)
+            if pad_front == 1:
+              targ = pad_front(targ, newseqlength+1, word_indexer.PAD)
+            else:
+              targ = pad(targ, newseqlength+1, word_indexer.PAD)
             for word in targ:
                 #use UNK for target, but not for source
                 word = word if word in word_indexer.d else word_indexer.UNK
             targ = word_indexer.convert_sequence(targ)
             targ = np.array(targ, dtype=int)
 
-            src = pad(src, newseqlength, src_indexer.PAD)
+            if pad_front == 1:
+              src = pad_front(src, newseqlength, src_indexer.PAD)
+            else:
+              src = pad(src, newseqlength, src_indexer.PAD)
             src_word = []
             for sent in src:
                 sent = word_indexer.clean(sent)
@@ -174,7 +185,10 @@ def get_data(args):
                 if len(word) > max_sent_l:
                     word = word[:max_sent_l]
                     word[-1] = word_indexer.EOS
-                word_idx = word_indexer.convert_sequence(pad(word, max_sent_l, word_indexer.PAD))
+                if pad_front == 1:
+                  word_idx = word_indexer.convert_sequence(pad_front(word, max_sent_l, word_indexer.PAD))
+                else:
+                  word_idx = word_indexer.convert_sequence(pad(word, max_sent_l, word_indexer.PAD))
                 src_word.append(word_idx)
             src = [1 if x == src_indexer.PAD else 0 for x in src] # 1 if pad, 0 o.w.
             src = np.array(src, dtype=int) # not useful
@@ -334,7 +348,7 @@ def main(arguments):
     parser.add_argument('--outputfile', help="Prefix of the output file names. ", type=str, required=True)
     parser.add_argument('--maxsentlength', help="For the character models, words are "
                                            "(if longer than maxwordlength) or zero-padded "
-                                            "(if shorter) to maxwordlength", type=int, default=75)
+                                            "(if shorter) to maxwordlength", type=int, default=30)
     parser.add_argument('--word2vec', help="Path to word2vec", type = str, default='')
     parser.add_argument('--word2vec_out', help="output for word2vec embeds", type=str, default='')
     parser.add_argument('--unkfilter', help="Ignore sentences with too many UNK tokens. "
@@ -344,6 +358,9 @@ def main(arguments):
     parser.add_argument('--shuffle', help="If = 1, shuffle sentences before sorting (based on  "
                                            "source length).",
                                           type = int, default = 0)
+    parser.add_argument('--pad_front', help="If = 1, pad front of sentences instead of end.",
+                                          type = int, default = 0)
+
     args = parser.parse_args(arguments)
     get_data(args)
 

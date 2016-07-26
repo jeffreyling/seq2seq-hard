@@ -18,7 +18,7 @@ cmd:option('-rnn_size', 500, [[Size of LSTM hidden states]])
 cmd:option('-word_vec_size', 300, [[Word embedding sizes]])
 
 -- FIX THESE FOR TRANSLATION
-cmd:option('-init_dec', 1, [[Initialize the hidden/cell state of the decoder at time 
+cmd:option('-init_dec', 0, [[Initialize the hidden/cell state of the decoder at time 
                            0 to be the last hidden/cell state of the encoder. If 0, 
                            the initial states of the decoder are set to zero vectors]])
 cmd:option('-input_feed', 1, [[If = 1, feed the context vector at each time step as additional
@@ -624,6 +624,7 @@ function train(train_data, valid_data)
         local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
         local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
         local source_char_l = d[9]
+        local pad_mask = source:eq(1) -- padding
 
         local loss = 0 -- added by Jeffrey
         for sample_i = 1, num_samples do
@@ -657,6 +658,14 @@ function train(train_data, valid_data)
             encoder_clones[t]:training()
             local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
             local out = encoder_clones[t]:forward(encoder_input)
+
+            -- mask out padding on encoder
+            local cur_mask = pad_mask[t]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+            for L = 1, opt.num_layers do
+              out[L*2-1]:maskedFill(cur_mask, 0)
+              out[L*2]:maskedFill(cur_mask, 0)
+            end
+              
             rnn_state_enc[t] = out
             context[{{},{},t}]:copy(out[#out]:view(batch_l, source_l, opt.rnn_size))
           end
@@ -869,6 +878,15 @@ function train(train_data, valid_data)
           for t = source_char_l, 1, -1 do
             local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
             drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},{},t}])
+
+            if t < source_char_l then
+              local cur_mask = pad_mask[t+1]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+              for L = 1, opt.num_layers do
+                drnn_state_enc[L*2-1]:maskedFill(cur_mask, 0)
+                drnn_state_enc[L*2]:maskedFill(cur_mask, 0)
+              end
+            end
+
             local dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
             for j = 1, #drnn_state_enc do
               drnn_state_enc[j]:copy(dlst[j+1])
@@ -876,6 +894,7 @@ function train(train_data, valid_data)
           end
 
           if opt.brnn == 1 then
+            assert(false, 'fix pad mask stuff!')
             local drnn_state_enc = reset_state(init_bwd_enc, batch_l*source_l)
             if opt.init_dec == 1 then
               for L = 1, opt.num_layers do
@@ -1355,7 +1374,7 @@ function main()
    
    layers = {encoder, decoder, generator, decoder_attn}
    layers_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
-   idx = #layers_idx + 1
+   idx = 5
    if opt.hierarchical == 1 then
      table.insert(layers, bow_encoder)
      layers_idx['bow_encoder'] = idx

@@ -14,7 +14,7 @@ import re
 import pdb
 from collections import defaultdict
 
-datasets = ['train', 'val', 'test']
+datasets = ['val', 'test', 'train']
 
 def LoadTokenMapping(filename):
   """Loads a token mapping from the given filename.
@@ -91,21 +91,23 @@ def format(path, outfile, dataset, max_num_sent=-1):
             # lowercase and replace numbers
             parts = ' '.join(tokens).lower()
             parts = re.sub(r"\d", "#", parts)
-            parts = parts.split('@ highlight </s>')
-            src = parts[0]
+            parts = parts.split(' @ highlight </s> ')
+            src = parts[0].strip()
             if max_num_sent != -1:
-              src = src.split('</s>')[:max_num_sent]
-              src = '</s>'.join(src) + '</s>'
+              src = src.strip(' </s>').split('</s>')[:max_num_sent]
+              src = '</s>'.join(src) + ' </s>'
             targ = parts[1].replace('</s>', '').strip()  # TODO: consider making all highlights relevant
 
-            # print src
-            # print targ
-            # raw_input()
+            # if counter == 1128:
+              # print parts
+              # print src
+              # print targ
+              # raw_input()
             src_file.write(src + '\n')
             targ_file.write(targ + '\n')
             counter += 1
             if counter % 10000 == 0:
-                print "Processed %d/%d" % (counter, files)
+                print "Processed %d/%d" % (counter, len(files))
 
     src_file.close()
     targ_file.close()
