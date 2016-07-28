@@ -9,6 +9,9 @@ require 'model_utils.lua'
 
 cmd = torch.CmdLine()
 
+cmd:option('-no_bow', 0, [[Use LSTM instead of BOW encoder]])
+cmd:option('-bow_encoder_lstm', 0, [[LSTM over sentence BOW]])
+cmd:option('-mask_padding', 1, [[Mask LSTM states for padding words]])
 cmd:option('-debug', 0, [[Debug]])
 cmd:option('-hierarchical', 0, [[Do hierarchical attention]])
 cmd:option('-attn_type', 'soft', [[`soft`, `hard` for first attention on decoder side]])
@@ -177,11 +180,16 @@ torch.manualSeed(opt.seed)
 function save_checkpoint(savefile)
   local save_table = {encoder, decoder, generator, decoder_attn}
   local save_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
-  local idx = #save_idx + 1
+  local idx = 5
   if opt.hierarchical == 1 then
     table.insert(save_table, bow_encoder)
     save_idx['bow_encoder'] = idx
     idx = idx + 1
+    if opt.bow_encoder_lstm == 1 then
+      table.insert(save_table, bow_encoder_lstm)
+      save_idx['bow_encoder_lstm'] = idx
+      idx = idx + 1
+    end
   end
   if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
     table.insert(save_table, baseline_m)
@@ -298,13 +306,28 @@ function train(train_data, valid_data)
    local encoder_bwd_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.max_word_l, opt.rnn_size)
    context_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.max_word_l, opt.rnn_size)
    context_proto2 = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.max_word_l, opt.rnn_size)
-   local encoder_bow_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.word_vec_size)
-   context_bow_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.word_vec_size)
+   local bow_size
+   local encoder_bow_lstm_grad_proto
+   if opt.bow_encoder_lstm == 1 then
+     bow_size = opt.rnn_size
+     if opt.no_bow == 1 then
+       encoder_bow_lstm_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.rnn_size)
+     else
+       encoder_bow_lstm_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.word_vec_size)
+     end
+   else
+     bow_size = opt.word_vec_size
+   end
+   local encoder_bow_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, bow_size)
+   context_bow_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, bow_size)
    
    -- clone encoder/decoder up to max source/target length   
    decoder_clones = clone_many_times(decoder, opt.max_sent_l_targ)
    decoder_attn_clones = clone_many_times(decoder_attn, opt.max_sent_l_targ)
    encoder_clones = clone_many_times(encoder, opt.max_word_l)
+   if (opt.hierarchical == 1) and (opt.bow_encoder_lstm == 1) then
+     bow_encoder_lstm_clones = clone_many_times(bow_encoder_lstm, opt.max_sent_l_src)
+   end
    if opt.brnn == 1 then
       encoder_bwd_clones = clone_many_times(encoder_bwd, opt.max_word_l)
    end   
@@ -316,8 +339,12 @@ function train(train_data, valid_data)
          encoder_bwd_clones[i]:apply(function(m) m:setReuse() end)
       end      
    end
-
-   for i = 1, opt.max_word_l do
+   for i = 1, opt.max_sent_l_src do
+      if (opt.hierarchical == 1) and (opt.bow_encoder_lstm == 1) then
+        bow_encoder_lstm_clones[i]:apply(function(m) m:setReuse() end)
+      end
+   end
+   for i = 1, opt.max_sent_l_targ do
       if decoder_clones[i].apply then
          decoder_clones[i]:apply(function(m) m:setReuse() end)
       end
@@ -388,6 +415,9 @@ function train(train_data, valid_data)
 	 end	 
          if opt.hierarchical == 1 then
            encoder_bow_grad_proto = encoder_bow_grad_proto:cuda()
+           if opt.bow_encoder_lstm == 1 then
+             encoder_bow_lstm_grad_proto = encoder_bow_lstm_grad_proto:cuda()
+           end
          end
       end
    end
@@ -396,6 +426,8 @@ function train(train_data, valid_data)
    init_bwd_enc = {}
    init_fwd_dec = {}
    init_bwd_dec = {}
+   init_fwd_bow_enc = {}
+   init_bwd_bow_enc = {}
    if opt.input_feed == 1 then
       table.insert(init_fwd_dec, h_init:clone())
    end
@@ -409,6 +441,12 @@ function train(train_data, valid_data)
       table.insert(init_fwd_dec, h_init:clone()) -- hidden state
       table.insert(init_bwd_dec, h_init:clone())
       table.insert(init_bwd_dec, h_init:clone())      
+      if opt.bow_encoder_lstm == 1 then
+        table.insert(init_fwd_bow_enc, h_init:clone())
+        table.insert(init_fwd_bow_enc, h_init:clone())
+        table.insert(init_bwd_bow_enc, h_init:clone())
+        table.insert(init_bwd_bow_enc, h_init:clone())
+      end
    end      
 
    --dec_offset = 3 -- offset depends on input feeding
@@ -625,6 +663,7 @@ function train(train_data, valid_data)
         local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
         local source_char_l = d[9]
         local pad_mask = source:eq(1) -- padding
+        local source_sent_l = source:ne(1):sum(1):squeeze(1) -- batch_l x source_l
 
         local loss = 0 -- added by Jeffrey
         for sample_i = 1, num_samples do
@@ -633,25 +672,32 @@ function train(train_data, valid_data)
           if opt.brnn == 1 then
             encoder_bwd_grads = encoder_bwd_grad_proto[{{1, batch_l}, {1, source_l}, {1, source_char_l}}]
           end	 
+          if opt.hierarchical == 1 and opt.bow_encoder_lstm == 1 then
+            encoder_bow_lstm_grads = encoder_bow_lstm_grad_proto[{{1, batch_l}, {1, source_l}}]
+          end
           local rnn_state_enc = reset_state(init_fwd_enc, batch_l*source_l, 0) -- different batch size for summary
           local context = context_proto[{{1, batch_l}, {1, source_l}, {1, source_char_l}}]
+          local rnn_state_mask = torch.zeros(batch_l, source_l, source_char_l, opt.rnn_size):byte():cuda()
+          for j = 1, batch_l do
+            for t = 1, source_l do
+              local idx = source_sent_l[j][t]
+              rnn_state_mask[j][t][idx]:fill(1)
+            end
+          end
 
           local encoder_bow_grads
           local context_bow
+          local rnn_state_bow_enc
           if opt.hierarchical == 1 then
             encoder_bow_grads = encoder_bow_grad_proto[{{1, batch_l}, {1, source_l}}]
             context_bow = context_bow_proto[{{1, batch_l}, {1, source_l}}]
+            if opt.bow_encoder_lstm == 1 then
+              rnn_state_bow_enc = reset_state(init_fwd_bow_enc, batch_l, 0)
+            end
           end
           if opt.gpuid >= 0 then
             cutorch.setDevice(opt.gpuid)
           end	 
-
-          -- forward prop encoder bow
-          if opt.hierarchical == 1 then
-            bow_encoder:training()
-            local bow_out = bow_encoder:forward(source:permute(2,3,1))
-            context_bow:copy(bow_out)
-          end
 
           -- forward prop encoder
           for t = 1, source_char_l do
@@ -660,14 +706,48 @@ function train(train_data, valid_data)
             local out = encoder_clones[t]:forward(encoder_input)
 
             -- mask out padding on encoder
-            local cur_mask = pad_mask[t]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
-            for L = 1, opt.num_layers do
-              out[L*2-1]:maskedFill(cur_mask, 0)
-              out[L*2]:maskedFill(cur_mask, 0)
+            if opt.mask_padding == 1 then
+              local cur_mask = pad_mask[t]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+              for L = 1, opt.num_layers do
+                out[L*2-1]:maskedFill(cur_mask, 0)
+                out[L*2]:maskedFill(cur_mask, 0)
+              end
             end
               
             rnn_state_enc[t] = out
             context[{{},{},t}]:copy(out[#out]:view(batch_l, source_l, opt.rnn_size))
+          end
+
+          -- forward prop encoder bow
+          local bow_out
+          local masked_selecter, rnn_states
+          if opt.no_bow == 1 then
+            masked_selecter = make_last_state_selecter(opt, batch_l, source_l)
+            rnn_states = masked_selecter:forward({context, rnn_state_mask})
+          end
+          if opt.hierarchical == 1 then
+            if opt.no_bow ~= 1 then
+              bow_encoder:training()
+              bow_out = bow_encoder:forward(source:permute(2,3,1))
+            end
+              
+            if opt.bow_encoder_lstm == 1 then
+              -- pass bag of words through LSTM over sentences for context
+              for t = 1, source_l do
+                bow_encoder_lstm_clones[t]:training()
+                local bow_encoder_input
+                if opt.no_bow == 1 then
+                  bow_encoder_input = {rnn_states[t], table.unpack(rnn_state_bow_enc[t-1])}
+                else
+                  bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc[t-1])}
+                end
+                local out = bow_encoder_lstm_clones[t]:forward(bow_encoder_input)
+                rnn_state_bow_enc[t] = out
+                context_bow[{{}, t}]:copy(out[#out])
+              end
+            else
+              context_bow:copy(bow_out)
+            end
           end
 
           -- forward prop decoder
@@ -824,7 +904,6 @@ function train(train_data, valid_data)
             local dl_dattn = decoder_attn_clones[t]:backward(decoder_attn_input, dl_dtarget)
 
             drnn_state_dec[#drnn_state_dec]:add(dl_dattn[1])
-            --local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
             local decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
             if i % opt.print_batch == 0 then
@@ -858,6 +937,38 @@ function train(train_data, valid_data)
             word_vec_layers[2].gradWeight:zero()
           end
 
+          -- encoder bow
+          local drnn_state_bow_enc = reset_state(init_bwd_bow_enc, batch_l)
+          if opt.hierarchical == 1 then
+            if opt.bow_encoder_lstm == 1 then
+              for t = source_l, 1, -1 do
+                local bow_encoder_input
+                if opt.no_bow == 1 then
+                  bow_encoder_input = {rnn_states[t], table.unpack(rnn_state_bow_enc[t-1])}
+                else
+                  bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc[t-1])}
+                end
+                drnn_state_bow_enc[#drnn_state_bow_enc]:add(encoder_bow_grads[{{},t}])
+                local dlst = bow_encoder_lstm_clones[t]:backward(bow_encoder_input, drnn_state_bow_enc)
+                for j = 1, #drnn_state_bow_enc do
+                  drnn_state_bow_enc[j]:copy(dlst[j+1])
+                end
+                encoder_bow_lstm_grads[{{},t}]:copy(dlst[1])
+              end
+
+              -- backward through word embeds
+              if opt.no_bow == 1 then
+                local ctx_grads = masked_selecter:backward({context, rnn_state_mask}, encoder_bow_lstm_grads)[1]
+                encoder_grads:add(ctx_grads)
+              else
+                bow_encoder:backward(source:permute(2,3,1), encoder_bow_lstm_grads)
+              end
+            else
+              bow_encoder:backward(source:permute(2,3,1), encoder_bow_grads)
+            end
+            word_vecs_bow.gradWeight[1]:zero()
+          end
+
           -- backward prop encoder
           if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
             cutorch.setDevice(opt.gpuid)
@@ -877,14 +988,22 @@ function train(train_data, valid_data)
 
           for t = source_char_l, 1, -1 do
             local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
-            drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},{},t}])
 
-            if t < source_char_l then
-              local cur_mask = pad_mask[t+1]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
-              for L = 1, opt.num_layers do
-                drnn_state_enc[L*2-1]:maskedFill(cur_mask, 0)
-                drnn_state_enc[L*2]:maskedFill(cur_mask, 0)
+            if opt.mask_padding == 1 then
+              if t < source_char_l then
+                local cur_mask = pad_mask[t+1]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+                for L = 1, opt.num_layers do
+                  drnn_state_enc[L*2-1]:maskedFill(cur_mask, 0)
+                  drnn_state_enc[L*2]:maskedFill(cur_mask, 0)
+                end
               end
+            end
+
+            -- attn grads
+            drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},{},t}])
+            if opt.mask_padding == 1 then
+              local cur_mask = pad_mask[t]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+              drnn_state_enc[#drnn_state_enc]:maskedFill(cur_mask, 0)
             end
 
             local dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
@@ -918,12 +1037,6 @@ function train(train_data, valid_data)
           end
           if opt.brnn == 1 then
             word_vec_layers[3].gradWeight[1]:zero()
-          end
-
-          -- encoder bow
-          if opt.hierarchical == 1 then
-            bow_encoder:backward(source:permute(2,3,1), encoder_bow_grads)
-            word_vecs_bow.gradWeight[1]:zero()
           end
 
           if cur_soft_anneal then
@@ -1119,6 +1232,9 @@ function train(train_data, valid_data)
     end
     if opt.hierarchical == 1 then
       bow_encoder:evaluate()
+      if opt.bow_encoder_lstm == 1 then
+        bow_encoder_lstm_clones[1]:evaluate()
+      end
     end
 
     local nll = 0
@@ -1128,19 +1244,65 @@ function train(train_data, valid_data)
       local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
       local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
       local source_char_l = d[9]
+      local pad_mask = source:eq(1) -- padding
       local rnn_state_enc = reset_state(init_fwd_enc, batch_l*source_l)
       local context = context_proto[{{1, batch_l}, {1, source_l}, {1, source_char_l}}]
       local context_bow = context_bow_proto[{{1, batch_l}, {1, source_l}}]
+      local rnn_state_bow_enc
+      if opt.hierarchical == 1 and opt.bow_encoder_lstm == 1 then
+        rnn_state_bow_enc = reset_state(init_fwd_bow_enc, batch_l)
+      end
+      local source_sent_l = source:ne(1):sum(1):squeeze(1) -- batch_l x source_l
+      local rnn_state_mask = torch.zeros(batch_l, source_l, source_char_l, opt.rnn_size):byte():cuda()
+      for j = 1, batch_l do
+        for t = 1, source_l do
+          local idx = source_sent_l[j][t]
+          rnn_state_mask[j][t][idx]:fill(1)
+        end
+      end
+
       -- forward prop encoder
       for t = 1, source_char_l do
         local encoder_input = {source[t], table.unpack(rnn_state_enc)}
         local out = encoder_clones[1]:forward(encoder_input)
+
+        if opt.mask_padding == 1 then
+          local cur_mask = pad_mask[t]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+          for L = 1, opt.num_layers do
+            out[L*2-1]:maskedFill(cur_mask, 0)
+            out[L*2]:maskedFill(cur_mask, 0)
+          end
+        end
+
         rnn_state_enc = out
         context[{{},{},t}]:copy(out[#out]:view(batch_l, source_l, opt.rnn_size))
       end	 
+
+      -- bow encoder
+      local masked_selecter, rnn_states
+      if opt.no_bow == 1 then
+        masked_selecter = make_last_state_selecter(opt, batch_l, source_l)
+        rnn_states = masked_selecter:forward({context, rnn_state_mask})
+      end
       if opt.hierarchical == 1 then
         local bow_out = bow_encoder:forward(source:permute(2,3,1))
-        context_bow:copy(bow_out)
+
+        if opt.bow_encoder_lstm == 1 then
+          -- pass bag of words through LSTM over sentences for context
+          for t = 1, source_l do
+            local bow_encoder_input
+            if opt.no_bow == 1 then
+              bow_encoder_input = {rnn_states[t], table.unpack(rnn_state_bow_enc)}
+            else
+              bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc)}
+            end
+            local out = bow_encoder_lstm_clones[t]:forward(bow_encoder_input)
+            rnn_state_bow_enc = out
+            context_bow[{{}, t}]:copy(out[#out])
+          end
+        else
+          context_bow:copy(bow_out)
+        end
       end
 
       local rnn_state_dec = reset_state(init_fwd_dec, batch_l)
@@ -1291,6 +1453,9 @@ function main()
       if opt.hierarchical == 1 then
         decoder_attn = make_hierarchical_decoder_attn(valid_data, opt)
         bow_encoder = make_bow_encoder(valid_data, opt)
+        if opt.bow_encoder_lstm == 1 then
+          bow_encoder_lstm = make_lstm_bow(valid_data, opt, 'bow')
+        end
       else
         decoder_attn = make_decoder_attn(valid_data, opt)
       end
@@ -1368,8 +1533,18 @@ function main()
    else
      print('doing full attention over doc')
    end
+   if opt.mask_padding == 1 then
+     print('masking padding for encoder hidden states')
+   end
    if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
      print('using learned baseline method')
+   end
+   if opt.no_bow == 1 then
+     assert(opt.bow_encoder_lstm == 1, 'need BOW lstm if using no bow')
+     print('using no bow')
+   end
+   if opt.bow_encoder_lstm == 1 then
+     print('using bow encoder lstm')
    end
    
    layers = {encoder, decoder, generator, decoder_attn}
@@ -1379,6 +1554,11 @@ function main()
      table.insert(layers, bow_encoder)
      layers_idx['bow_encoder'] = idx
      idx = idx + 1
+     if opt.bow_encoder_lstm == 1 then
+       table.insert(layers, bow_encoder_lstm)
+       layers_idx['bow_encoder_lstm'] = idx
+       idx = idx + 1
+     end
    end
    if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
      table.insert(layers, baseline_m)

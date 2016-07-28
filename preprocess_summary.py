@@ -46,7 +46,7 @@ def build_embeds(fname, outfile, words):
     for word, vec in word_vecs.iteritems():
         embeds[words[word]-1] = vec
 
-    f = h5py.File(outfile+".hdf5", "w")
+    f = h5py.File(outfile, "w")
     f["word_vecs"] = np.array(embeds)
     f.close()
 
@@ -114,7 +114,7 @@ def get_data(args):
     word_indexer = Indexer(["<blank>","<unk>","<s>", "</s>"]) # for both source and target
     word_indexer.add_w([src_indexer.BOS, src_indexer.EOS])
 
-    def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0):
+    def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0, truncate=0):
         num_docs = 0
         for _, (src_orig, targ_orig) in \
                 enumerate(itertools.izip(open(srcfile,'r'), open(targetfile,'r'))):
@@ -123,8 +123,9 @@ def get_data(args):
 
             src = src_orig.strip().strip("</s>").split("</s>") # splits the doc into sentences
             targ = targ_orig.strip().split()
-            if len(src) > seqlength or len(src) < 1 or len(targ) < 1:
-                continue
+            if truncate != 1:
+              if len(src) > seqlength or len(src) < 1 or len(targ) < 1:
+                  continue
             num_docs += 1
             for word in targ:
                 word_indexer.vocab[word] += 1
@@ -141,7 +142,7 @@ def get_data(args):
         return max_sent_l, num_docs
                 
     def convert(srcfile, targetfile, batchsize, seqlength, outfile, num_docs,
-                max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0, pad_front=0):
+                max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0, truncate=0):
         
         newseqlength = seqlength + 2 #add 2 for EOS and BOS; length in sents of the longest document
         targets = np.zeros((num_docs, newseqlength), dtype=int) # the target sequence
@@ -160,24 +161,23 @@ def get_data(args):
             src = [src_indexer.BOS] + src_orig.strip().strip("</s>").split("</s>") + [src_indexer.EOS]
             targ = [word_indexer.BOS] + targ_orig.strip().split() + [word_indexer.EOS]
             max_doc_l = max(len(src), max_doc_l)
-            # if len(src) > newseqlength or len(src) < 3:
-            if len(src) > newseqlength:
-                dropped += 1
-                continue                   
-            if pad_front == 1:
-              targ = pad_front(targ, newseqlength+1, word_indexer.PAD)
+            if truncate == 1:
+              if len(src) > newseqlength:
+                src = src[:newseqlength]
             else:
-              targ = pad(targ, newseqlength+1, word_indexer.PAD)
+              # if len(src) > newseqlength or len(src) < 3:
+              if len(src) > newseqlength:
+                  dropped += 1
+                  continue                   
+
+            targ = pad(targ, newseqlength+1, word_indexer.PAD)
             for word in targ:
                 #use UNK for target, but not for source
                 word = word if word in word_indexer.d else word_indexer.UNK
             targ = word_indexer.convert_sequence(targ)
             targ = np.array(targ, dtype=int)
 
-            if pad_front == 1:
-              src = pad_front(src, newseqlength, src_indexer.PAD)
-            else:
-              src = pad(src, newseqlength, src_indexer.PAD)
+            src = pad(src, newseqlength, src_indexer.PAD)
             src_word = []
             for sent in src:
                 sent = word_indexer.clean(sent)
@@ -185,10 +185,7 @@ def get_data(args):
                 if len(word) > max_sent_l:
                     word = word[:max_sent_l]
                     word[-1] = word_indexer.EOS
-                if pad_front == 1:
-                  word_idx = word_indexer.convert_sequence(pad_front(word, max_sent_l, word_indexer.PAD))
-                else:
-                  word_idx = word_indexer.convert_sequence(pad(word, max_sent_l, word_indexer.PAD))
+                word_idx = word_indexer.convert_sequence(pad(word, max_sent_l, word_indexer.PAD))
                 src_word.append(word_idx)
             src = [1 if x == src_indexer.PAD else 0 for x in src] # 1 if pad, 0 o.w.
             src = np.array(src, dtype=int) # not useful
@@ -292,10 +289,10 @@ def get_data(args):
 
     print("First pass through data to get vocab...")
     max_sent_l, num_docs_train = make_vocab(args.srcfile, args.targetfile,
-                                             args.seqlength, 0)
+                                             args.seqlength, 0, args.truncate)
     print("Number of docs in training: {}".format(num_docs_train))
     max_sent_l, num_docs_valid = make_vocab(args.srcvalfile, args.targetvalfile,
-                                             args.seqlength, max_sent_l)
+                                             args.seqlength, max_sent_l, args.truncate)
     print("Number of docs in valid: {}".format(num_docs_valid))    
     print("Max sentence length (before cutting): {}".format(max_sent_l))
     max_sent_l = min(max_sent_l, args.maxsentlength)
@@ -309,15 +306,15 @@ def get_data(args):
 
     if args.word2vec != '':
         print('Building embeddings from ' + args.word2vec)
-        build_embeds(args.word2vec, args.word2vec_out, word_indexer.d)
+        build_embeds(args.word2vec, args.outputfile + "-word2vec.hdf5", word_indexer.d)
 
     max_doc_l = 0
     max_doc_l = convert(args.srcvalfile, args.targetvalfile, args.batchsize, args.seqlength,
                          args.outputfile + "-val.hdf5", num_docs_valid,
-                         max_sent_l, max_doc_l, args.unkfilter, args.shuffle)
+                         max_sent_l, max_doc_l, args.unkfilter, args.shuffle, args.truncate)
     max_doc_l = convert(args.srcfile, args.targetfile, args.batchsize, args.seqlength,
                          args.outputfile + "-train.hdf5", num_docs_train, max_sent_l,
-                         max_doc_l, args.unkfilter, args.shuffle)
+                         max_doc_l, args.unkfilter, args.shuffle, args.truncate)
     
     print("Max doc length (before dropping): {}".format(max_doc_l))
     
@@ -350,7 +347,6 @@ def main(arguments):
                                            "(if longer than maxwordlength) or zero-padded "
                                             "(if shorter) to maxwordlength", type=int, default=30)
     parser.add_argument('--word2vec', help="Path to word2vec", type = str, default='')
-    parser.add_argument('--word2vec_out', help="output for word2vec embeds", type=str, default='')
     parser.add_argument('--unkfilter', help="Ignore sentences with too many UNK tokens. "
                                        "Can be an absolute count limit (if > 1) "
                                        "or a proportional limit (0 < unkfilter < 1).",
@@ -358,7 +354,7 @@ def main(arguments):
     parser.add_argument('--shuffle', help="If = 1, shuffle sentences before sorting (based on  "
                                            "source length).",
                                           type = int, default = 0)
-    parser.add_argument('--pad_front', help="If = 1, pad front of sentences instead of end.",
+    parser.add_argument('--truncate', help="If = 1, truncate docs instead of dropping.",
                                           type = int, default = 0)
 
     args = parser.parse_args(arguments)

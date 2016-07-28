@@ -17,13 +17,7 @@ function make_lstm(data, opt, model, use_chars)
    local dropout = opt.dropout or 0
    local n = opt.num_layers
    local rnn_size = opt.rnn_size
-   local input_size
-   if use_chars == 0 then
-      input_size = opt.word_vec_size
-   else
-      --input_size = opt.num_kernels
-      input_size = opt.word_vec_size
-   end   
+   local input_size = opt.word_vec_size
    local offset = 0
   -- there will be 2*n+3 inputs
    local inputs = {}
@@ -118,6 +112,78 @@ function make_lstm(data, opt, model, use_chars)
   return nn.gModule(inputs, outputs)
 end
 
+function make_lstm_bow(data, opt)
+   local dropout = opt.dropout or 0
+   local n = opt.num_layers
+   local rnn_size = opt.rnn_size
+   local input_size
+   if opt.no_bow == 1 then
+     input_size = opt.rnn_size
+   else
+     input_size = opt.word_vec_size
+   end
+   local offset = 0
+  -- there will be 2*n+3 inputs
+   local inputs = {}
+   table.insert(inputs, nn.Identity()()) -- x (batch_size x word_vec_size)
+   for L = 1,n do
+      table.insert(inputs, nn.Identity()()) -- prev_c[L]
+      table.insert(inputs, nn.Identity()()) -- prev_h[L]
+   end
+
+   local x, input_size_L
+   local outputs = {}
+  for L = 1,n do
+     -- c,h from previous timesteps
+    local prev_c = inputs[L*2+offset]    
+    local prev_h = inputs[L*2+1+offset]
+    -- the input to this layer
+    if L == 1 then
+       x = inputs[1] -- batch_size x word_vec_size
+       input_size_L = input_size
+    else
+       x = outputs[(L-1)*2]
+       if opt.res_net == 1 and L > 2 then
+	  x = nn.CAddTable()({x, outputs[(L-2)*2]})       
+       end       
+       input_size_L = rnn_size
+       --if opt.multi_attn == L and model == 'dec' then
+		--local multi_attn = make_decoder_attn(data, opt, 1)
+		--multi_attn.name = 'multi_attn' .. L
+		--x = multi_attn({x, inputs[2]})
+       --end
+       if dropout > 0 then
+	  x = nn.Dropout(dropout, nil, false)(x)
+       end       
+    end
+    -- evaluate the input sums at once for efficiency
+    local i2h = nn.Linear(input_size_L, 4 * rnn_size):reuseMem()(x)
+    local h2h = nn.LinearNoBias(rnn_size, 4 * rnn_size):reuseMem()(prev_h)
+    local all_input_sums = nn.CAddTable()({i2h, h2h})
+
+    local reshaped = nn.Reshape(4, rnn_size, true)(all_input_sums)
+    local n1, n2, n3, n4 = nn.SplitTable(2)(reshaped):split(4)
+    -- decode the gates
+    local in_gate = nn.Sigmoid():reuseMem()(n1)
+    local forget_gate = nn.Sigmoid():reuseMem()(n2)
+    local out_gate = nn.Sigmoid():reuseMem()(n3)
+    -- decode the write inputs
+    local in_transform = nn.Tanh():reuseMem()(n4)
+    -- perform the LSTM update
+    local next_c           = nn.CAddTable()({
+        nn.CMulTable()({forget_gate, prev_c}),
+        nn.CMulTable()({in_gate,     in_transform})
+      })
+    -- gated cells form the output
+    local next_h = nn.CMulTable()({out_gate, nn.Tanh():reuseMem()(next_c)})
+    
+    table.insert(outputs, next_c)
+    table.insert(outputs, next_h)
+  end
+  return nn.gModule(inputs, outputs)
+end
+
+
 function make_no_recur_encoder(data, opt)
    local rnn_size = opt.rnn_size
    local input_size = opt.word_vec_size
@@ -146,8 +212,20 @@ function make_bow_encoder(data, opt)
   function do_nothing() end
   no_grad_replicate.updateGradInput = do_nothing
   local output = nn.Sum(3)(nn.ViewAs()({embeds, no_grad_replicate(input)})) -- batch_l x source_l x word_vec_size
+  if opt.bow_encoder_lstm == 1 then
+    -- make output suitable for LSTM
+    output = nn.Transpose({1,2})(output) -- source_l x batch_l x word_vec_size
+  end
 
   return nn.gModule({input}, {output})
+end
+
+function make_last_state_selecter(opt, batch_l, source_l)
+  local selecter = nn.Sequential()
+  selecter:add(nn.MaskedSelect())
+  selecter:add(nn.Reshape(batch_l, source_l, opt.rnn_size, false))
+  selecter:add(nn.Transpose({1,2})) -- source_l x batch_l x rnn_size
+  return selecter:cuda()
 end
 
 function make_decoder_attn(data, opt, simple)
@@ -206,6 +284,7 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    -- 2D tensor target_t (batch_l x rnn_size)
    -- 4D tensor for context (batch_l x source_l x source_char_l x rnn_size)
    -- 3D tensor for BOW context (batch_l x source_l x word_vec_size)
+   --     or if using LSTM, (batch_l x source_l x rnn_size)
 
    local inputs = {}
    local outputs = {}
@@ -220,8 +299,14 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    -- get attention
 
    -- attention over sentences
+   local bow_size
+   if opt.bow_encoder_lstm == 1 then
+     bow_size = opt.rnn_size
+   else
+     bow_size = opt.word_vec_size
+   end
    local attn1 = nn.MM()({bow_context,
-        nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.word_vec_size)(target_t))}) -- batch_l x source_l x 1
+        nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, bow_size)(target_t))}) -- batch_l x source_l x 1
    attn1 = nn.Sum(3)(attn1)
    local mul_constant1 = nn.MulConstant(opt.temperature) -- multiply for temperature
    mul_constant1.name = 'mul_constant'
