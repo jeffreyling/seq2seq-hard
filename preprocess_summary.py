@@ -116,16 +116,20 @@ def get_data(args):
 
     def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0, truncate=0):
         num_docs = 0
-        for _, (src_orig, targ_orig) in \
+        for i, (src_orig, targ_orig) in \
                 enumerate(itertools.izip(open(srcfile,'r'), open(targetfile,'r'))):
             src_orig = src_indexer.clean(src_orig.strip())
             targ_orig = word_indexer.clean(targ_orig.strip())
 
             src = src_orig.strip().strip("</s>").split("</s>") # splits the doc into sentences
             targ = targ_orig.strip().split()
-            if truncate != 1:
-              if len(src) > seqlength or len(src) < 1 or len(targ) < 1:
-                  continue
+            if len(src) < 1 or len(targ) < 1 or len(src[0]) < 1:
+              continue
+            if len(src) > seqlength:
+              if truncate == 1:
+                src = src[:seqlength]
+              else:
+                continue
             num_docs += 1
             for word in targ:
                 word_indexer.vocab[word] += 1
@@ -138,6 +142,9 @@ def get_data(args):
                 max_sent_l = max(len(words)+2, max_sent_l)
                 for word in words:
                     word_indexer.vocab[word] += 1                                        
+
+            # print src, targ
+            # raw_input()
                 
         return max_sent_l, num_docs
                 
@@ -161,14 +168,15 @@ def get_data(args):
             src = [src_indexer.BOS] + src_orig.strip().strip("</s>").split("</s>") + [src_indexer.EOS]
             targ = [word_indexer.BOS] + targ_orig.strip().split() + [word_indexer.EOS]
             max_doc_l = max(len(src), max_doc_l)
-            if truncate == 1:
-              if len(src) > newseqlength:
+            if len(src) < 3 or len(targ) < 3 or len(src[1]) < 3:
+              dropped += 1
+              continue                   
+            if len(src) > newseqlength:
+              if truncate == 1:
                 src = src[:newseqlength]
-            else:
-              # if len(src) > newseqlength or len(src) < 3:
-              if len(src) > newseqlength:
-                  dropped += 1
-                  continue                   
+              else:
+                dropped += 1
+                continue                   
 
             targ = pad(targ, newseqlength+1, word_indexer.PAD)
             for word in targ:

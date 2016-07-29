@@ -91,12 +91,20 @@ def format(path, outfile, dataset, max_num_sent=-1):
             # lowercase and replace numbers
             parts = ' '.join(tokens).lower()
             parts = re.sub(r"\d", "#", parts)
-            parts = parts.split(' @ highlight </s> ')
+            parts = parts.split('@ highlight </s>')
             src = parts[0].strip()
             if max_num_sent != -1:
-              src = src.strip(' </s>').split('</s>')[:max_num_sent]
-              src = '</s>'.join(src) + ' </s>'
+              src = src.strip('</s>').strip().split('</s>')
+              src = [sent.strip() for sent in src]
+              src = src[:max_num_sent]
+              src = ' </s> '.join(src) + ' </s>'
             targ = parts[1].replace('</s>', '').strip()  # TODO: consider making all highlights relevant
+            # if src == '':
+              # print src
+              # print targ
+              # print text
+              # print url_hash
+              # raw_input()
 
             # if counter == 1128:
               # print parts
