@@ -67,7 +67,7 @@ local ViewAs = torch.class('nn.ViewAs', 'nn.Module')
 function ViewAs:__init(ndim)
   nn.Module.__init(self)
   self.ndim = ndim
-  self.gradInput = {torch.Tensor()}
+  self.gradInput = {torch.Tensor(), torch.Tensor()}
 end
 
 function ViewAs:updateOutput(input)
@@ -88,6 +88,8 @@ function ViewAs:updateOutput(input)
 end
 
 function ViewAs:updateGradInput(input, gradOutput)
+  self.gradInput[2]:resizeAs(input[2]):zero() -- unused
+
   self.gradInput[1] = self.gradInput[1] or gradOutput.new()
   self.gradInput[1]:view(gradOutput, input[1]:size())
   return self.gradInput
@@ -103,7 +105,7 @@ function ReplicateAs:__init(in_dim, template_dim)
   nn.Module.__init(self)
   self.in_dim = in_dim
   self.template_dim = template_dim
-  self.gradInput = {torch.Tensor()}
+  self.gradInput = {torch.Tensor(), torch.Tensor()}
 end
 
 function ReplicateAs:updateOutput(input)
@@ -130,6 +132,8 @@ function ReplicateAs:updateOutput(input)
 end
 
 function ReplicateAs:updateGradInput(input, gradOutput)
+  self.gradInput[2]:resizeAs(input[2]):zero() -- unused
+
   input = input[1]
   self.gradInput[1]:resizeAs(input):zero()
   local rdim = self.in_dim
@@ -142,5 +146,6 @@ function ReplicateAs:updateGradInput(input, gradOutput)
   end
   local gradInput = self.gradInput[1]:view(sz)
   gradInput:sum(gradOutput, rdim)
+
   return self.gradInput
 end
