@@ -641,6 +641,7 @@ function train(train_data, valid_data)
         local source_char_l = d[9]
         local pad_mask = source:eq(1) -- padding
         local source_sent_l = source:ne(1):sum(1):squeeze(1) -- batch_l x source_l
+        --source_sent_l[source_sent_l:eq(0)]:fill(1)
 
         local loss = 0 -- added by Jeffrey
         for sample_i = 1, num_samples do

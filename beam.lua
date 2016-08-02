@@ -16,6 +16,10 @@ cmd = torch.CmdLine()
 cmd:option('-view_attn', 0, [[View attention weights at each time step]])
 cmd:option('-print_attn', 0, [[Print attention weights]])
 
+cmd:option('-no_pad', 0, [[No pad format for data]])
+cmd:option('-no_pad_sent_l', 5, [[Number of `sentences` we have for a doc]])
+cmd:option('-repeat_words', 0, [[Repeat words format for data]])
+
 -- file location
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])
 cmd:option('-src_file', '',[[Source sequence to decode (one line per sequence)]])
@@ -190,10 +194,14 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    end
    local pad_mask = source_input:eq(1)
    local source_lens = source_input:ne(1):sum(1):squeeze(1)
-   local rnn_state_mask = torch.zeros(1, source_sent_l, source_char_l, model_opt.rnn_size):byte():cuda()
-   for t = 1, source_sent_l do
-     local idx = source_lens[1][t]
-     rnn_state_mask[1][t][idx]:fill(1)
+   --source_lens[source_lens:eq(0)]:fill(1) -- prevent indexing 0
+   local rnn_state_mask
+   if model_opt.no_bow == 1 then
+     rnn_state_mask = torch.zeros(1, source_sent_l, source_char_l, model_opt.rnn_size):byte():cuda()
+     for t = 1, source_sent_l do
+       local idx = source_lens[1][t]
+       rnn_state_mask[1][t][idx]:fill(1)
+     end
    end
 
    --local rnn_state_enc = {}
@@ -400,11 +408,14 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                     local pre_attn = decoder_softmax.output:reshape(K, source_sent_l, source_char_l)[prev_k]:clone()
                     local result
                     for r = 1, source_sent_l do
-                      local cur = pre_attn[r][{{1, nonzeros[r]}}]
-                      if result == nil then
-                        result = cur
-                      else
-                        result = torch.cat(result, cur, 1)
+                      local cur
+                      if nonzeros[r] > 0 then -- ignore blank sentences
+                        cur = pre_attn[r][{{1, nonzeros[r]}}]
+                        if result == nil then
+                          result = cur
+                        else
+                          result = torch.cat(result, cur, 1)
+                        end
                       end
                     end
                     attn_list[i][k] = State.advance(attn_list[i-1][prev_k], result)
@@ -577,15 +588,50 @@ function doc2charidx(doc, char2idx, max_word_l, start_symbol)
      end
      if start_symbol == 1 then
         table.insert(words[#words], END_WORD)
+     elseif opt.no_pad == 1 then
+        table.insert(words[#words], "</s>")
      end   
    end
    --local chars = torch.ones(#words, max_word_l)
    --for i = 1, #words do
       --chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i])
    --end
-   local chars = torch.ones(#words, max_word_l)
-   for i = 1, #words do
-      chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i], start_symbol)
+   local chars
+   if opt.no_pad == 1 then
+     local rep_words = opt.repeat_words
+     chars = torch.ones(opt.no_pad_sent_l, max_word_l)
+     local i = 1
+     local j = 1
+     local done = false
+     for _,word in ipairs(words) do
+       for _, char in ipairs(word) do
+         local char_idx = char2idx[char] or UNK
+         chars[i][j] = char_idx
+         j = j+1
+         if j == max_word_l + 1 then
+           i = i+1
+           if i == opt.no_pad_sent_l + 1 then
+             done = true
+             break
+           end
+
+           if rep_words > 0 then
+             -- copy last row over
+             local tail = chars[{{i-1}, {max_word_l-rep_words+1, max_word_l}}]
+             chars[{{i},{1,rep_words}}]:copy(tail)
+             j = rep_words + 1
+           else
+             j = 1
+           end
+         end
+       end
+       if done then break end
+     end
+   else
+     chars = torch.ones(#words, max_word_l)
+     for i = 1, #words do
+        chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i], start_symbol)
+     end
    end
    return chars, words
 end
