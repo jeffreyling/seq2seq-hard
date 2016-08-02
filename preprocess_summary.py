@@ -99,9 +99,12 @@ class Indexer:
             v, k = line.strip().split()
             self.d[v] = int(k)
 
-def pad(ls, length, symbol):
+def pad(ls, length, symbol, no_cut=False):
     if len(ls) >= length:
-        return ls[:length]
+        if no_cut:
+          return ls
+        else:
+          return ls[:length]
     return ls + [symbol] * (length -len(ls))
 
 def pad_front(ls, length, symbol):
@@ -114,7 +117,7 @@ def get_data(args):
     word_indexer = Indexer(["<blank>","<unk>","<s>", "</s>"]) # for both source and target
     word_indexer.add_w([src_indexer.BOS, src_indexer.EOS])
 
-    def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0, truncate=0):
+    def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0, truncate=0, no_pad=0):
         num_docs = 0
         for i, (src_orig, targ_orig) in \
                 enumerate(itertools.izip(open(srcfile,'r'), open(targetfile,'r'))):
@@ -125,7 +128,7 @@ def get_data(args):
             targ = targ_orig.strip().split()
             if len(src) < 1 or len(targ) < 1 or len(src[0]) < 1:
               continue
-            if len(src) > seqlength:
+            if len(src) > seqlength and no_pad == 0:
               if truncate == 1:
                 src = src[:seqlength]
               else:
@@ -149,11 +152,15 @@ def get_data(args):
         return max_sent_l, num_docs
                 
     def convert(srcfile, targetfile, batchsize, seqlength, outfile, num_docs,
-                max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0, truncate=0):
+                max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0, truncate=0, no_pad=0, repeat_words=0,targetseqlength=100):
         
-        newseqlength = seqlength + 2 #add 2 for EOS and BOS; length in sents of the longest document
-        targets = np.zeros((num_docs, newseqlength), dtype=int) # the target sequence
-        target_output = np.zeros((num_docs, newseqlength), dtype=int) # next word to predict
+        if no_pad == 1:
+            newseqlength = seqlength
+        else:
+            newseqlength = seqlength + 2 #add 2 for EOS and BOS; length in sents of the longest document
+        newtargetseqlength = targetseqlength + 2 #add 2 for EOS and BOS; length in sents of the longest document
+        targets = np.zeros((num_docs, newtargetseqlength), dtype=int) # the target sequence
+        target_output = np.zeros((num_docs, newtargetseqlength), dtype=int) # next word to predict
         sources = np.zeros((num_docs, newseqlength), dtype=int) # input split into sentences
         source_lengths = np.zeros((num_docs,), dtype=int) # lengths of each document
         target_lengths = np.zeros((num_docs,), dtype=int) # lengths of each target sequence
@@ -165,36 +172,54 @@ def get_data(args):
                 enumerate(itertools.izip(open(srcfile,'r'), open(targetfile,'r'))):
             src_orig = src_indexer.clean(src_orig.strip())
             targ_orig = word_indexer.clean(targ_orig.strip())
-            src = [src_indexer.BOS] + src_orig.strip().strip("</s>").split("</s>") + [src_indexer.EOS]
+            if no_pad == 1:
+                src = src_orig.strip().strip("</s>").split("</s>")
+            else:
+                src = [src_indexer.BOS] + src_orig.strip().strip("</s>").split("</s>") + [src_indexer.EOS]
             targ = [word_indexer.BOS] + targ_orig.strip().split() + [word_indexer.EOS]
             max_doc_l = max(len(src), max_doc_l)
-            if len(src) < 3 or len(targ) < 3 or len(src[1]) < 3:
-              dropped += 1
-              continue                   
-            if len(src) > newseqlength:
+
+            if no_pad == 1:
+              if len(src) < 1 or len(targ) < 3 or len(src[0]) < 1:
+                dropped += 1
+                continue                   
+            else:
+              if len(src) < 3 or len(targ) < 3 or len(src[1]) < 3:
+                dropped += 1
+                continue                   
+            if len(src) > newseqlength and no_pad == 0:
               if truncate == 1:
                 src = src[:newseqlength]
               else:
                 dropped += 1
                 continue                   
 
-            targ = pad(targ, newseqlength+1, word_indexer.PAD)
+            targ = pad(targ, newtargetseqlength+1, word_indexer.PAD)
             for word in targ:
                 #use UNK for target, but not for source
                 word = word if word in word_indexer.d else word_indexer.UNK
             targ = word_indexer.convert_sequence(targ)
             targ = np.array(targ, dtype=int)
 
-            src = pad(src, newseqlength, src_indexer.PAD)
+            if no_pad == 1:
+              src = pad(src, newseqlength, src_indexer.PAD, no_cut=True)
+            else:
+              src = pad(src, newseqlength, src_indexer.PAD)
             src_word = []
             for sent in src:
                 sent = word_indexer.clean(sent)
-                word = [word_indexer.BOS] + sent.split() + [word_indexer.EOS]
-                if len(word) > max_sent_l:
-                    word = word[:max_sent_l]
-                    word[-1] = word_indexer.EOS
-                word_idx = word_indexer.convert_sequence(pad(word, max_sent_l, word_indexer.PAD))
-                src_word.append(word_idx)
+                if no_pad == 1:
+                  word = sent.split() + [word_indexer.EOS]
+                  src_word = src_word + word
+                else:
+                  word = [word_indexer.BOS] + sent.split() + [word_indexer.EOS]
+                  if len(word) > max_sent_l:
+                      word = word[:max_sent_l]
+                      word[-1] = word_indexer.EOS
+                  word_idx = word_indexer.convert_sequence(pad(word, max_sent_l, word_indexer.PAD))
+                  src_word.append(word_idx)
+            if no_pad == 1:
+                src = src[:newseqlength]
             src = [1 if x == src_indexer.PAD else 0 for x in src] # 1 if pad, 0 o.w.
             src = np.array(src, dtype=int) # not useful
             
@@ -213,7 +238,17 @@ def get_data(args):
             target_output[doc_id] = np.array(targ[1:],dtype=int)                    
             sources[doc_id] = np.array(src, dtype=int)
             source_lengths[doc_id] = (sources[doc_id] != 1).sum()            
-            sources_word[doc_id] = np.array(src_word, dtype=int)
+            if no_pad == 1:
+              src_word = word_indexer.convert_sequence(pad(src_word, newseqlength*max_sent_l, word_indexer.PAD))
+              result = np.array(src_word, dtype=int).reshape((newseqlength, max_sent_l))
+              if repeat_words > 0:
+                idx = 0
+                for j in xrange(newseqlength):
+                  result[j] = src_word[idx:idx+max_sent_l]
+                  idx = idx + max_sent_l - repeat_words # subtract deficit
+              sources_word[doc_id] = result
+            else:
+              sources_word[doc_id] = np.array(src_word, dtype=int)
             source_word_l[doc_id] = (sources_word[doc_id] != 1).sum(1).max() # get max sent len for doc
 
             doc_id += 1
@@ -297,10 +332,10 @@ def get_data(args):
 
     print("First pass through data to get vocab...")
     max_sent_l, num_docs_train = make_vocab(args.srcfile, args.targetfile,
-                                             args.seqlength, 0, args.truncate)
+                                             args.seqlength, 0, args.truncate, args.no_pad)
     print("Number of docs in training: {}".format(num_docs_train))
     max_sent_l, num_docs_valid = make_vocab(args.srcvalfile, args.targetvalfile,
-                                             args.seqlength, max_sent_l, args.truncate)
+                                             args.seqlength, max_sent_l, args.truncate, args.no_pad)
     print("Number of docs in valid: {}".format(num_docs_valid))    
     print("Max sentence length (before cutting): {}".format(max_sent_l))
     max_sent_l = min(max_sent_l, args.maxsentlength)
@@ -319,10 +354,10 @@ def get_data(args):
     max_doc_l = 0
     max_doc_l = convert(args.srcvalfile, args.targetvalfile, args.batchsize, args.seqlength,
                          args.outputfile + "-val.hdf5", num_docs_valid,
-                         max_sent_l, max_doc_l, args.unkfilter, args.shuffle, args.truncate)
+                         max_sent_l, max_doc_l, args.unkfilter, args.shuffle, args.truncate, args.no_pad, args.repeat_words, args.targetseqlength)
     max_doc_l = convert(args.srcfile, args.targetfile, args.batchsize, args.seqlength,
                          args.outputfile + "-train.hdf5", num_docs_train, max_sent_l,
-                         max_doc_l, args.unkfilter, args.shuffle, args.truncate)
+                         max_doc_l, args.unkfilter, args.shuffle, args.truncate, args.no_pad, args.repeat_words, args.targetseqlength)
     
     print("Max doc length (before dropping): {}".format(max_doc_l))
     
@@ -347,8 +382,9 @@ def main(arguments):
     parser.add_argument('--srcvalfile', help="Path to source validation data.", required=True)
     parser.add_argument('--targetvalfile', help="Path to target txt validation data.", required=True)
     parser.add_argument('--batchsize', help="Size of each minibatch.", type=int, default=64)
-    # NOTE: seqlength and maxsentlength is very long right now, be careful!
     parser.add_argument('--seqlength', help="Maximum sequence (document) length. Sequences longer "
+                                               "than this are dropped.", type=int, default=10)
+    parser.add_argument('--targetseqlength', help="Maximum sequence (document) length. Sequences longer "
                                                "than this are dropped.", type=int, default=100)
     parser.add_argument('--outputfile', help="Prefix of the output file names. ", type=str, required=True)
     parser.add_argument('--maxsentlength', help="For the character models, words are "
@@ -363,6 +399,10 @@ def main(arguments):
                                            "source length).",
                                           type = int, default = 0)
     parser.add_argument('--truncate', help="If = 1, truncate docs instead of dropping.",
+                                          type = int, default = 0)
+    parser.add_argument('--no_pad', help="If = 1, truncate image instead of padding sentences",
+                                          type = int, default = 0)
+    parser.add_argument('--repeat_words', help="If > 1, repeat words at end of each row to next row",
                                           type = int, default = 0)
 
     args = parser.parse_args(arguments)
