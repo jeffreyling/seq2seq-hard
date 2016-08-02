@@ -183,23 +183,6 @@ function make_lstm_bow(data, opt)
   return nn.gModule(inputs, outputs)
 end
 
-
-function make_no_recur_encoder(data, opt)
-   local rnn_size = opt.rnn_size
-   local input_size = opt.word_vec_size
-    assert(rnn_size == input_size, 'size mismatch')
-
-   local inputs = {}
-   table.insert(inputs, nn.Identity()()) -- x (batch_size x max_word_l)
-
-   local x
-	  local word_vecs = nn.LookupTable(data.source_size, input_size)
-	  word_vecs.name = 'word_vecs_enc'
-	  x = word_vecs(inputs[1]) -- batch_size x word_vec_size
-    --local out = nn.Linear(input_size, rnn_size)(x)
-  return nn.gModule(inputs, {x})
-end
-
 function make_bow_encoder(data, opt)
   -- takes 3D tensor input: batch_l x source_l x source_char_l
   
@@ -207,14 +190,30 @@ function make_bow_encoder(data, opt)
   local word_vecs = nn.LookupTable(data.char_size, opt.word_vec_size)
   word_vecs.name = 'word_vecs_bow'
   local embeds = word_vecs(nn.Reshape(-1, true)(input)) -- batch_l x (source_l*source_char_l) x word_vec_size
+  embeds = nn.ViewAs()({embeds, nn.Replicate(opt.word_vec_size, 4)(input)}) -- batch_l x source_l x source_char_l x word_vec_size
 
-  local no_grad_replicate = nn.Replicate(opt.word_vec_size, 4)
-  function do_nothing() end
-  no_grad_replicate.updateGradInput = do_nothing
-  local output = nn.Sum(3)(nn.ViewAs()({embeds, no_grad_replicate(input)})) -- batch_l x source_l x word_vec_size
+  local output
+  if opt.conv_bow == 1 then
+    local template = nn.View(-1):setNumInputDims(1)(input) -- (batch_l*source_l) x source_char_l
+    template = nn.Replicate(opt.word_vec_size, 3)(template) -- (batch_l*source_l) x source_char_l x word_vec_size
+    local reshaped_embeds = nn.ViewAs()({embeds, template})
+    local conv = make_cnn(opt.word_vec_size, opt.kernel_width, opt.num_kernels)
+
+    local template2 = nn.Sum(3)(input) -- batch_l x source_l
+    template2 = nn.Replicate(opt.num_kernels, 3)(template2) -- batch_l x source_l x num_kernels
+    output = nn.ViewAs()({conv(reshaped_embeds), template2})
+  else
+    -- bag of words
+    output = nn.Sum(3)(embeds) -- batch_l x source_l x word_vec_size
+  end
+  if opt.concat_doc_bow == 1 then
+    local doc_bow = nn.Sum(2)(nn.Sum(2)(embeds)) -- batch_l x word_vec_size
+    doc_bow = nn.ReplicateAs(2,2)({doc_bow, input}) -- batch_l x source_l x word_vec_size
+    output = nn.JoinTable(3)({output, doc_bow}) -- batch_l x source_l x {word_vec_size,num_kernels}+word_vec_size
+  end
   if opt.bow_encoder_lstm == 1 then
     -- make output suitable for LSTM
-    output = nn.Transpose({1,2})(output) -- source_l x batch_l x word_vec_size
+    output = nn.Transpose({1,2})(output) -- source_l x batch_l x {word_vec_size,num_kernels}
   end
 
   return nn.gModule({input}, {output})
@@ -244,9 +243,11 @@ function make_decoder_attn(data, opt, simple)
 
    local attn = nn.MM()({context, nn.Replicate(1,3)(target_t)}) -- batch_l x (source_l*source_char_l) x 1
    attn = nn.Sum(3)(attn)
-   local mul_constant = nn.MulConstant(opt.temperature) -- multiply for temperature
-   mul_constant.name = 'mul_constant'
-   attn = mul_constant(attn)
+   if opt.attn_type == 'hard' then
+     local mul_constant = nn.MulConstant(opt.temperature) -- multiply for temperature
+     mul_constant.name = 'mul_constant'
+     attn = mul_constant(attn)
+   end
    local softmax_attn = nn.SoftMax()
    softmax_attn.name = 'softmax_attn'
    attn = softmax_attn(attn)
@@ -303,7 +304,14 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    if opt.bow_encoder_lstm == 1 then
      bow_size = opt.rnn_size
    else
-     bow_size = opt.word_vec_size
+     if opt.conv_bow == 1 then
+       bow_size = opt.num_kernels
+     else
+       bow_size = opt.word_vec_size
+     end
+   end
+   if opt.concat_doc_bow == 1 then
+     bow_size = bow_size + opt.word_vec_size
    end
    local attn1 = nn.MM()({bow_context,
         nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, bow_size)(target_t))}) -- batch_l x source_l x 1

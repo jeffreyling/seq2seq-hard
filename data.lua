@@ -16,8 +16,10 @@ function data:__init(opt, data_file)
    self.batch_l = f:read('batch_l'):all()
    self.source_l = f:read('batch_w'):all() --max source length each batch
    if opt.start_symbol == 0 then
-      self.source_l:add(-2)
-      self.source = self.source[{{},{2, self.source:size(2)-1}}]
+     if opt.no_pad == 0 then
+        self.source_l:add(-2)
+        self.source = self.source[{{},{2, self.source:size(2)-1}}]
+     end
    end   
    self.batch_idx = f:read('batch_idx'):all()
    
@@ -32,12 +34,16 @@ function data:__init(opt, data_file)
       self.char_size = f:read('char_size'):all()[1]
       --self.char_length = self.source_char:size(3)
       if opt.start_symbol == 0 then
-	 self.source_char = self.source_char[{{}, {2, self.source_char:size(2)-1}}] -- doc
+         if opt.no_pad == 0 then
+           self.source_char = self.source_char[{{}, {2, self.source_char:size(2)-1}}] -- doc
 
-         -- assumes end padding
-         self.source_char_l:add(-2)
-         self.source_char = self.source_char[{{},{},{2, self.source_char:size(3)-1}}] -- get rid of start,end token
-         self.source_char[self.source_char:eq(4)] = 1 -- replace EOS with pad
+           -- assumes end padding
+           self.source_char_l:add(-2)
+           self.source_char = self.source_char[{{},{},{2, self.source_char:size(3)-1}}] -- get rid of start,end token
+           self.source_char[self.source_char:eq(4)] = 1 -- replace EOS with pad
+         else
+           print('using no_pad = 1')
+         end
       end      
    end
    
@@ -116,9 +122,6 @@ function data.__index(self, idx)
       if opt.gpuid >= 0 then --if multi-gpu, source lives in gpuid1, rest on gpuid2
 	 cutorch.setDevice(opt.gpuid)
 	 source_input = source_input:cuda()
-	 if opt.gpuid2 >= 0 then
-	    cutorch.setDevice(opt.gpuid2)
-	 end	 
 	 target_input = target_input:cuda()
 	 target_output = target_output:cuda()
 	 target_l_all = target_l_all:cuda()

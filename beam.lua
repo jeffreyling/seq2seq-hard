@@ -45,27 +45,18 @@ cmd:option('-srctarg_dict', 'data/en-de.dict', [[Path to source-target dictionar
 cmd:option('-score_gold', 1, [[If = 1, score the log likelihood of the gold as well]])
 cmd:option('-n_best', 1, [[If > 1, it will also output an n_best list of decoded sentences]])
 cmd:option('-gpuid',  -1, [[ID of the GPU to use (-1 = use CPU)]])
-cmd:option('-gpuid2', -1, [[Second GPU ID]])
+--cmd:option('-gpuid2', -1, [[Second GPU ID]])
 cmd:option('-cudnn', 0, [[If using character model, this should be = 1 if the character model
                           was trained using cudnn]])
 opt = cmd:parse(arg)
 
-function reset_state(state, batch_l, t)
-  if t == nil then
-     local u = {}
-     for i = 1, #state do
-        state[i]:zero()
-        table.insert(u, state[i][{{1, batch_l}}])
-     end
-     return u
-  else
-     local u = {[t] = {}}
-     for i = 1, #state do
-        state[i]:zero()
-        table.insert(u[t], state[i][{{1, batch_l}}])
-     end
-     return u
-  end      
+function reset_state(state, batch_l)
+   local u = {}
+   for i = 1, #state do
+      state[i]:zero()
+      table.insert(u, state[i][{{1, batch_l}}])
+   end
+   return u
 end
 
 
@@ -153,9 +144,6 @@ end
 
 function generate_beam(model, initial, K, max_sent_l, source, gold)
    --reset decoder initial states
-   if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
-      cutorch.setDevice(opt.gpuid)
-   end
    local n = max_sent_l
   -- Backpointer table.
    local prev_ks = torch.LongTensor(n, K):fill(1)
@@ -201,13 +189,11 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       source_input = source:view(source_char_l, 1)
    end
    local pad_mask = source_input:eq(1)
-   local source_lens = source:ne(1):sum(1):squeeze(1)
-   local rnn_state_mask = torch.zeros(batch_l, source_sent_l, source_char_l, opt.rnn_size):byte():cuda()
-   for j = 1, batch_l do
-     for t = 1, source_l do
-       local idx = source_lens[j][t]
-       rnn_state_mask[j][t][idx]:fill(1)
-     end
+   local source_lens = source_input:ne(1):sum(1):squeeze(1)
+   local rnn_state_mask = torch.zeros(1, source_sent_l, source_char_l, model_opt.rnn_size):byte():cuda()
+   for t = 1, source_sent_l do
+     local idx = source_lens[1][t]
+     rnn_state_mask[1][t][idx]:fill(1)
    end
 
    --local rnn_state_enc = {}
@@ -243,7 +229,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
      rnn_states = masked_selecter:forward({context, rnn_state_mask})
    end
    if model_opt.hierarchical == 1 then
-     local bow_out = model[layers_idx['bow_encoder']]:forward(source_input:permute(2,3,1))
+     local bow_out = model[layers_idx['bow_encoder']]:forward(source_input:permute(2,3,1):contiguous())
 
      if model_opt.bow_encoder_lstm == 1 then
        -- pass bag of words through LSTM over sentences for context
@@ -302,17 +288,14 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
      if model_opt.bow_encoder_lstm == 1 then
        context_bow = context_bow:expand(K, source_sent_l, model_opt.rnn_size)
      else
-       context_bow = context_bow:expand(K, source_sent_l, model_opt.word_vec_size)
+       if model_opt.conv_bow == 1 then
+         context_bow = context_bow:expand(K, source_sent_l, model_opt.num_kernels)
+       else
+         context_bow = context_bow:expand(K, source_sent_l, model_opt.word_vec_size)
+       end
      end
    end
    
-   if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
-      cutorch.setDevice(opt.gpuid2)
-      local context2 = context_proto2[{{1, K}, {1, source_l}}]
-      context2:copy(context)
-      context = context2
-   end
-
    out_float = torch.FloatTensor()
    
    local i = 1
@@ -414,13 +397,21 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                     max_attn, max_index = result:max(1)
                     attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
                  else
-                    assert(false, 'TODO error')
-                    attn_list[i][k] = State.advance(attn_list[i-1][prev_k], decoder_softmax.output[prev_k]:clone())
-                    max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
+                    local pre_attn = decoder_softmax.output:reshape(K, source_sent_l, source_char_l)[prev_k]:clone()
+                    local result
+                    for r = 1, source_sent_l do
+                      local cur = pre_attn[r][{{1, nonzeros[r]}}]
+                      if result == nil then
+                        result = cur
+                      else
+                        result = torch.cat(result, cur, 1)
+                      end
+                    end
+                    attn_list[i][k] = State.advance(attn_list[i-1][prev_k], result)
+                    deficit_list[i][k] = State.advance(deficit_list[i-1][prev_k], 1-result:sum())
+                    max_attn, max_index = result:max(1)
                     attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
                  end
-                 --if model_opt.hierarchical == 1 then
-                   --attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k], m
 
                 prev_ks[i][k] = prev_k
                 next_ys[i][k] = y_i
@@ -671,6 +662,7 @@ function main()
    PAD_WORD = '<blank>'; UNK_WORD = '<unk>'; START_WORD = '<d>'; END_WORD = '</d>'
    START_CHAR = '{'; END_CHAR = '}'
    MAX_SENT_L = opt.max_sent_l
+   print('max_sent_l:', MAX_SENT_L)
    assert(path.exists(opt.src_file), 'src_file does not exist')
    assert(path.exists(opt.model), 'model does not exist')
    
@@ -740,13 +732,6 @@ function main()
    if opt.gpuid >= 0 then
       cutorch.setDevice(opt.gpuid)
       for i = 1, #model do
-         if opt.gpuid2 >= 0 then
-            if i == 1 or i == 4 then
-               cutorch.setDevice(opt.gpuid)
-            else
-               cutorch.setDevice(opt.gpuid2)
-            end
-         end                        
          model[i]:double():cuda()
          model[i]:evaluate()
       end
@@ -758,6 +743,9 @@ function main()
     decoder_attn:apply(get_layer)
     decoder_softmax = softmax_layers[1]
     decoder_softmax_words = softmax_layers[2]
+    if model_opt.hierarchical == 0 then
+      assert(decoder_softmax_words == nil)
+    end
     attn_layer = torch.zeros(opt.beam, MAX_SENT_L)      
    
    
@@ -767,7 +755,11 @@ function main()
    if model_opt.bow_encoder_lstm == 1 then
      bow_size = model_opt.rnn_size
    else
-     bow_size = model_opt.word_vec_size
+     if model_opt.conv_bow == 1 then
+       bow_size = model_opt.num_kernels
+     else
+       bow_size = model_opt.word_vec_size
+     end
    end
    context_bow_proto = torch.zeros(1, MAX_SENT_L, bow_size)
 
@@ -778,15 +770,8 @@ function main()
       h_init_enc = h_init_enc:cuda()      
       h_init_dec = h_init_dec:cuda()
       cutorch.setDevice(opt.gpuid)
-      if opt.gpuid2 >= 0 then
-         cutorch.setDevice(opt.gpuid)
-         context_proto = context_proto:cuda()         
-         cutorch.setDevice(opt.gpuid2)
-         context_proto2 = torch.zeros(opt.beam, MAX_SENT_L, model_opt.rnn_size):cuda()
-      else
-         context_proto = context_proto:cuda()
-         context_bow_proto = context_bow_proto:cuda()
-      end
+      context_proto = context_proto:cuda()
+      context_bow_proto = context_bow_proto:cuda()
        attn_layer = attn_layer:cuda()
    end
    init_fwd_enc = {}
