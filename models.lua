@@ -21,7 +21,7 @@ function make_lstm(data, opt, model, use_chars)
    local offset = 0
   -- there will be 2*n+3 inputs
    local inputs = {}
-   table.insert(inputs, nn.Identity()()) -- x (batch_size x source_char_l)
+   table.insert(inputs, nn.Identity()()) -- x (batch_size x source_l)
    if model == 'dec' then
       if opt.input_feed == 1 then
         table.insert(inputs, nn.Identity()()) -- prev context_attn (batch_size x rnn_size)
@@ -201,7 +201,12 @@ function make_bow_encoder(data, opt)
 
     local template2 = nn.Sum(3)(input) -- batch_l x source_l
     template2 = nn.Replicate(opt.num_kernels, 3)(template2) -- batch_l x source_l x num_kernels
-    output = nn.ViewAs()({conv(reshaped_embeds), template2})
+    local conv_output = conv(reshaped_embeds)
+    if opt.num_highway_layers > 0 then
+      local mlp = make_highway(opt.num_kernels, opt.num_highway_layers)
+      conv_output = mlp(conv_output)
+    end	  
+    output = nn.ViewAs()({conv_output, template2})
   else
     -- bag of words
     output = nn.Sum(3)(embeds) -- batch_l x source_l x word_vec_size

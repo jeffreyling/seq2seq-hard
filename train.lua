@@ -9,6 +9,7 @@ require 'model_utils.lua'
 
 cmd = torch.CmdLine()
 
+cmd:option('-denoise', 0, [[Denoising autoencoder p]])
 cmd:option('-no_pad', 0, [[Single block of document as image]])
 cmd:option('-concat_doc_bow', 0, [[Concat document BOW to each word representation]])
 cmd:option('-conv_bow', 0, [[Use convolution instead of summing bag of words]])
@@ -16,7 +17,7 @@ cmd:option('-no_bow', 0, [[Use LSTM instead of BOW encoder]])
 cmd:option('-bow_encoder_lstm', 0, [[LSTM over sentence BOW]])
 cmd:option('-mask_padding', 1, [[Mask LSTM states for padding words]])
 cmd:option('-debug', 0, [[Debug]])
-cmd:option('-hierarchical', 0, [[Do hierarchical attention]])
+cmd:option('-hierarchical', 1, [[Do hierarchical attention]])
 cmd:option('-attn_type', 'soft', [[`soft`, `hard` for first attention on decoder side]])
 cmd:option('-attn_word_type', 'soft', [[`soft`, `hard` for hierarchical second attention]])
 cmd:option('-num_layers', 2, [[Number of layers in the LSTM encoder/decoder]])
@@ -115,9 +116,9 @@ cmd:text("")
 -- char-cnn model specs (if use_chars == 1)
 --cmd:option('-char_vec_size', 300, [[Size of the character embeddings]])
 cmd:option('-kernel_width', 6, [[Size (i.e. width) of the convolutional filter]])
-cmd:option('-num_kernels', 1000, [[Number of convolutional filters (feature maps). So the
+cmd:option('-num_kernels', 600, [[Number of convolutional filters (feature maps). So the
                                  representation from characters will have this many dimensions]])
---cmd:option('-num_highway_layers', 2, [[Number of highway layers in the character model]])
+cmd:option('-num_highway_layers', 0, [[Number of highway layers in the character model]])
 
 cmd:text("")
 cmd:text("**Optimization options**")
@@ -283,9 +284,13 @@ function train(train_data, valid_data)
    end
    
    -- prototypes for gradients so there is no need to clone
-   local encoder_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.max_word_l, opt.rnn_size)
-   local encoder_bwd_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.max_word_l, opt.rnn_size)
-   context_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.max_word_l, opt.rnn_size)
+   local max_word_l_sz = opt.max_word_l
+   if opt.denoise > 0 then
+     max_word_l_sz = max_word_l_sz + 5
+   end
+   local encoder_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, max_word_l_sz, opt.rnn_size)
+   local encoder_bwd_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, max_word_l_sz, opt.rnn_size)
+   context_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, max_word_l_sz, opt.rnn_size)
    local bow_size -- output size of bow encoder
    local encoder_bow_lstm_grad_proto
    if opt.bow_encoder_lstm == 1 then
@@ -311,14 +316,14 @@ function train(train_data, valid_data)
    -- clone encoder/decoder up to max source/target length   
    decoder_clones = clone_many_times(decoder, opt.max_sent_l_targ)
    decoder_attn_clones = clone_many_times(decoder_attn, opt.max_sent_l_targ)
-   encoder_clones = clone_many_times(encoder, opt.max_word_l)
+   encoder_clones = clone_many_times(encoder, max_word_l_sz)
    if (opt.hierarchical == 1) and (opt.bow_encoder_lstm == 1) then
      bow_encoder_lstm_clones = clone_many_times(bow_encoder_lstm, opt.max_sent_l_src)
    end
    if opt.brnn == 1 then
-      encoder_bwd_clones = clone_many_times(encoder_bwd, opt.max_word_l)
+      encoder_bwd_clones = clone_many_times(encoder_bwd, max_word_l_sz)
    end   
-   for i = 1, opt.max_word_l do
+   for i = 1, max_word_l_sz do
       if encoder_clones[i].apply then
          encoder_clones[i]:apply(function(m) m:setReuse() end)
       end
@@ -336,6 +341,42 @@ function train(train_data, valid_data)
          decoder_clones[i]:apply(function(m) m:setReuse() end)
       end
    end   
+
+   if opt.denoise > 0 then
+     source_proto = torch.zeros(opt.max_word_l + 5, opt.max_batch_l, opt.max_sent_l):cuda()
+     source_proto2 = torch.zeros(opt.max_batch_l, opt.max_sent_l):cuda()
+   end
+   function denoise(source, source_l, source_char_l, batch_l, r)
+     r = r or 0.1
+
+     local new_source = source_proto[{{}, {1, batch_l}, {1, source_l}}]:fill(3)
+     local new_source_proto = source_proto2[{{1, batch_l}, {1, source_l}}]
+     local new_source_l = 0
+     for t = 1, source_char_l do
+       p = torch.uniform()
+       if p < 1-r and new_source_l < opt.max_word_l + 5 then
+         new_source_l = new_source_l + 1
+         new_source[new_source_l]:copy(source[t])
+       end
+       p = torch.uniform()
+       if p < r and new_source_l < opt.max_word_l + 5 then
+         new_source_l = new_source_l + 1
+         local pad_mask = source[t]:eq(1)
+         new_source[new_source_l]:fill(torch.random(5, valid_data.target_size))
+         new_source[new_source_l]:maskedFill(pad_mask, 1) -- replace pad
+       end
+       p = torch.uniform()
+       if p < r and new_source_l > 1 and t < source_char_l then
+         local pad_mask = new_source[new_source_l]:eq(1)
+         new_source_proto:copy(new_source[new_source_l-1])
+         new_source[new_source_l-1]:copy(new_source[new_source_l])
+         new_source[new_source_l]:copy(new_source_proto)
+         new_source[new_source_l]:maskedFill(pad_mask, 1) -- replace pad
+       end
+     end
+     new_source_l = math.max(new_source_l, 1)
+     return new_source[{{1, new_source_l}}], new_source_l
+   end
 
    if opt.attn_type == 'hard' then
      sampler_layers = {}
@@ -639,9 +680,13 @@ function train(train_data, valid_data)
         local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
         local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
         local source_char_l = d[9]
+        if opt.denoise > 0 then
+          -- denoising autoencoder
+          source, source_char_l = denoise(source, source_l, source_char_l, batch_l, opt.denoise)
+        end
         local pad_mask = source:eq(1) -- padding
         local source_sent_l = source:ne(1):sum(1):squeeze(1) -- batch_l x source_l
-        --source_sent_l[source_sent_l:eq(0)]:fill(1)
+        source_sent_l[source_sent_l:eq(0)]:fill(1)
 
         local loss = 0 -- added by Jeffrey
         for sample_i = 1, num_samples do
@@ -729,6 +774,15 @@ function train(train_data, valid_data)
             else
               context_bow:copy(bow_out)
             end
+          end
+          if i % opt.print_batch == 0 then
+            print(source:narrow(1,1,10))
+            print(source_char_l)
+            print('loss:', train_loss)
+            --print('memory:', cutorch.getMemoryUsage(opt.gpuid))
+            --print('i:', i)
+            --print('source length:', source_l, 'time step:', t)
+            io.read()
           end
 
           -- forward prop decoder
@@ -882,12 +936,6 @@ function train(train_data, valid_data)
             drnn_state_dec[#drnn_state_dec]:add(dl_dattn[1])
             local decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
-            if i % opt.print_batch == 0 then
-              print('memory:', cutorch.getMemoryUsage(opt.gpuid))
-              print('i:', i)
-              print('source length:', source_l, 'time step:', t)
-              io.read()
-            end
             -- accumulate encoder/decoder grads
             encoder_grads:add(dl_dattn[2])
             if opt.brnn == 1 then
@@ -1433,6 +1481,9 @@ function main()
       if opt.brnn == 1 then
 	 encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
       end      
+
+      -- check for word2vec
+      assert(opt.pre_word_vecs_enc ~= '' and opt.pre_word_vecs_dec ~= '', 'not using word2vec!')
    else
       assert(path.exists(opt.train_from), 'checkpoint path invalid')
       print('loading ' .. opt.train_from .. '...')
@@ -1441,10 +1492,11 @@ function main()
       opt.num_layers = model_opt.num_layers
       opt.rnn_size = model_opt.rnn_size
       opt.input_feed = model_opt.input_feed
-      --opt.attn = model_opt.attn
-      opt.attn_type = model_opt.attn_type
+      opt.init_dec = model_opt.init_dec
       opt.brnn = model_opt.brnn
+
       opt.hierarchical = model_opt.hierarchical
+      opt.attn_type = model_opt.attn_type
       opt.attn_word_type = model_opt.attn_word_type
       opt.baseline_method = model_opt.baseline_method
 
@@ -1478,6 +1530,7 @@ function main()
       end
    end   
 
+   -- print options
    print('init dec:', opt.init_dec)
    print('input feed:', opt.input_feed)
    print('attention on sentences:', opt.attn_type)
@@ -1501,9 +1554,10 @@ function main()
      print('using bow encoder lstm')
    end
    if opt.conv_bow == 1 then
+     assert(opt.cudnn == 1, 'use cudnn!')
      print('using convolution instead of bag of words')
    end
-   
+
    layers = {encoder, decoder, generator, decoder_attn}
    layers_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
    idx = 5

@@ -117,7 +117,7 @@ def get_data(args):
     word_indexer = Indexer(["<blank>","<unk>","<s>", "</s>"]) # for both source and target
     word_indexer.add_w([src_indexer.BOS, src_indexer.EOS])
 
-    def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0, truncate=0, no_pad=0):
+    def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0, truncate=0, no_pad=0, targetseqlength=100, pretrain=0):
         num_docs = 0
         for i, (src_orig, targ_orig) in \
                 enumerate(itertools.izip(open(srcfile,'r'), open(targetfile,'r'))):
@@ -126,14 +126,22 @@ def get_data(args):
 
             src = src_orig.strip().strip("</s>").split("</s>") # splits the doc into sentences
             targ = targ_orig.strip().split()
-            if len(src) < 1 or len(targ) < 1 or len(src[0]) < 1:
+            if len(src) < 1 or len(src[0]) < 1:
               continue
             if len(src) > seqlength and no_pad == 0:
               if truncate == 1:
                 src = src[:seqlength]
               else:
                 continue
-            num_docs += 1
+            if pretrain == 0:
+              if len(targ) < 1 or len(targ) > targetseqlength:
+                continue
+
+            if pretrain > 0:
+                num_docs += pretrain
+            else:
+                num_docs += 1
+
             for word in targ:
                 word_indexer.vocab[word] += 1
 
@@ -152,13 +160,15 @@ def get_data(args):
         return max_sent_l, num_docs
                 
     def convert(srcfile, targetfile, batchsize, seqlength, outfile, num_docs,
-                max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0, truncate=0, no_pad=0, repeat_words=0,targetseqlength=100):
+                max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0,
+                truncate=0, no_pad=0, repeat_words=0, targetseqlength=100, pretrain=0):
         
         if no_pad == 1:
             newseqlength = seqlength
         else:
             newseqlength = seqlength + 2 #add 2 for EOS and BOS; length in sents of the longest document
-        newtargetseqlength = targetseqlength + 2 #add 2 for EOS and BOS; length in sents of the longest document
+        newtargetseqlength = targetseqlength + 2 #add 2 for EOS and BOS
+
         targets = np.zeros((num_docs, newtargetseqlength), dtype=int) # the target sequence
         target_output = np.zeros((num_docs, newtargetseqlength), dtype=int) # next word to predict
         sources = np.zeros((num_docs, newseqlength), dtype=int) # input split into sentences
@@ -172,34 +182,57 @@ def get_data(args):
                 enumerate(itertools.izip(open(srcfile,'r'), open(targetfile,'r'))):
             src_orig = src_indexer.clean(src_orig.strip())
             targ_orig = word_indexer.clean(targ_orig.strip())
+            orig_sents = src_orig.strip().strip("</s>").split("</s>")
             if no_pad == 1:
-                src = src_orig.strip().strip("</s>").split("</s>")
+                src = orig_sents
             else:
-                src = [src_indexer.BOS] + src_orig.strip().strip("</s>").split("</s>") + [src_indexer.EOS]
-            targ = [word_indexer.BOS] + targ_orig.strip().split() + [word_indexer.EOS]
+                src = [src_indexer.BOS] + orig_sents + [src_indexer.EOS]
+            if pretrain > 0:
+                targ = []
+                for j in xrange(pretrain):
+                    sampled_sents = np.random.choice(orig_sents, min(2, len(orig_sents)), replace=False)
+                    sampled_sents = [' '.join(sent.strip().split()[:targetseqlength/2]) for sent in list(sampled_sents)]
+                    sampled_sents = ' '.join(sampled_sents).strip().split()
+                    targ.append([word_indexer.BOS] + sampled_sents[:targetseqlength-2] + [word_indexer.EOS])
+            else:
+                targ = [word_indexer.BOS] + targ_orig.strip().split() + [word_indexer.EOS]
             max_doc_l = max(len(src), max_doc_l)
 
+            # drop
             if no_pad == 1:
-              if len(src) < 1 or len(targ) < 3 or len(src[0]) < 1:
+              if len(src) < 1 or len(src[0]) < 1:
                 dropped += 1
                 continue                   
             else:
-              if len(src) < 3 or len(targ) < 3 or len(src[1]) < 3:
+              if len(src) < 3 or len(src[1]) < 3:
                 dropped += 1
-                continue                   
+                continue
             if len(src) > newseqlength and no_pad == 0:
               if truncate == 1:
                 src = src[:newseqlength]
               else:
                 dropped += 1
                 continue                   
+            if pretrain == 0:
+                if len(targ) > newtargetseqlength or len(targ) < 3:
+                    dropped += 1
+                    continue
 
-            targ = pad(targ, newtargetseqlength+1, word_indexer.PAD)
-            for word in targ:
-                #use UNK for target, but not for source
-                word = word if word in word_indexer.d else word_indexer.UNK
-            targ = word_indexer.convert_sequence(targ)
-            targ = np.array(targ, dtype=int)
+            if pretrain > 0:
+                for j in xrange(len(targ)):
+                    targ[j] = pad(targ[j], newtargetseqlength+1, word_indexer.PAD)
+                    for word in targ[j]:
+                        #use UNK for target, but not for source
+                        word = word if word in word_indexer.d else word_indexer.UNK
+                    targ[j] = word_indexer.convert_sequence(targ[j])
+                    targ[j] = np.array(targ[j], dtype=int)
+            else:
+                targ = pad(targ, newtargetseqlength+1, word_indexer.PAD)
+                for word in targ:
+                    #use UNK for target, but not for source
+                    word = word if word in word_indexer.d else word_indexer.UNK
+                targ = word_indexer.convert_sequence(targ)
+                targ = np.array(targ, dtype=int)
 
             if no_pad == 1:
               src = pad(src, newseqlength, src_indexer.PAD, no_cut=True)
@@ -233,25 +266,47 @@ def get_data(args):
                     dropped += 1
                     continue
                 
-            targets[doc_id] = np.array(targ[:-1],dtype=int) # get all but the last pad
-            target_lengths[doc_id] = (targets[doc_id] != 1).sum()
-            target_output[doc_id] = np.array(targ[1:],dtype=int)                    
-            sources[doc_id] = np.array(src, dtype=int)
-            source_lengths[doc_id] = (sources[doc_id] != 1).sum()            
-            if no_pad == 1:
-              src_word = word_indexer.convert_sequence(pad(src_word, newseqlength*max_sent_l, word_indexer.PAD))
-              result = np.array(src_word, dtype=int).reshape((newseqlength, max_sent_l))
-              if repeat_words > 0:
-                idx = 0
-                for j in xrange(newseqlength):
-                  result[j] = src_word[idx:idx+max_sent_l]
-                  idx = idx + max_sent_l - repeat_words # subtract deficit
-              sources_word[doc_id] = result
-            else:
-              sources_word[doc_id] = np.array(src_word, dtype=int)
-            source_word_l[doc_id] = (sources_word[doc_id] != 1).sum(1).max() # get max sent len for doc
+            if pretrain > 0:
+                for j in xrange(len(targ)):
+                  targets[doc_id] = np.array(targ[j][:-1],dtype=int) # get all but the last pad
+                  target_lengths[doc_id] = (targets[doc_id] != 1).sum()
+                  target_output[doc_id] = np.array(targ[j][1:],dtype=int)                    
+                  sources[doc_id] = np.array(src, dtype=int)
+                  source_lengths[doc_id] = (sources[doc_id] != 1).sum()            
+                  if no_pad == 1:
+                    src_word = word_indexer.convert_sequence(pad(src_word, newseqlength*max_sent_l, word_indexer.PAD))
+                    result = np.array(src_word, dtype=int).reshape((newseqlength, max_sent_l))
+                    if repeat_words > 0:
+                      idx = 0
+                      for j in xrange(newseqlength):
+                        result[j] = src_word[idx:idx+max_sent_l]
+                        idx = idx + max_sent_l - repeat_words # subtract deficit
+                    sources_word[doc_id] = result
+                  else:
+                    sources_word[doc_id] = np.array(src_word, dtype=int)
+                  source_word_l[doc_id] = (sources_word[doc_id] != 1).sum(1).max() # get max sent len for doc
 
-            doc_id += 1
+                  doc_id += 1
+            else:
+                targets[doc_id] = np.array(targ[:-1],dtype=int) # get all but the last pad
+                target_lengths[doc_id] = (targets[doc_id] != 1).sum()
+                target_output[doc_id] = np.array(targ[1:],dtype=int)                    
+                sources[doc_id] = np.array(src, dtype=int)
+                source_lengths[doc_id] = (sources[doc_id] != 1).sum()            
+                if no_pad == 1:
+                  src_word = word_indexer.convert_sequence(pad(src_word, newseqlength*max_sent_l, word_indexer.PAD))
+                  result = np.array(src_word, dtype=int).reshape((newseqlength, max_sent_l))
+                  if repeat_words > 0:
+                    idx = 0
+                    for j in xrange(newseqlength):
+                      result[j] = src_word[idx:idx+max_sent_l]
+                      idx = idx + max_sent_l - repeat_words # subtract deficit
+                  sources_word[doc_id] = result
+                else:
+                  sources_word[doc_id] = np.array(src_word, dtype=int)
+                source_word_l[doc_id] = (sources_word[doc_id] != 1).sum(1).max() # get max sent len for doc
+
+                doc_id += 1
             if doc_id % 100000 == 0:
                 print("{}/{} docs processed".format(doc_id, num_docs))
 
@@ -332,17 +387,22 @@ def get_data(args):
 
     print("First pass through data to get vocab...")
     max_sent_l, num_docs_train = make_vocab(args.srcfile, args.targetfile,
-                                             args.seqlength, 0, args.truncate, args.no_pad)
+                                             args.seqlength, 0, args.truncate, args.no_pad, args.targetseqlength, args.pretrain)
     print("Number of docs in training: {}".format(num_docs_train))
     max_sent_l, num_docs_valid = make_vocab(args.srcvalfile, args.targetvalfile,
-                                             args.seqlength, max_sent_l, args.truncate, args.no_pad)
+                                             args.seqlength, max_sent_l, args.truncate, args.no_pad, args.targetseqlength, args.pretrain)
     print("Number of docs in valid: {}".format(num_docs_valid))    
     print("Max sentence length (before cutting): {}".format(max_sent_l))
     max_sent_l = min(max_sent_l, args.maxsentlength)
     print("Max sentence length (after cutting): {}".format(max_sent_l))
+    print("Target sequence length: {}".format(args.targetseqlength))
 
     #prune and write vocab
     word_indexer.prune_vocab(args.srcvocabsize)
+    if args.charvocabfile != '':
+        print('Loading pre-specified char vocab from ' + args.charvocabfile)
+        word_indexer.load_vocab(args.charvocabfile)
+
     word_indexer.write(args.outputfile + ".word.dict")
     print("Word vocab size: Original = {}, Pruned = {}".format(len(word_indexer.vocab), 
                                                           len(word_indexer.d)))
@@ -354,10 +414,12 @@ def get_data(args):
     max_doc_l = 0
     max_doc_l = convert(args.srcvalfile, args.targetvalfile, args.batchsize, args.seqlength,
                          args.outputfile + "-val.hdf5", num_docs_valid,
-                         max_sent_l, max_doc_l, args.unkfilter, args.shuffle, args.truncate, args.no_pad, args.repeat_words, args.targetseqlength)
+                         max_sent_l, max_doc_l, args.unkfilter, args.shuffle,
+                         args.truncate, args.no_pad, args.repeat_words, args.targetseqlength, args.pretrain)
     max_doc_l = convert(args.srcfile, args.targetfile, args.batchsize, args.seqlength,
                          args.outputfile + "-train.hdf5", num_docs_train, max_sent_l,
-                         max_doc_l, args.unkfilter, args.shuffle, args.truncate, args.no_pad, args.repeat_words, args.targetseqlength)
+                         max_doc_l, args.unkfilter, args.shuffle,
+                         args.truncate, args.no_pad, args.repeat_words, args.targetseqlength, args.pretrain)
     
     print("Max doc length (before dropping): {}".format(max_doc_l))
     
@@ -373,6 +435,9 @@ def main(arguments):
                                                 "by taking the top X most frequent words. "
                                                 "Rest are replaced with special UNK tokens.",
                                                 type=int, default=50000)
+    parser.add_argument('--charvocabfile', help="If working with a preset vocab, "
+                                         "then including this use the char vocab provided here.",
+                                          type = str, default='')    
     parser.add_argument('--srcfile', help="Path to source training data, "
                                            "where each line represents a single "
                                            "source/target sequence.", required=True)
@@ -383,7 +448,7 @@ def main(arguments):
     parser.add_argument('--targetvalfile', help="Path to target txt validation data.", required=True)
     parser.add_argument('--batchsize', help="Size of each minibatch.", type=int, default=64)
     parser.add_argument('--seqlength', help="Maximum sequence (document) length. Sequences longer "
-                                               "than this are dropped.", type=int, default=10)
+                                               "than this are dropped.", type=int, default=20)
     parser.add_argument('--targetseqlength', help="Maximum sequence (document) length. Sequences longer "
                                                "than this are dropped.", type=int, default=100)
     parser.add_argument('--outputfile', help="Prefix of the output file names. ", type=str, required=True)
@@ -400,12 +465,18 @@ def main(arguments):
                                           type = int, default = 0)
     parser.add_argument('--truncate', help="If = 1, truncate docs instead of dropping.",
                                           type = int, default = 0)
-    parser.add_argument('--no_pad', help="If = 1, truncate image instead of padding sentences",
+    parser.add_argument('--no_pad', help="If = 1, fill image instead of padding sentences",
                                           type = int, default = 0)
     parser.add_argument('--repeat_words', help="If > 1, repeat words at end of each row to next row",
                                           type = int, default = 0)
+    parser.add_argument('--pretrain', help="If > 1, emit pretraining data - target is number of random sents from source",
+                                          type = int, default = 0)
+    parser.add_argument('--sample_sents', help="If = 1, sample sentences from doc up to seqlength",
+                                          type = int, default = 0)
+    parser.add_argument('--seed', help="random seed", type = int, default = 3435)
 
     args = parser.parse_args(arguments)
+    np.random.seed(args.seed)
     get_data(args)
 
 if __name__ == '__main__':

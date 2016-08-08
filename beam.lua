@@ -8,6 +8,9 @@ require 'data.lua'
 require 'util.lua'
 require 'hard_attn'
 
+ENTROPY = 0
+GOLD_SIZE = 0
+
 stringx = require('pl.stringx')
 
 cmd = torch.CmdLine()
@@ -15,6 +18,7 @@ cmd = torch.CmdLine()
 -- check attn options
 cmd:option('-view_attn', 0, [[View attention weights at each time step]])
 cmd:option('-print_attn', 0, [[Print attention weights]])
+cmd:option('-print_gold_attn', 0, [[Print attention weights for gold]])
 
 cmd:option('-no_pad', 0, [[No pad format for data]])
 cmd:option('-no_pad_sent_l', 5, [[Number of `sentences` we have for a doc]])
@@ -462,6 +466,11 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    end
    local gold_score = 0
    if opt.score_gold == 1 then
+      local gold_sentence_attn_list = {}
+      gold_sentence_attn_list[1] = initial
+      local gold_attn_list = {}
+      gold_attn_list[1] = initial
+
       rnn_state_dec = {}
       for i = 1, #init_fwd_dec do
          table.insert(rnn_state_dec, init_fwd_dec[i][{{1}}]:zero())
@@ -491,6 +500,46 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
            decoder_attn_input = {out_decoder[#out_decoder], context[{{1}}]}
          end
          local attn_out = model[layers_idx['decoder_attn']]:forward(decoder_attn_input)
+         if opt.print_gold_attn == 1 then
+             gold_sentence_attn_list[t] = {}
+             gold_attn_list[t] = {}
+             if model_opt.hierarchical == 1 then
+                local row_attn = decoder_softmax.output[1]:clone()
+                local word_attn = decoder_softmax_words.output:clone()
+                local result
+                for r = 1, row_attn:size(1) do
+                  word_attn[r]:mul(row_attn[r])
+                  local cur = word_attn[r][{{1, nonzeros[r]}}]
+                  if result == nil then
+                    result = cur
+                  else
+                    result = torch.cat(result, cur, 1)
+                  end
+                end
+                gold_sentence_attn_list[t] = row_attn
+                gold_attn_list[t] = result
+             else
+                local pre_attn = decoder_softmax.output:clone()
+                if opt.no_pad == 1 then
+                  pre_attn = pre_attn:view(opt.no_pad_sent_l, model_opt.max_word_l)
+                end
+                local row_attn = pre_attn:sum(2):squeeze(2)
+                local result
+                for r = 1, source_sent_l do
+                  local cur
+                  if nonzeros[r] > 0 then -- ignore blank sentences
+                    cur = pre_attn[r][{{1, nonzeros[r]}}]
+                    if result == nil then
+                      result = cur
+                    else
+                      result = torch.cat(result, cur, 1)
+                    end
+                  end
+                end
+                gold_sentence_attn_list[t] = row_attn
+                gold_attn_list[t] = result
+             end
+         end
 
          local out = model[3]:forward(attn_out) -- K x vocab_size
          rnn_state_dec = {} -- to be modified later
@@ -503,6 +552,15 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
          gold_score = gold_score + out[1][gold[t]]
 
       end      
+      if opt.print_gold_attn == 1 then
+        -- sentence attn
+        pretty_print(gold_sentence_attn_list)
+        for j = 2, #gold_sentence_attn_list do
+          local p = gold_sentence_attn_list[j]
+          ENTROPY = ENTROPY + p:cmul(torch.log(p + 1e-8)):sum()
+          GOLD_SIZE = GOLD_SIZE + p:size(1)
+        end
+      end
    end
    if opt.simple == 1 or end_score > max_score or not found_eos then
       max_hyp = end_hyp
@@ -904,6 +962,7 @@ function main()
                           math.exp(-gold_score_total/gold_words_total)))
    end
    print(string.format("attn deficit: %.4f", total_deficit/pred_words_total))
+   print(string.format("gold entropy: %.4f", ENTROPY / GOLD_SIZE))
    out_file:close()
 end
 main()

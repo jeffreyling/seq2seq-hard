@@ -72,7 +72,6 @@ function data:__init(opt, data_file)
 					      self.batch_idx[i] + self.batch_l[i]-1, 1,
 					      self.source_l[i], 1, self.source_char_l[i]):permute(3,1,2):contiguous()
                                               -- permute to get words, batch, sents
-                                              -- TODO: is there a way to make the batch size right here?
       else
 	 source_i =  self.source:sub(self.batch_idx[i], self.batch_idx[i]+self.batch_l[i]-1,
 				     1, self.source_l[i]):transpose(1,2)
@@ -100,6 +99,7 @@ function data:__init(opt, data_file)
 				  target_l_i,
                                   self.source_char_l[i]})
    end
+
 end
 
 function data:size()
