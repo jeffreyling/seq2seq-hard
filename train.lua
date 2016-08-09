@@ -1483,7 +1483,8 @@ function main()
       end      
 
       -- check for word2vec
-      assert(opt.pre_word_vecs_enc ~= '' and opt.pre_word_vecs_dec ~= '', 'not using word2vec!')
+      assert(opt.pre_word_vecs_enc ~= '', 'not using word2vec!')
+      opt.pre_word_vecs_dec = opt.pre_word_vecs_enc
    else
       assert(path.exists(opt.train_from), 'checkpoint path invalid')
       print('loading ' .. opt.train_from .. '...')

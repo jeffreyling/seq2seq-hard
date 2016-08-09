@@ -242,6 +242,7 @@ def get_data(args):
             for sent in src:
                 sent = word_indexer.clean(sent)
                 if no_pad == 1:
+                  if sent == '': continue
                   word = sent.split() + [word_indexer.EOS]
                   src_word = src_word + word
                 else:

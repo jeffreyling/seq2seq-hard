@@ -28,6 +28,8 @@ cmd:option('-repeat_words', 0, [[Repeat words format for data]])
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])
 cmd:option('-src_file', '',[[Source sequence to decode (one line per sequence)]])
 cmd:option('-targ_file', '', [[True target sequence (optional)]])
+cmd:option('-src_hdf5', '', [[Instead of src_file and targ_file, can provide a src_hdf5 from preprocessing]])
+
 cmd:option('-output_file', 'pred.txt', [[Path to output the predictions (each line will be the
                                        decoded sequence]])
 cmd:option('-src_dict', 'data/demo.src.dict', [[Path to source vocabulary (*.src.dict file)]])
@@ -396,12 +398,14 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                     local word_attn = decoder_softmax_words.output:reshape(K, source_sent_l, source_char_l)[prev_k]:clone()
                     local result
                     for r = 1, row_attn:size(1) do
-                      word_attn[r]:mul(row_attn[r])
-                      local cur = word_attn[r][{{1, nonzeros[r]}}]
-                      if result == nil then
-                        result = cur
-                      else
-                        result = torch.cat(result, cur, 1)
+                      if nonzeros[r] > 0 then -- ignore blank sentences
+                        word_attn[r]:mul(row_attn[r])
+                        local cur = word_attn[r][{{1, nonzeros[r]}}]
+                        if result == nil then
+                          result = cur
+                        else
+                          result = torch.cat(result, cur, 1)
+                        end
                       end
                     end
                     attn_list[i][k] = State.advance(attn_list[i-1][prev_k], result)
@@ -508,12 +512,14 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                 local word_attn = decoder_softmax_words.output:clone()
                 local result
                 for r = 1, row_attn:size(1) do
-                  word_attn[r]:mul(row_attn[r])
-                  local cur = word_attn[r][{{1, nonzeros[r]}}]
-                  if result == nil then
-                    result = cur
-                  else
-                    result = torch.cat(result, cur, 1)
+                  if nonzeros[r] > 0 then -- ignore blank sentences
+                    word_attn[r]:mul(row_attn[r])
+                    local cur = word_attn[r][{{1, nonzeros[r]}}]
+                    if result == nil then
+                      result = cur
+                    else
+                      result = torch.cat(result, cur, 1)
+                    end
                   end
                 end
                 gold_sentence_attn_list[t] = row_attn
@@ -721,14 +727,19 @@ end
 
 function wordidx2sent(sent, idx2word, source_str, attn, skip_end)
    local t = {}
-   local start_i, end_i
-   skip_end = skip_start_end or true
-   if skip_end then
-      end_i = #sent-1
+   if skip_end == nil then skip_end = true end
+   local start_i = 1
+   local end_i
+   if torch.isTensor(sent) then
+     end_i = sent:size(1)
    else
-      end_i = #sent
+     end_i = #sent
+   end
+   if skip_end then
+      start_i = start_i + 1
+      end_i = end_i - 1
    end   
-   for i = 2, end_i do -- skip START and END
+   for i = start_i, end_i do -- skip START and END
       if sent[i] == UNK then
          if opt.replace_unk == 1 then
             local s = source_str[attn[i]]
@@ -760,6 +771,20 @@ function strip(s)
    return s:gsub("^%s+",""):gsub("%s+$","")
 end
 
+function iterate_tensor(t)
+  assert(torch.isTensor(t), 'non-tensor provided')
+  local i = 0
+  local function f(t, _)
+    if i < t:size(1) then
+      i = i+1
+      return t[i]
+    else
+      return nil
+    end
+  end
+  return f, t, nil
+end
+
 function main()
    -- some globals
    PAD = 1; UNK = 2; START = 3; END = 4
@@ -767,8 +792,12 @@ function main()
    START_CHAR = '{'; END_CHAR = '}'
    MAX_SENT_L = opt.max_sent_l
    print('max_sent_l:', MAX_SENT_L)
-   assert(path.exists(opt.src_file), 'src_file does not exist')
-   assert(path.exists(opt.model), 'model does not exist')
+   if path.exists(opt.src_hdf5) then
+     print('using hdf5 file ' .. opt.src_hdf5)
+   else
+     assert(path.exists(opt.src_file), 'src_file does not exist')
+     assert(path.exists(opt.model), 'model does not exist')
+   end
    
    -- parse input params
    opt = cmd:parse(arg)
@@ -802,6 +831,9 @@ function main()
    end
    layers_idx = model_opt.save_idx
    
+   assert(opt.src_dict ~= '', 'need dictionary')
+   opt.targ_dict = opt.src_dict
+   opt.char_dict = opt.src_dict
    
    idx2word_src = idx2key(opt.src_dict)
    word2idx_src = flip_table(idx2word_src)
@@ -821,6 +853,7 @@ function main()
                                              model_opt.max_word_l, word2charidx_targ[i])
       end      
    end  
+
    -- load gold labels if it exists
    if path.exists(opt.targ_file) then
       print('loading GOLD labels at ' .. opt.targ_file)
@@ -830,7 +863,35 @@ function main()
          table.insert(gold, line)
       end
    else
-      opt.score_gold = 0
+      if opt.src_hdf5 == '' then
+        -- no gold data
+        opt.score_gold = 0
+      end
+   end
+
+   local file
+   local src_sents = {}
+   local num_sents = 0
+   if opt.src_hdf5 ~= '' then
+     file = hdf5.open(opt.src_hdf5, 'r')
+     local source_char = file:read('source_char'):all()
+     num_sents = source_char:size(1)
+     for i = 1, num_sents do
+       table.insert(src_sents, source_char[i])
+     end
+
+     -- reinit gold
+     gold = {}
+     local targets = file:read('target'):all()
+     for i = 1, num_sents do
+       table.insert(gold, targets[i])
+     end
+   else
+     file = io.open(opt.src_file, "r")
+     for line in file:lines() do
+       table.insert(src_sents, line)
+       num_sents = num_sents + 1
+     end
    end
 
    if opt.gpuid >= 0 then
@@ -905,21 +966,37 @@ function main()
    State = StateAll
    local sent_id = 0
    pred_sents = {}
-   local file = io.open(opt.src_file, "r")
    local out_file = io.open(opt.output_file,'w')   
-   for line in file:lines() do
+
+   for _,line in ipairs(src_sents) do
       sent_id = sent_id + 1
-      line = clean_sent(line)      
-      print('SENT ' .. sent_id .. ': ' ..line)
-      local source, source_str
-      if model_opt.use_chars_enc == 0 then
-         source, source_str = sent2wordidx(line, word2idx_src, model_opt.start_symbol)
+
+      if opt.src_hdf5 == '' then 
+        line = clean_sent(line)      
+        print('SENT ' .. sent_id .. ': ' ..line)
+        local source, source_str
+        if model_opt.use_chars_enc == 0 then
+           source, source_str = sent2wordidx(line, word2idx_src, model_opt.start_symbol)
+        else
+           source, source_str = doc2charidx(line, char2idx, model_opt.max_word_l, model_opt.start_symbol)
+        end
+        if opt.score_gold == 1 then
+           target, target_str = sent2wordidx(gold[sent_id], word2idx_targ, 1)
+        end
       else
-         source, source_str = doc2charidx(line, char2idx, model_opt.max_word_l, model_opt.start_symbol)
+        -- line is a tensor
+        source_str = wordidx2sent(line:view(line:nElement()), idx2word_src, nil, nil, false)
+        print('SENT ' .. sent_id .. ': ' .. source_str)
+        source = line
+        if opt.score_gold == 1 then
+          target = gold[sent_id]
+          local nonzero = target:ne(1):sum()
+          target = target[{{1, nonzero}}] -- remove padding
+          gold[sent_id] = target
+          target_str = wordidx2sent(gold[sent_id], idx2word_targ, nil, nil, false)
+        end
       end
-      if opt.score_gold == 1 then
-         target, target_str = sent2wordidx(gold[sent_id], word2idx_targ, 1)
-      end
+
       state = State.initial(START)
       pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn, attn_list, deficit_list = generate_beam(model,
                   state, opt.beam, MAX_SENT_L, source, target) -- use attn_list to print attn
@@ -929,7 +1006,11 @@ function main()
       out_file:write(pred_sent .. '\n')      
       print('PRED ' .. sent_id .. ': ' .. pred_sent)
       if gold ~= nil then
-         print('GOLD ' .. sent_id .. ': ' .. gold[sent_id])
+         if opt.src_hdf5 == '' then
+           print('GOLD ' .. sent_id .. ': ' .. gold[sent_id])
+         else
+           print('GOLD ' .. sent_id .. ': ' .. target_str)
+         end
          if opt.score_gold == 1 then
             print(string.format("PRED SCORE: %.4f, GOLD SCORE: %.4f", pred_score, gold_score))
             gold_score_total = gold_score_total + gold_score
