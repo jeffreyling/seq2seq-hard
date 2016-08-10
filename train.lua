@@ -1111,12 +1111,11 @@ function train(train_data, valid_data)
         local shrinkage = opt.max_grad_norm / grad_norm
         for j = 1, #grad_params do
           if j == layers_idx['baseline_m'] and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
-            local idx = layers_idx['baseline_m']
             -- special case
-            local n = grad_params[idx]:norm()
+            local n = grad_params[j]:norm()
             local s = opt.max_grad_norm / n
             if s < 1 then
-              grad_params[idx]:mul(s)
+              grad_params[j]:mul(s)
             end
           else
             if shrinkage < 1 then
