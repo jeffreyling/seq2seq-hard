@@ -193,7 +193,7 @@ def get_data(args):
                     sampled_sents = np.random.choice(orig_sents, min(2, len(orig_sents)), replace=False)
                     sampled_sents = [' '.join(sent.strip().split()[:targetseqlength/2]) for sent in list(sampled_sents)]
                     sampled_sents = ' '.join(sampled_sents).strip().split()
-                    targ.append([word_indexer.BOS] + sampled_sents[:targetseqlength-2] + [word_indexer.EOS])
+                    targ.append([word_indexer.BOS] + sampled_sents[:targetseqlength] + [word_indexer.EOS])
             else:
                 targ = [word_indexer.BOS] + targ_orig.strip().split() + [word_indexer.EOS]
             max_doc_l = max(len(src), max_doc_l)
