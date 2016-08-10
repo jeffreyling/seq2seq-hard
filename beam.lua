@@ -21,10 +21,6 @@ cmd:option('-print_attn', 0, [[Print attention weights]])
 cmd:option('-sent_attn', 0, [[Print sentence attention instead of all attn]])
 cmd:option('-print_gold_attn', 0, [[Print attention weights for gold]])
 
-cmd:option('-no_pad', 0, [[No pad format for data]])
-cmd:option('-no_pad_sent_l', 5, [[Number of `sentences` we have for a doc]])
-cmd:option('-repeat_words', 0, [[Repeat words format for data]])
-
 -- file location
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])
 cmd:option('-src_file', '',[[Source sequence to decode (one line per sequence)]])
@@ -145,14 +141,6 @@ function flat_to_rc(v, flat_index)
    return row, (flat_index - 1) % v:size(2) + 1
 end
 
-function get_nonzeros(source)
-  local nonzeros = {}
-  for i = 1, source:size(1) do
-    table.insert(nonzeros, source[i]:ne(1):sum())
-  end
-  return nonzeros
-end
-
 function generate_beam(model, initial, K, max_sent_l, source, gold)
    --reset decoder initial states
    local n = max_sent_l
@@ -163,26 +151,12 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    -- Current Scores.
    local scores = torch.FloatTensor(n, K)
    scores:zero()
+   local source_l = math.min(source:size(1), opt.max_sent_l)
 
-   local nonzeros = get_nonzeros(source)
-   source = source:t():contiguous() -- get words to dim 1 for LSTM
-   --local source_l = math.min(source:size(1), opt.max_sent_l)
-   local source_char_l = math.min(source:size(1), opt.max_sent_l)
-   local source_sent_l = source:size(2)
    local attn_argmax = {}   -- store attn weights
    attn_argmax[1] = {}
    local attn_list = {}
    attn_list[1] = {}
-   local deficit_list = {}
-   deficit_list[1] = {}
-   local sentence_attn_list = {}
-   sentence_attn_list[1] = {}
-
-   local attn_argmax_words
-   if model_opt.hierarchical == 1 then
-     attn_argmax_words = {}
-     attn_argmax_words[1] = {}
-   end
 
    local states = {} -- store predicted word idx
    states[1] = {}
@@ -198,121 +172,59 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    local source_input
    -- for batch
    if model_opt.use_chars_enc == 1 then
-      source_input = source:view(source_char_l, 1, source:size(2)):contiguous():cuda()
+      source_input = source:view(source_l, 1, source:size(2)):contiguous():cuda()
    else
-      source_input = source:view(source_char_l, 1)
-   end
-   local pad_mask = source_input:eq(1)
-   local source_lens = source_input:ne(1):sum(1):squeeze(1)
-   --source_lens[source_lens:eq(0)]:fill(1) -- prevent indexing 0
-   local rnn_state_mask
-   if model_opt.no_bow == 1 then
-     rnn_state_mask = torch.zeros(1, source_sent_l, source_char_l, model_opt.rnn_size):byte():cuda()
-     for t = 1, source_sent_l do
-       local idx = source_lens[1][t]
-       rnn_state_mask[1][t][idx]:fill(1)
-     end
+      source_input = source:view(source_l, 1)
    end
 
-   --local rnn_state_enc = {}
-   --for i = 1, #init_fwd_enc do
-      --table.insert(rnn_state_enc, init_fwd_enc[i]:zero())
-   --end   
-   local rnn_state_enc = reset_state(init_fwd_enc, 1*source_sent_l)
-   local context = context_proto[{{}, {1, source_sent_l}, {1,source_char_l}}]:clone() -- 1 x source_l x source_char_l x rnn_size
-   local context_bow = context_bow_proto[{{}, {1, source_sent_l}}]:clone() -- 1 x source_l x word_vec_size
-   local rnn_state_bow_enc
-   if model_opt.bow_encoder_lstm == 1 then
-     rnn_state_bow_enc = reset_state(init_fwd_bow_enc, 1)
-   end
+   local rnn_state_enc = {}
+   for i = 1, #init_fwd_enc do
+      table.insert(rnn_state_enc, init_fwd_enc[i]:zero())
+   end   
+   local context = context_proto[{{}, {1, source_l}}]:clone() -- 1 x source_l x rnn_size
    
-   for t = 1, source_char_l do
+   for t = 1, source_l do
       local encoder_input = {source_input[t], table.unpack(rnn_state_enc)}
       local out = model[1]:forward(encoder_input)
-      if model_opt.mask_padding == 1 then
-        local cur_mask = pad_mask[t]:view(1*source_sent_l, 1):expand(1*source_sent_l, model_opt.rnn_size)
-        for L = 1, model_opt.num_layers do
-          out[L*2-1]:maskedFill(cur_mask, 0)
-          out[L*2]:maskedFill(cur_mask, 0)
-        end
-      end
 
       rnn_state_enc = out
-      context[{{},{},t}]:copy(out[#out]:view(1, source_sent_l, model_opt.rnn_size))
+      context[{{},t}]:copy(out[#out])
    end
 
-   local masked_selecter, rnn_states
-   if model_opt.no_bow == 1 then
-     masked_selecter = make_last_state_selecter(model_opt, batch_l, source_l)
-     rnn_states = masked_selecter:forward({context, rnn_state_mask})
-   end
-   if model_opt.hierarchical == 1 then
-     local bow_out = model[layers_idx['bow_encoder']]:forward(source_input:permute(2,3,1):contiguous())
-
-     if model_opt.bow_encoder_lstm == 1 then
-       -- pass bag of words through LSTM over sentences for context
-       for t = 1, source_sent_l do
-         local bow_encoder_input
-         if model_opt.no_bow == 1 then
-           bow_encoder_input = {rnn_states[t], table.unpack(rnn_state_bow_enc)}
-         else
-           bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc)}
-         end
-         local out = model[layers_idx['bow_encoder_lstm']]:forward(bow_encoder_input)
-         rnn_state_bow_enc = out
-         context_bow[{{}, t}]:copy(out[#out])
-       end
-     else
-       context_bow:copy(bow_out)
-     end
-   end
    rnn_state_dec = {}
    for i = 1, #init_fwd_dec do
       table.insert(rnn_state_dec, init_fwd_dec[i]:zero())
    end
 
    if model_opt.init_dec == 1 then
-      init_dec_module = make_init_dec_module(model_opt, 1, source_sent_l)
       for L = 1, model_opt.num_layers do
          rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
-            init_dec_module:forward(rnn_state_enc[L*2-1]):expand(K, model_opt.rnn_size))
+            rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
          rnn_state_dec[L*2+model_opt.input_feed]:copy(
-            init_dec_module:forward(rnn_state_enc[L*2]):expand(K, model_opt.rnn_size))
+            rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
       end
    end
    
    if model_opt.brnn == 1 then
-      local rnn_state_enc = reset_state(init_fwd_enc, 1*source_sent_l)
-      --for i = 1, #rnn_state_enc do
-         --rnn_state_enc[i]:zero()
-      --end      
-      for t = source_char_l, 1, -1 do
+      for i = 1, #rnn_state_enc do
+         rnn_state_enc[i]:zero()
+      end      
+      for t = source_l, 1, -1 do
          local encoder_input = {source_input[t], table.unpack(rnn_state_enc)}
          local out = model[layers_idx['encoder_bwd']]:forward(encoder_input)
          rnn_state_enc = out
-         context[{{},{},t}]:add(out[#out]:view(1, source_sent_l, model_opt.rnn_size))
+         context[{{},t}]:add(out[#out])
       end
       if model_opt.init_dec == 1 then
          for L = 1, model_opt.num_layers do
             rnn_state_dec[L*2-1+model_opt.input_feed]:add(
-               init_dec_module:forward(rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size)))
+               rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
             rnn_state_dec[L*2+model_opt.input_feed]:add(
-               init_dec_module:forward(rnn_state_enc[L*2]:expand(K, model_opt.rnn_size)))
+               rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
          end         
       end      
    end   
-   context = context:expand(K, source_sent_l, source_char_l, model_opt.rnn_size)
-   if model_opt.hierarchical == 1 then
-     if model_opt.bow_encoder_lstm == 1 then
-       context_bow = context_bow:expand(K, source_sent_l, model_opt.rnn_size)
-     else
-       if model_opt.conv_bow == 1 then
-         context_bow = context_bow:expand(K, source_sent_l, model_opt.num_kernels)
-       else
-         context_bow = context_bow:expand(K, source_sent_l, model_opt.word_vec_size)
-       end
-     end
-   end
+   context = context:expand(K, source_l, model_opt.rnn_size)
    
    out_float = torch.FloatTensor()
    
@@ -326,10 +238,6 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       attn_argmax[i] = {}
       attn_list[i] = {}
       sentence_attn_list[i] = {}
-      deficit_list[i] = {}
-      if model_opt.hierarchical == 1 then
-        attn_argmax_words[i] = {}
-      end
       local decoder_input1
       if model_opt.use_chars_dec == 1 then
          decoder_input1 = word2charidx_targ:index(1, next_ys:narrow(1,i-1,1):squeeze())
@@ -337,24 +245,17 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
          decoder_input1 = next_ys:narrow(1,i-1,1):squeeze()
          if opt.beam == 1 then
             decoder_input1 = torch.LongTensor({decoder_input1})
-         end        
+         end
       end
-      local decoder_input = {decoder_input1, table.unpack(rnn_state_dec)}
+      local decoder_input = {decoder_input1, context, table.unpack(rnn_state_dec)}
       local out_decoder = model[2]:forward(decoder_input)
-      local decoder_attn_input
-      if model_opt.hierarchical == 1 then
-        decoder_attn_input = {out_decoder[#out_decoder], context, context_bow}
-      else
-        decoder_attn_input = {out_decoder[#out_decoder], context}
-      end
-      local attn_out = model[layers_idx['decoder_attn']]:forward(decoder_attn_input)
-      local out = model[3]:forward(attn_out) -- K x vocab_size
+      local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
       
       rnn_state_dec = {} -- to be modified later
       if model_opt.input_feed == 1 then
-         table.insert(rnn_state_dec, attn_out)
+         table.insert(rnn_state_dec, out_decoder[#out_decoder])
       end      
-      for j = 1, #out_decoder do
+      for j = 1, #out_decoder - 1 do
          table.insert(rnn_state_dec, out_decoder[j])
       end
       out_float:resize(out:size()):copy(out)
@@ -388,55 +289,20 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
              end
              
              if i < 2 or diff then
-                 if opt.view_attn == 1 then
-                   print('decoder attention at time ', i)
-                   if model_opt.hierarchical == 1 then
-                     print('row:', decoder_softmax.output) -- K x source_sent_l
-                     print('words:', decoder_softmax_words.output:view(K, source_sent_l, source_char_l))
-                   else
-                     print('all words:', decoder_softmax.output:view(K, source_sent_l, source_char_l))
-                   end
-                   io.read()
-                 end
-                 if model_opt.hierarchical == 1 then
-                    local row_attn = decoder_softmax.output[prev_k]:clone()
-                    local word_attn = decoder_softmax_words.output:reshape(K, source_sent_l, source_char_l)[prev_k]:clone()
-                    local result
-                    for r = 1, row_attn:size(1) do
-                      if nonzeros[r] > 0 then -- ignore blank sentences
-                        word_attn[r]:mul(row_attn[r])
-                        local cur = word_attn[r][{{1, nonzeros[r]}}]
-                        if result == nil then
-                          result = cur
-                        else
-                          result = torch.cat(result, cur, 1)
-                        end
-                      end
-                    end
-                    attn_list[i][k] = State.advance(attn_list[i-1][prev_k], result)
-                    sentence_attn_list[i][k] = State.advance(sentence_attn_list[i-1][prev_k], row_attn)
-                    deficit_list[i][k] = State.advance(deficit_list[i-1][prev_k], 1-result:sum())
-                    max_attn, max_index = result:max(1)
-                    attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
-                 else
-                    local pre_attn = decoder_softmax.output:reshape(K, source_sent_l, source_char_l)[prev_k]:clone()
-                    local result
-                    for r = 1, source_sent_l do
-                      local cur
-                      if nonzeros[r] > 0 then -- ignore blank sentences
-                        cur = pre_attn[r][{{1, nonzeros[r]}}]
-                        if result == nil then
-                          result = cur
-                        else
-                          result = torch.cat(result, cur, 1)
-                        end
-                      end
-                    end
-                    attn_list[i][k] = State.advance(attn_list[i-1][prev_k], result)
-                    deficit_list[i][k] = State.advance(deficit_list[i-1][prev_k], 1-result:sum())
-                    max_attn, max_index = result:max(1)
-                    attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
-                 end
+                 --if opt.view_attn == 1 then
+                   --print('decoder attention at time ', i)
+                   --if model_opt.hierarchical == 1 then
+                     --print('row:', decoder_softmax.output) -- K x source_sent_l
+                     --print('words:', decoder_softmax_words.output:view(K, source_sent_l, source_char_l))
+                   --else
+                     --print('all words:', decoder_softmax.output:view(K, source_sent_l, source_char_l))
+                   --end
+                   --io.read()
+                 --end
+                local pre_attn = decoder_softmax.output[prev_k]:clone()
+                attn_list[i][k] = State.advance(attn_list[i-1][prev_k], pre_attn)
+                max_attn, max_index = pre_attn:max(1)
+                attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
 
                 prev_ks[i][k] = prev_k
                 next_ys[i][k] = y_i
@@ -454,10 +320,6 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
        end_score = scores[i][1]
         end_attn_argmax = attn_argmax[i][1]
        end_attn_list = attn_list[i][1]
-       if model_opt.hierarchical == 1 then
-         end_sentence_attn_list = sentence_attn_list[i][1]
-       end
-       end_deficit_list = deficit_list[i][1]
        if end_hyp[#end_hyp] == END then
           done = true
           found_eos = true
@@ -471,8 +333,6 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                    max_score = scores[i][k]
                     max_attn_argmax = attn_argmax[i][k]
                     max_attn_list = attn_list[i][k]
-                    max_sentence_attn_list = sentence_attn_list[i][k]
-                    max_deficit_list = deficit_list[i][k]
                 end
              end             
           end          
@@ -480,8 +340,6 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    end
    local gold_score = 0
    if opt.score_gold == 1 then
-      local gold_sentence_attn_list = {}
-      gold_sentence_attn_list[1] = initial
       local gold_attn_list = {}
       gold_attn_list[1] = initial
 
@@ -491,10 +349,8 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       end
       if model_opt.init_dec == 1 then
          for L = 1, model_opt.num_layers do
-            --rnn_state_dec[L*2]:copy(init_dec_module:forward(rnn_state_enc[L*2-1][{{1}}]))
-            --rnn_state_dec[L*2+1]:copy(init_dec_module:forward(rnn_state_enc[L*2][{{1}}]))
-            rnn_state_dec[L*2]:copy(init_dec_module:forward(rnn_state_enc[L*2-1]))
-            rnn_state_dec[L*2+1]:copy(init_dec_module:forward(rnn_state_enc[L*2]))
+            rnn_state_dec[L*2]:copy(rnn_state_enc[L*2-1][{{1}}])
+            rnn_state_dec[L*2+1]:copy(rnn_state_enc[L*2][{{1}}])
          end
       end
       local target_l = gold:size(1) 
@@ -505,77 +361,32 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
          else
             decoder_input1 = gold[{{t-1}}]
          end
-         local decoder_input = {decoder_input1, table.unpack(rnn_state_dec)}
+         local decoder_input = {decoder_input1, context[{{1}}], table.unpack(rnn_state_dec)}
          local out_decoder = model[2]:forward(decoder_input)
-         local decoder_attn_input
-         if model_opt.hierarchical == 1 then
-           decoder_attn_input = {out_decoder[#out_decoder], context[{{1}}], context_bow[{{1}}]}
-         else
-           decoder_attn_input = {out_decoder[#out_decoder], context[{{1}}]}
-         end
-         local attn_out = model[layers_idx['decoder_attn']]:forward(decoder_attn_input)
          if opt.print_gold_attn == 1 then
-             gold_sentence_attn_list[t] = {}
              gold_attn_list[t] = {}
-             if model_opt.hierarchical == 1 then
-                local row_attn = decoder_softmax.output[1]:clone()
-                local word_attn = decoder_softmax_words.output:clone()
-                local result
-                for r = 1, row_attn:size(1) do
-                  if nonzeros[r] > 0 then -- ignore blank sentences
-                    word_attn[r]:mul(row_attn[r])
-                    local cur = word_attn[r][{{1, nonzeros[r]}}]
-                    if result == nil then
-                      result = cur
-                    else
-                      result = torch.cat(result, cur, 1)
-                    end
-                  end
-                end
-                gold_sentence_attn_list[t] = row_attn
-                gold_attn_list[t] = result
-             else
-                local pre_attn = decoder_softmax.output:clone()
-                if opt.no_pad == 1 then
-                  pre_attn = pre_attn:view(opt.no_pad_sent_l, model_opt.max_word_l)
-                end
-                local row_attn = pre_attn:sum(2):squeeze(2)
-                local result
-                for r = 1, source_sent_l do
-                  local cur
-                  if nonzeros[r] > 0 then -- ignore blank sentences
-                    cur = pre_attn[r][{{1, nonzeros[r]}}]
-                    if result == nil then
-                      result = cur
-                    else
-                      result = torch.cat(result, cur, 1)
-                    end
-                  end
-                end
-                gold_sentence_attn_list[t] = row_attn
-                gold_attn_list[t] = result
-             end
+             local pre_attn = decoder_softmax.output[1]:clone()
+             gold_attn_list[t] = pre_attn
          end
 
-         local out = model[3]:forward(attn_out) -- K x vocab_size
+         local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
          rnn_state_dec = {} -- to be modified later
          if model_opt.input_feed == 1 then
-           table.insert(rnn_state_dec, attn_out)
+           table.insert(rnn_state_dec, out_decoder[#out_decoder])
          end
-         for j = 1, #out_decoder do
+         for j = 1, #out_decoder - 1 do
             table.insert(rnn_state_dec, out_decoder[j])
          end
          gold_score = gold_score + out[1][gold[t]]
 
       end      
       if opt.print_gold_attn == 1 then
-        -- sentence attn
-        pretty_print(gold_sentence_attn_list)
-        for j = 2, #gold_sentence_attn_list do
-          local p = gold_sentence_attn_list[j]
-          ENTROPY = ENTROPY + p:cmul(torch.log(p + 1e-8)):sum()
-          GOLD_SIZE = GOLD_SIZE + p:size(1)
-        end
+        pretty_print(gold_attn_list)
+        --for j = 2, #gold_sentence_attn_list do
+          --local p = gold_sentence_attn_list[j]
+          --ENTROPY = ENTROPY + p:cmul(torch.log(p + 1e-8)):sum()
+          --GOLD_SIZE = GOLD_SIZE + p:size(1)
+        --end
       end
    end
    if opt.simple == 1 or end_score > max_score or not found_eos then
@@ -583,11 +394,9 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       max_score = end_score
       max_attn_argmax = end_attn_argmax
       max_attn_list = end_attn_list
-      max_sentence_attn_list = end_sentence_attn_list
-      max_deficit_list = end_deficit_list
    end
 
-   return max_hyp, max_score, max_attn_argmax, gold_score, states[i], scores[i], attn_argmax[i], max_attn_list, max_deficit_list, max_sentence_attn_list
+   return max_hyp, max_score, max_attn_argmax, gold_score, states[i], scores[i], attn_argmax[i], max_attn_list
 end
 
 function idx2key(file)   
@@ -648,65 +457,19 @@ function sent2wordidx(sent, word2idx, start_symbol)
    return torch.LongTensor(t), u
 end
 
-function doc2charidx(doc, char2idx, max_word_l, start_symbol)
+function sent2charidx(doc, char2idx, max_word_l, start_symbol)
    local words = {}
-   local st = 1
-   for idx in doc:gmatch("()(</s>)") do
-     local sent = doc:sub(st, idx-2)
-     st = idx + 5
-     table.insert(words, {})
-     if start_symbol == 1 then
-        table.insert(words[#words], START_WORD)
-     end   
-     for word in sent:gmatch'([^%s]+)' do
-        table.insert(words[#words], word)
-     end
-     if start_symbol == 1 then
-        table.insert(words[#words], END_WORD)
-     elseif opt.no_pad == 1 then
-        table.insert(words[#words], "</s>")
-     end   
+   if start_symbol == 1 then
+      table.insert(words, START_WORD)
+   end   
+   for word in sent:gmatch'([^%s]+)' do
+      table.insert(words, word)
    end
-   --local chars = torch.ones(#words, max_word_l)
-   --for i = 1, #words do
-      --chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i])
-   --end
-   local chars
-   if opt.no_pad == 1 then
-     local rep_words = opt.repeat_words
-     chars = torch.ones(opt.no_pad_sent_l, max_word_l)
-     local i = 1
-     local j = 1
-     local done = false
-     for _,word in ipairs(words) do
-       for _, char in ipairs(word) do
-         local char_idx = char2idx[char] or UNK
-         chars[i][j] = char_idx
-         j = j+1
-         if j == max_word_l + 1 then
-           i = i+1
-           if i == opt.no_pad_sent_l + 1 then
-             done = true
-             break
-           end
-
-           if rep_words > 0 then
-             -- copy last row over
-             local tail = chars[{{i-1}, {max_word_l-rep_words+1, max_word_l}}]
-             chars[{{i},{1,rep_words}}]:copy(tail)
-             j = rep_words + 1
-           else
-             j = 1
-           end
-         end
-       end
-       if done then break end
-     end
-   else
-     chars = torch.ones(#words, max_word_l)
-     for i = 1, #words do
-        chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i], start_symbol)
-     end
+   if start_symbol == 1 then
+      table.insert(words, END_WORD)
+   local chars = torch.ones(#words, max_word_l)
+   for i = 1, #words do
+      chars[i] = word2charidx(words[i], char2idx, max_word_l, chars[i])
    end
    return chars, words
 end
@@ -739,7 +502,7 @@ end
 function wordidx2sent(sent, idx2word, source_str, attn, skip_end)
    local t = {}
    if skip_end == nil then skip_end = true end
-   local start_i = 1
+   local start_i, end_i
    local end_i
    if torch.isTensor(sent) then
      end_i = sent:size(1)
@@ -782,24 +545,10 @@ function strip(s)
    return s:gsub("^%s+",""):gsub("%s+$","")
 end
 
-function iterate_tensor(t)
-  assert(torch.isTensor(t), 'non-tensor provided')
-  local i = 0
-  local function f(t, _)
-    if i < t:size(1) then
-      i = i+1
-      return t[i]
-    else
-      return nil
-    end
-  end
-  return f, t, nil
-end
-
 function main()
    -- some globals
    PAD = 1; UNK = 2; START = 3; END = 4
-   PAD_WORD = '<blank>'; UNK_WORD = '<unk>'; START_WORD = '<d>'; END_WORD = '</d>'
+   PAD_WORD = '<blank>'; UNK_WORD = '<unk>'; START_WORD = '<s>'; END_WORD = '</s>'
    START_CHAR = '{'; END_CHAR = '}'
    MAX_SENT_L = opt.max_sent_l
    print('max_sent_l:', MAX_SENT_L)
@@ -843,8 +592,6 @@ function main()
    layers_idx = model_opt.save_idx
    
    assert(opt.src_dict ~= '', 'need dictionary')
-   opt.targ_dict = opt.src_dict
-   opt.char_dict = opt.src_dict
    
    idx2word_src = idx2key(opt.src_dict)
    word2idx_src = flip_table(idx2word_src)
@@ -853,7 +600,7 @@ function main()
    
    -- load character dictionaries if needed
    if model_opt.use_chars_enc == 1 or model_opt.use_chars_dec == 1 then
-      --utf8 = require 'lua-utf8'      
+      utf8 = require 'lua-utf8'      
       char2idx = flip_table(idx2key(opt.char_dict))
       model[1]:apply(get_layer)
    end
@@ -915,44 +662,24 @@ function main()
 
    softmax_layers = {}
    model[2]:apply(get_layer)
-    decoder_attn = model[layers_idx['decoder_attn']]
     decoder_attn:apply(get_layer)
     decoder_softmax = softmax_layers[1]
-    decoder_softmax_words = softmax_layers[2]
-    if model_opt.hierarchical == 0 then
-      assert(decoder_softmax_words == nil)
-    end
     attn_layer = torch.zeros(opt.beam, MAX_SENT_L)      
    
    
-   MAX_WORD_L = model_opt.max_word_l
-   context_proto = torch.zeros(1, MAX_SENT_L, MAX_WORD_L, model_opt.rnn_size)
-   local bow_size
-   if model_opt.bow_encoder_lstm == 1 then
-     bow_size = model_opt.rnn_size
-   else
-     if model_opt.conv_bow == 1 then
-       bow_size = model_opt.num_kernels
-     else
-       bow_size = model_opt.word_vec_size
-     end
-   end
-   context_bow_proto = torch.zeros(1, MAX_SENT_L, bow_size)
+   context_proto = torch.zeros(1, MAX_SENT_L, model_opt.rnn_size)
 
    local h_init_dec = torch.zeros(opt.beam, model_opt.rnn_size)
-   --local h_init_enc = torch.zeros(1, model_opt.rnn_size) 
-   local h_init_enc = torch.zeros(MAX_SENT_L, model_opt.rnn_size) 
+   local h_init_enc = torch.zeros(1, model_opt.rnn_size) 
    if opt.gpuid >= 0 then
       h_init_enc = h_init_enc:cuda()      
       h_init_dec = h_init_dec:cuda()
       cutorch.setDevice(opt.gpuid)
       context_proto = context_proto:cuda()
-      context_bow_proto = context_bow_proto:cuda()
        attn_layer = attn_layer:cuda()
    end
    init_fwd_enc = {}
    init_fwd_dec = {} -- initial context
-   init_fwd_bow_enc = {}
    if model_opt.input_feed == 1 then
       table.insert(init_fwd_dec, h_init_dec:clone())
    end
@@ -962,17 +689,12 @@ function main()
       table.insert(init_fwd_enc, h_init_enc:clone())
       table.insert(init_fwd_dec, h_init_dec:clone()) -- memory cell
       table.insert(init_fwd_dec, h_init_dec:clone()) -- hidden state      
-      if model_opt.bow_encoder_lstm == 1 then
-        table.insert(init_fwd_bow_enc, h_init_enc:clone())
-        table.insert(init_fwd_bow_enc, h_init_enc:clone())
-      end
    end      
      
    pred_score_total = 0
    gold_score_total = 0
    pred_words_total = 0
    gold_words_total = 0
-   total_deficit = 0
    
    State = StateAll
    local sent_id = 0
@@ -1009,7 +731,7 @@ function main()
       end
 
       state = State.initial(START)
-      pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn, attn_list, deficit_list, sentence_attn_list  = generate_beam(model, state, opt.beam, MAX_SENT_L, source, target) -- use attn_list to print attn
+      pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn, attn_list = generate_beam(model, state, opt.beam, MAX_SENT_L, source, target) -- use attn_list to print attn
       pred_score_total = pred_score_total + pred_score
       pred_words_total = pred_words_total + #pred - 1
       pred_sent = wordidx2sent(pred, idx2word_targ, source_str, attn, true)
@@ -1036,15 +758,7 @@ function main()
          end         
       end
       if opt.print_attn == 1 then
-        if opt.sent_attn == 1 then
-          pretty_print(sentence_attn_list)
-        else
-          pretty_print(attn_list)
-        end
-        deficit_list[1] = 0
-        total_deficit = total_deficit + torch.Tensor(deficit_list):sum()
-        --print(deficit_list)
-        --io.read()
+        pretty_print(attn_list)
       end
 
       print('')
@@ -1056,8 +770,8 @@ function main()
                           gold_score_total / gold_words_total,
                           math.exp(-gold_score_total/gold_words_total)))
    end
-   print(string.format("attn deficit: %.4f", total_deficit/pred_words_total))
-   print(string.format("gold entropy: %.4f", ENTROPY / GOLD_SIZE))
+   --print(string.format("attn deficit: %.4f", total_deficit/pred_words_total))
+   --print(string.format("gold entropy: %.4f", ENTROPY / GOLD_SIZE))
    out_file:close()
 end
 main()
