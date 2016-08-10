@@ -378,34 +378,33 @@ function train(train_data, valid_data)
      return new_source[{{1, new_source_l}}], new_source_l
    end
 
+   if opt.reinit_encoder == 1 then
+     params[1]:uniform(-opt.param_init, opt.param_init)
+   end
+   if opt.reinit_decoder == 1 then
+      -- don't reinit attention weights though
+     local p, _ = decoder_attn_layers[1]:parameters()
+
+     local save_params = {}
+     for i = 1, #p do
+       table.insert(save_params, p[i]:clone())
+     end
+     params[2]:uniform(-opt.param_init, opt.param_init)
+    for i = 1, #p do
+      p[i]:copy(save_params[i])
+    end
+  end
+
    if opt.attn_type == 'hard' then
+     -- save stochastic layers
      sampler_layers = {}
      mul_constant_layers = {}
      if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
        sampler_word_layers = {}
      end
-
-     -- save stochastic layers
      for i = 1, opt.max_sent_l_targ do
        decoder_attn_clones[i]:apply(get_RL_layer)
      end
-
-     if opt.reinit_encoder == 1 then
-       params[1]:uniform(-opt.param_init, opt.param_init)
-     end
-     if opt.reinit_decoder == 1 then
-        -- don't reinit attention weights though
-       local p, _ = decoder_attn_layers[1]:parameters()
-
-       local save_params = {}
-       for i = 1, #p do
-         table.insert(save_params, p[i]:clone())
-       end
-       params[2]:uniform(-opt.param_init, opt.param_init)
-      for i = 1, #p do
-        p[i]:copy(save_params[i])
-      end
-    end
 
      if opt.baseline_method == 'average' or opt.baseline_method == 'both' then
        -- baseline should be time dependent on target
@@ -537,7 +536,7 @@ function train(train_data, valid_data)
      local b, b_learned, b_const
      local scale = opt.reward_scale -- default
      if opt.baseline_method == 'learned' then
-       assert(h_state, 'need to pass in hidden state for learned baseline')
+       assert(h_state ~= nil, 'need to pass in hidden state for learned baseline')
        b_learned = baseline_m:forward(h_state):squeeze(2)
        b = b_learned
      elseif opt.baseline_method == 'average' then
@@ -1112,24 +1111,25 @@ function train(train_data, valid_data)
         local shrinkage = opt.max_grad_norm / grad_norm
         for j = 1, #grad_params do
           if j == layers_idx['baseline_m'] and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
+            local idx = layers_idx['baseline_m']
             -- special case
-            local n = grad_params[4]:norm()
+            local n = grad_params[idx]:norm()
             local s = opt.max_grad_norm / n
             if s < 1 then
-              grad_params[4]:mul(s)
+              grad_params[idx]:mul(s)
             end
-            param_norm = param_norm + params[4]:norm()^2
           else
             if shrinkage < 1 then
               grad_params[j]:mul(shrinkage)
             end
-            if opt.adagrad == 1 then
-              adagradStep(params[j], grad_params[j], layer_etas[j], optStates[j])
-            else
-              params[j]:add(grad_params[j]:mul(-opt.learning_rate))
-            end	    
-            param_norm = param_norm + params[j]:norm()^2
           end
+
+          if opt.adagrad == 1 then
+            adagradStep(params[j], grad_params[j], layer_etas[j], optStates[j])
+          else
+            params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+          end	    
+          param_norm = param_norm + params[j]:norm()^2
         end	 
         param_norm = param_norm^0.5
         if opt.brnn == 1 then
@@ -1468,11 +1468,13 @@ function main()
           _, reward_criterion = make_reinforce(valid_data, opt)
         end
         opt.baseline = 0 -- RL average
-        opt.exact_stats = {} -- RL exact stats: \sum x, \sum x^2, n
-        opt.exact_stats['n'] = 0
-        opt.exact_stats['x'] = 0
-        opt.exact_stats['x^2'] = 0
-        -- TODO: allow this to be time dependent
+        if opt.baseline_method == 'exact' then
+          -- TODO: allow this to be time dependent
+          opt.exact_stats = {} -- RL exact stats: \sum x, \sum x^2, n
+          opt.exact_stats['n'] = 0
+          opt.exact_stats['x'] = 0
+          opt.exact_stats['x^2'] = 0
+        end
 
         if opt.moving_variance == 1 then
           opt.reward_variance = 0 -- RL stddev
@@ -1506,25 +1508,29 @@ function main()
       decoder = model[2]:double()      
       generator = model[3]:double()
       decoder_attn = model[4]:double()
-      if model_opt.attn_type == 'hard' and (model_opt.baseline_method == 'learned' or model_opt.baseline_method == 'both') then
-        baseline_m = model[save_idx['baseline_m']]:double()
-      end
       if model_opt.brnn == 1 then
         encoder_bwd = model[save_idx['encoder_bwd']]:double()
       end      
       if model_opt.hierarchical == 1 then
         bow_encoder = model[save_idx['bow_encoder']]:double()
       end
-      if model_opt.attn_type == 'hard' and (model_opt.baseline_method == 'average' or model_opt.baseline_method == 'both') then
-        opt.baseline = model_opt.baseline
+
+      if model_opt.attn_type == 'hard' then
+        if model_opt.baseline_method == 'learned' or model_opt.baseline_method == 'both' then
+          baseline_m = model[save_idx['baseline_m']]:double()
+        end
+        if model_opt.baseline_method == 'average' or model_opt.baseline_method == 'both' then
+          opt.baseline = model_opt.baseline
+        end
+        if model_opt.baseline_method == 'exact' then
+          opt.exact_stats = model_opt.exact_stats
+        end
         if model_opt.moving_variance == 1 then
           opt.moving_variance = 1 
           opt.reward_variance = model_opt.reward_variance
         end
       end
-      if model_opt.attn_type == 'hard' and model_opt.baseline_method == 'exact' then
-        opt.exact_stats = model_opt.exact_stats
-      end
+
       _, criterion = make_generator(valid_data, opt)
       if opt.attn_type == 'hard' then
         _, reward_criterion = make_reinforce(valid_data, opt)
