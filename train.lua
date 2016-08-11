@@ -85,6 +85,7 @@ cmd:option('-num_shards', 0, [[If the training data has been broken up into diff
                              then training files are in this many partitions]])
 cmd:option('-train_from', '', [[If training from a checkpoint then this is the path to the
                                 pretrained model.]])
+cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 
 -- rnn model specs
 cmd:text("")
@@ -1403,6 +1404,20 @@ function get_RL_layer(layer)
    end
 end
 
+function copy_params(targ, src)
+  local targ_params = targ:parameters()
+  local src_params = src:parameters()
+
+  if torch.isTensor(targ_params) then
+    targ_params:copy(src_params) 
+  else
+    -- table
+    for i,p in ipairs(targ_params) do
+      p:copy(src_params[i])
+    end
+  end
+end
+
 function main() 
     -- parse input params
    opt = cmd:parse(arg)
@@ -1445,7 +1460,7 @@ function main()
    print(string.format('Source max sent len: %d', opt.max_word_l))
 
    -- Build model
-   if opt.train_from:len() == 0 then
+   if opt.train_from:len() == 0 or opt.start_soft == 1 then
       encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
       decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
       if opt.hierarchical == 1 then
@@ -1458,6 +1473,36 @@ function main()
         decoder_attn = make_decoder_attn(valid_data, opt)
       end
       generator, criterion = make_generator(valid_data, opt)
+      if opt.brnn == 1 then
+	 encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
+      end      
+
+      if opt.start_soft == 1 then
+        -- Load params
+        assert(path.exists(opt.train_from), 'checkpoint path invalid')
+        print('loading ' .. opt.train_from .. '...')
+        local checkpoint = torch.load(opt.train_from)
+        local model, model_opt = checkpoint[1], checkpoint[2]
+        opt.num_layers = model_opt.num_layers
+        opt.rnn_size = model_opt.rnn_size
+        opt.input_feed = model_opt.input_feed
+        opt.init_dec = model_opt.init_dec
+        opt.brnn = model_opt.brnn
+        opt.hierarchical = model_opt.hierarchical
+
+        -- copy params
+        local save_idx = model_opt.save_idx
+        copy_params(encoder, model[1]:double())
+        copy_params(decoder, model[2]:double())
+        copy_params(generator, model[3]:double())
+        copy_params(decoder_attn, model[4]:double())
+        if model_opt.brnn == 1 then
+          copy_params(encoder_bwd, model[save_idx['encoder_bwd']]:double())
+        end      
+        if model_opt.hierarchical == 1 then
+          copy_params(bow_encoder, model[save_idx['bow_encoder']]:double())
+        end
+      end
 
       if opt.attn_type == 'hard' then
         if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
@@ -1479,13 +1524,12 @@ function main()
           opt.reward_variance = 0 -- RL stddev
         end
       end
-      if opt.brnn == 1 then
-	 encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
-      end      
 
       -- check for word2vec
-      assert(opt.pre_word_vecs_enc ~= '', 'not using word2vec!')
-      opt.pre_word_vecs_dec = opt.pre_word_vecs_enc
+      if opt.train_from == '' then
+        assert(opt.pre_word_vecs_enc ~= '', 'not using word2vec!')
+        opt.pre_word_vecs_dec = opt.pre_word_vecs_enc
+      end
    else
       assert(path.exists(opt.train_from), 'checkpoint path invalid')
       print('loading ' .. opt.train_from .. '...')
@@ -1496,11 +1540,7 @@ function main()
       opt.input_feed = model_opt.input_feed
       opt.init_dec = model_opt.init_dec
       opt.brnn = model_opt.brnn
-
       opt.hierarchical = model_opt.hierarchical
-      opt.attn_type = model_opt.attn_type
-      opt.attn_word_type = model_opt.attn_word_type
-      opt.baseline_method = model_opt.baseline_method
 
       local save_idx = model_opt.save_idx
       encoder = model[1]:double()
