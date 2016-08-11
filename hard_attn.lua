@@ -242,8 +242,7 @@ end
 
 function ReinforceNLLCriterion:update_baseline(b, mask, target)
   -- baseline grad
-  local gradInput = torch.Tensor()
-  gradInput = self.criterion:backward(b, target)
+  local gradInput = self.criterion:backward(b, target)
   gradInput:maskedFill(mask, 0)
 
   return gradInput

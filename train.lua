@@ -181,9 +181,7 @@ function save_checkpoint(savefile)
     idx = idx + 1
   end
   opt.save_idx = save_idx
-  if opt.debug == 0 then
-    torch.save(savefile, {save_table, opt})
-  end
+  torch.save(savefile, {save_table, opt})
 end
 
 function zero_table(t)
@@ -913,7 +911,7 @@ function train(train_data, valid_data)
       local train_score = math.exp(total_loss/total_nonzeros)
       print('Train', train_score)
       print(opt.train_perf)
-      if opt.attn_type == 'hard' and opt.debug == 1 then
+      if opt.attn_type == 'hard' then
         print('baseline:')
         print(opt.baseline)
         if opt.moving_variance == 1 then
