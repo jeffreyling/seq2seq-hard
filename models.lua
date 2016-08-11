@@ -121,14 +121,9 @@ function make_lstm(data, opt, model, use_chars)
     local top_h = outputs[#outputs]
     local decoder_out
     local attn_out
-    if opt.attn == 1 then
-      local decoder_attn = make_decoder_attn(data, opt)
-      decoder_attn.name = 'decoder_attn'
-      decoder_out = decoder_attn({top_h, inputs[2]})
-    else
-      decoder_out = nn.JoinTable(2)({top_h, inputs[2]})
-      decoder_out = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size)(decoder_out))
-    end
+    local decoder_attn = make_decoder_attn(data, opt)
+    decoder_attn.name = 'decoder_attn'
+    decoder_out = decoder_attn({top_h, inputs[2]})
     if dropout > 0 then
       decoder_out = nn.Dropout(dropout, nil, false)(decoder_out)
     end
@@ -149,7 +144,6 @@ function make_decoder_attn(data, opt, simple)
    local target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
    local context = inputs[2]
    simple = simple or 0
-   local dropout = opt.dropout or 0
    -- get attention
 
    local attn = nn.MM()({context, nn.Replicate(1,3)(target_t)}) -- batch_l x source_l x 1

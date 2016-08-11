@@ -74,7 +74,7 @@ cmd:text("")
 
 cmd:option('-num_layers', 2, [[Number of layers in the LSTM encoder/decoder]])
 cmd:option('-rnn_size', 500, [[Size of LSTM hidden states]])
-cmd:option('-word_vec_size', 300, [[Word embedding sizes]])
+cmd:option('-word_vec_size', 500, [[Word embedding sizes]])
 cmd:option('-attn_type', 'hard', [[Hard or soft attention on decoder side]])
 cmd:option('-use_chars_enc', 0, [[If = 1, use character on the encoder
                                   side (instead of word embeddings]])
@@ -167,7 +167,7 @@ opt = cmd:parse(arg)
 torch.manualSeed(opt.seed)
 
 function save_checkpoint(savefile)
-  local save_table = {encoder, decoder, generator, decoder_attn}
+  local save_table = {encoder, decoder, generator}
   local save_idx = {encoder=1, decoder=2, generator=3}
   local idx = 4
   if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
@@ -295,6 +295,7 @@ function train(train_data, valid_data)
      -- save stochastic layers
      sampler_layers = {}
      mul_constant_layers = {}
+     decoder_attn_layers = {}
      for i = 1, opt.max_sent_l_targ do
        decoder_clones[i]:apply(get_RL_layer)
        decoder_attn_layers[i]:apply(get_RL_layer)
@@ -331,6 +332,7 @@ function train(train_data, valid_data)
    if opt.input_feed == 1 then
       table.insert(init_fwd_dec, h_init:clone())
    end
+   table.insert(init_bwd_dec, h_init:clone()) -- context
    
    for L = 1, opt.num_layers do
       table.insert(init_fwd_enc, h_init:clone())
@@ -702,6 +704,7 @@ function train(train_data, valid_data)
             loss = loss + criterion:forward(pred, target_out[t])/batch_l
             local dl_dpred = criterion:backward(pred, target_out[t])
             dl_dpred:div(batch_l)
+            local dl_dtarget = generator:backward(preds[t], dl_dpred)
             drnn_state_dec[#drnn_state_dec]:add(dl_dtarget)
             local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
@@ -1089,7 +1092,6 @@ function main()
 
       if opt.attn_type == 'hard' then
         if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
-          print('using learned baseline method')
           baseline_m, reward_criterion = make_reinforce(valid_data, opt)
         else
           _, reward_criterion = make_reinforce(valid_data, opt)
@@ -1134,7 +1136,6 @@ function main()
       encoder = model[1]:double()
       decoder = model[2]:double()      
       generator = model[3]:double()
-      decoder_attn = model[4]:double()
       if model_opt.brnn == 1 then
         encoder_bwd = model[save_idx['encoder_bwd']]:double()
       end      
