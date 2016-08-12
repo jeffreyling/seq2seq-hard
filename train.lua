@@ -299,7 +299,9 @@ function train(train_data, valid_data)
      if opt.no_bow == 1 then
        encoder_bow_lstm_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.rnn_size)
      else
-       encoder_bow_lstm_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.word_vec_size)
+       local sz
+       if opt.conv_bow == 1 then sz = opt.num_kernels else sz = opt.word_vec_size end
+       encoder_bow_lstm_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, sz)
      end
    else
      if opt.conv_bow == 1 then
@@ -332,8 +334,8 @@ function train(train_data, valid_data)
          encoder_bwd_clones[i]:apply(function(m) m:setReuse() end)
       end      
    end
-   for i = 1, opt.max_sent_l_src do
-      if (opt.hierarchical == 1) and (opt.bow_encoder_lstm == 1) then
+   if (opt.hierarchical == 1) and (opt.bow_encoder_lstm == 1) then
+      for i = 1, opt.max_sent_l_src do
         bow_encoder_lstm_clones[i]:apply(function(m) m:setReuse() end)
       end
    end
@@ -752,7 +754,7 @@ function train(train_data, valid_data)
             rnn_states = masked_selecter:forward({context, rnn_state_mask})
           end
           if opt.hierarchical == 1 then
-            if opt.no_bow ~= 1 then
+            if opt.no_bow == 0 then
               bow_encoder:training()
               bow_out = bow_encoder:forward(source:permute(2,3,1):contiguous())
             end

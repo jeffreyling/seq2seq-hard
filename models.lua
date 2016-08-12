@@ -120,7 +120,11 @@ function make_lstm_bow(data, opt)
    if opt.no_bow == 1 then
      input_size = opt.rnn_size
    else
-     input_size = opt.word_vec_size
+     if opt.conv_bow == 1 then
+       input_size = opt.num_kernels
+     else
+       input_size = opt.word_vec_size
+     end
    end
    local offset = 0
   -- there will be 2*n+3 inputs

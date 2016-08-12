@@ -569,8 +569,14 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
 
       end      
       if opt.print_gold_attn == 1 then
-        -- sentence attn
-        pretty_print(gold_sentence_attn_list)
+        print('ATTNGOLD')
+        if opt.sent_attn == 1 then
+          -- sentence attn
+          pretty_print(gold_sentence_attn_list)
+        else
+          pretty_print(gold_attn_list)
+        end
+
         for j = 2, #gold_sentence_attn_list do
           local p = gold_sentence_attn_list[j]
           ENTROPY = ENTROPY + p:cmul(torch.log(p + 1e-8)):sum()
@@ -982,10 +988,11 @@ function main()
    for _,line in ipairs(src_sents) do
       sent_id = sent_id + 1
 
+      local source, source_str
+      local target, target_str
       if opt.src_hdf5 == '' then 
         line = clean_sent(line)      
         print('SENT ' .. sent_id .. ': ' ..line)
-        local source, source_str
         if model_opt.use_chars_enc == 0 then
            source, source_str = sent2wordidx(line, word2idx_src, model_opt.start_symbol)
         else
@@ -1036,6 +1043,7 @@ function main()
          end         
       end
       if opt.print_attn == 1 then
+        print('ATTNSENT')
         if opt.sent_attn == 1 then
           pretty_print(sentence_attn_list)
         else
