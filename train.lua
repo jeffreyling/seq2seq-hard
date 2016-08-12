@@ -729,7 +729,7 @@ function train(train_data, valid_data)
           local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
           if opt.init_dec == 1 then
             for L = 1, opt.num_layers do
-              drnn_state_enc[L*2-1]:copy(drnn_state_enc[L*2-1])
+              drnn_state_enc[L*2-1]:copy(drnn_state_dec[L*2-1])
               drnn_state_enc[L*2]:copy(drnn_state_dec[L*2])
             end	    
           end
