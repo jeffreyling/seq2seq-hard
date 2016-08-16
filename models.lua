@@ -263,7 +263,7 @@ function make_decoder_attn(data, opt, simple)
 
    -- sample (hard attention)
    if opt.attn_type == 'hard' then
-     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale)
+     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling)
      sampler.name = 'sampler'
      attn = sampler(attn) -- one hot
    end
@@ -333,7 +333,7 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    attn1 = softmax_attn1(attn1) -- batch_l x source_l
    if opt.attn_type == 'hard' then
      -- sample (hard attention)
-     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale)
+     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling)
      sampler.name = 'sampler'
      attn1 = sampler(attn1) -- one hot
    end
@@ -352,7 +352,7 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    attn2 = softmax_attn2(attn2)
    if opt.attn_word_type == 'hard' then
      -- word level sampling
-     local sampler_word = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale)
+     local sampler_word = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling)
      sampler_word.name = 'sampler_word'
      attn2 = sampler_word(attn2) -- one hot
    end

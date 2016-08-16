@@ -88,10 +88,11 @@ end
 ------------------------------------------------------------------------
 local ReinforceCategorical, parent = torch.class("nn.ReinforceCategorical", "nn.Reinforce")
 
-function ReinforceCategorical:__init(semi_sampling_p, entropy_scale)
+function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, multisampling)
   parent.__init(self)
   self.semi_sampling_p = semi_sampling_p or 0
   self.entropy_scale = entropy_scale or 0
+  self.multisampling = multisampling or 0
   self.through = false -- pass prob weights through
 
   self.time_step = 0
@@ -101,14 +102,18 @@ end
 
 function ReinforceCategorical:_doArgmax(input)
    _, self._index = input:max(2)
-   self._input = input:clone()
-   self._input:scatter(2, self._index, 0)
-   _, self._index2 = self._input:max(2)
 
    self.output:zero()
-   -- seems sketch...
-   self.output:scatter(2, self._index, 0.5)
-   self.output:scatter(2, self._index2, 0.5)
+   if self.multisampling == 1 then
+     self._input = input:clone()
+     self._input:scatter(2, self._index, 0)
+     _, self._index2 = self._input:max(2)
+     -- seems sketch...
+     self.output:scatter(2, self._index, 0.5)
+     self.output:scatter(2, self._index2, 0.5)
+   else
+     self.output:scatter(2, self._index, 1)
+   end
 end
 
 function ReinforceCategorical:_doSample(input)
@@ -122,14 +127,21 @@ function ReinforceCategorical:_doSample(input)
       -- prevent division by zero error (see updateGradInput)
       self._input:resizeAs(input):copy(input):add(0.00000001) 
 
-      -- sample twice
-      input.multinomial(self._index, input, 2, true)
-      -- one hot encoding
-      self.output:zero()
-      self._output:resizeAs(self.output):zero()
-      self.output:scatter(2, self._index:narrow(2,1,1), 0.5)
-      self._output:scatter(2, self._index:narrow(2,2,1), 0.5)
-      self.output:add(self._output)
+      if self.multisampling == 1 then
+        -- sample twice
+        input.multinomial(self._index, input, 2, true)
+        -- one hot encoding
+        self.output:zero()
+        self._output:resizeAs(self.output):zero()
+        self.output:scatter(2, self._index:narrow(2,1,1), 0.5)
+        self._output:scatter(2, self._index:narrow(2,2,1), 0.5)
+        self.output:add(self._output)
+      else
+        input.multinomial(self._index, input, 1)
+        -- one hot encoding
+        self.output:zero()
+        self.output:scatter(2, self._index, 1)
+      end
    end
 end
 
