@@ -9,6 +9,7 @@ require 'model_utils.lua'
 
 cmd = torch.CmdLine()
 
+cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-denoise', 0, [[Denoising autoencoder p]])
 cmd:option('-no_pad', 0, [[Single block of document as image]])
 cmd:option('-concat_doc_bow', 0, [[Concat document BOW to each word representation]])
@@ -85,7 +86,6 @@ cmd:option('-num_shards', 0, [[If the training data has been broken up into diff
                              then training files are in this many partitions]])
 cmd:option('-train_from', '', [[If training from a checkpoint then this is the path to the
                                 pretrained model.]])
-cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 
 -- rnn model specs
 cmd:text("")

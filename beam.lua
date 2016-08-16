@@ -17,12 +17,11 @@ cmd = torch.CmdLine()
 
 -- check attn options
 cmd:option('-view_attn', 0, [[View attention weights at each time step]])
-cmd:option('-print_attn', 0, [[Print attention weights]])
-cmd:option('-sent_attn', 0, [[Print sentence attention instead of all attn]])
-cmd:option('-print_gold_attn', 0, [[Print attention weights for gold]])
+cmd:option('-print_attn', 1, [[Print attention weights]])
+cmd:option('-print_sent_attn', 1, [[Print sentence attention instead of all attn]])
 
 cmd:option('-no_pad', 0, [[No pad format for data]])
-cmd:option('-no_pad_sent_l', 5, [[Number of `sentences` we have for a doc]])
+cmd:option('-no_pad_sent_l', 10, [[Number of `sentences` we have for a doc]])
 cmd:option('-repeat_words', 0, [[Repeat words format for data]])
 
 -- file location
@@ -420,6 +419,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                     attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
                  else
                     local pre_attn = decoder_softmax.output:reshape(K, source_sent_l, source_char_l)[prev_k]:clone()
+                    local row_attn = pre_attn:sum(2):squeeze(2)
                     local result
                     for r = 1, source_sent_l do
                       local cur
@@ -433,6 +433,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                       end
                     end
                     attn_list[i][k] = State.advance(attn_list[i-1][prev_k], result)
+                    sentence_attn_list[i][k] = State.advance(sentence_attn_list[i-1][prev_k], row_attn)
                     deficit_list[i][k] = State.advance(deficit_list[i-1][prev_k], 1-result:sum())
                     max_attn, max_index = result:max(1)
                     attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
@@ -454,9 +455,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
        end_score = scores[i][1]
         end_attn_argmax = attn_argmax[i][1]
        end_attn_list = attn_list[i][1]
-       if model_opt.hierarchical == 1 then
-         end_sentence_attn_list = sentence_attn_list[i][1]
-       end
+       end_sentence_attn_list = sentence_attn_list[i][1]
        end_deficit_list = deficit_list[i][1]
        if end_hyp[#end_hyp] == END then
           done = true
@@ -514,7 +513,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
            decoder_attn_input = {out_decoder[#out_decoder], context[{{1}}]}
          end
          local attn_out = model[layers_idx['decoder_attn']]:forward(decoder_attn_input)
-         if opt.print_gold_attn == 1 then
+         if opt.print_attn == 1 then
              gold_sentence_attn_list[t] = {}
              gold_attn_list[t] = {}
              if model_opt.hierarchical == 1 then
@@ -568,13 +567,13 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
          gold_score = gold_score + out[1][gold[t]]
 
       end      
-      if opt.print_gold_attn == 1 then
-        print('ATTNGOLD')
-        if opt.sent_attn == 1 then
+      if opt.print_attn == 1 then
+        print('ATTN GOLD')
+        pretty_print(gold_attn_list)
+        if opt.print_sent_attn == 1 then
           -- sentence attn
+          print('ATTN LEVEL GOLD')
           pretty_print(gold_sentence_attn_list)
-        else
-          pretty_print(gold_attn_list)
         end
 
         for j = 2, #gold_sentence_attn_list do
@@ -1043,11 +1042,11 @@ function main()
          end         
       end
       if opt.print_attn == 1 then
-        print('ATTNSENT')
-        if opt.sent_attn == 1 then
+        print('ATTN PRED')
+        pretty_print(attn_list)
+        if opt.print_sent_attn == 1 then
+          print('ATTN LEVEL PRED')
           pretty_print(sentence_attn_list)
-        else
-          pretty_print(attn_list)
         end
         deficit_list[1] = 0
         total_deficit = total_deficit + torch.Tensor(deficit_list):sum()
