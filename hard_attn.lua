@@ -101,8 +101,14 @@ end
 
 function ReinforceCategorical:_doArgmax(input)
    _, self._index = input:max(2)
+   self._input = input:clone()
+   self._input:scatter(2, self._index, 0)
+   _, self._index2 = self._input:max(2)
+
    self.output:zero()
-   self.output:scatter(2, self._index, 1)
+   -- seems sketch...
+   self.output:scatter(2, self._index, 0.5)
+   self.output:scatter(2, self._index2, 0.5)
 end
 
 function ReinforceCategorical:_doSample(input)
