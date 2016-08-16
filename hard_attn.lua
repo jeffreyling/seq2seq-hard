@@ -96,6 +96,7 @@ function ReinforceCategorical:__init(semi_sampling_p, entropy_scale)
 
   self.time_step = 0
   self.oracle = false -- stupid hack
+  self._output = torch.Tensor()
 end
 
 function ReinforceCategorical:_doArgmax(input)
@@ -114,10 +115,15 @@ function ReinforceCategorical:_doSample(input)
       self._input = self._input or input.new()
       -- prevent division by zero error (see updateGradInput)
       self._input:resizeAs(input):copy(input):add(0.00000001) 
-      input.multinomial(self._index, input, 1)
+
+      -- sample twice
+      input.multinomial(self._index, input, 2, true)
       -- one hot encoding
       self.output:zero()
-      self.output:scatter(2, self._index, 1)
+      self._output:resizeAs(self.output):zero()
+      self.output:scatter(2, self._index:narrow(2,1,1), 0.5)
+      self._output:scatter(2, self._index:narrow(2,2,1), 0.5)
+      self.output:add(self._output)
    end
 end
 
@@ -160,6 +166,7 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      self.gradInput:copy(gradOutput)
    else 
      self.gradInput:copy(self.output)
+     self.gradInput:mul(2) -- 2 samples
      self._input = self._input or input.new()
      -- prevent division by zero error
      self._input:resizeAs(input):copy(input):add(0.00000001) 
