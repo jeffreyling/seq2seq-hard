@@ -88,11 +88,13 @@ end
 ------------------------------------------------------------------------
 local ReinforceCategorical, parent = torch.class("nn.ReinforceCategorical", "nn.Reinforce")
 
-function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, multisampling)
+function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, multisampling, with_replace, uniform_attn)
   parent.__init(self)
   self.semi_sampling_p = semi_sampling_p or 0
   self.entropy_scale = entropy_scale or 0
   self.multisampling = multisampling or 0
+  self.with_replace = with_replace or 1
+  self.uniform_attn = uniform_attn or 1
   self.through = false -- pass prob weights through
 
   self.time_step = 0
@@ -100,17 +102,22 @@ function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, multisampli
 end
 
 function ReinforceCategorical:_doArgmax(input)
-   _, self._index = input:max(2)
-
    self.output:zero()
-   if self.multisampling == 1 then
-     self._input = input:clone()
-     self._input:scatter(2, self._index, 0)
-     _, self._index2 = self._input:max(2)
-     -- seems sketch...
-     self.output:scatter(2, self._index, 0.5)
-     self.output:scatter(2, self._index2, 0.5)
+   if self.multisampling > 0 then
+     -- take top k attention weights
+     _, self._index = input:topk(self.multisampling, 2, true) -- true for max
+
+     if self.uniform_attn == 1 then
+       self.output:scatter(2, self._index, 1/self.multisampling)
+     else
+       local mask = self.output:byte():zero()
+       mask:scatter(2, self._index, 1)
+       self.output:maskedCopy(mask, input[mask])
+       -- normalize
+       self.output:cdiv(self.output:sum(2):expandAs(self.output))
+     end
    else
+     _, self._index = input:max(2)
      self.output:scatter(2, self._index, 1)
    end
 end
@@ -126,16 +133,24 @@ function ReinforceCategorical:_doSample(input)
       -- prevent division by zero error (see updateGradInput)
       self._input:resizeAs(input):copy(input):add(0.00000001) 
 
-      if self.multisampling == 1 then
-        -- sample twice
-        input.multinomial(self._index, input, 2, true)
-        -- one hot encoding
+      if self.multisampling > 0 then
+        -- sample k times
+        if self.with_replace == 1 then
+          input.multinomial(self._index, input, self.multisampling, true)
+        else
+          assert(false, 'fix policy gradient first')
+          input.multinomial(self._index, input, self.multisampling, false)
+        end
+
         self.output:zero()
+        -- TODO: undesirable loop...
         self._output = self._output or self.output.new()
-        self._output:resizeAs(self.output):zero()
-        self.output:scatter(2, self._index:narrow(2,1,1), 0.5)
-        self._output:scatter(2, self._index:narrow(2,2,1), 0.5)
-        self.output:add(self._output)
+        self._output:resizeAs(self.output)
+        for i = 1, self.multisampling do
+          self._output:zero()
+          self._output:scatter(2, self._index:narrow(2,i,1), 1/self.multisampling)
+          self.output:add(self._output)
+        end
       else
         input.multinomial(self._index, input, 1)
         -- one hot encoding
@@ -185,7 +200,7 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
    else 
      self.gradInput:copy(self.output)
      if self.multisampling == 1 then
-       self.gradInput:mul(2) -- 2 samples
+       self.gradInput:mul(self.multisampling) -- k samples
      end
      self._input = self._input or input.new()
      -- prevent division by zero error

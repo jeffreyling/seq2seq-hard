@@ -9,7 +9,10 @@ require 'model_utils.lua'
 
 cmd = torch.CmdLine()
 
-cmd:option('-multisampling', 0, [[In ReinforceCategorical do 2 samples instead of 1]])
+cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
+cmd:option('-with_replace', 1, [[With replacement for multisampling]])
+cmd:option('-uniform_attn', 1, [[Uniform attention instead of scaling]])
+
 cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-denoise', 0, [[Denoising autoencoder p]])
 cmd:option('-no_pad', 0, [[Single block of document as image]])
