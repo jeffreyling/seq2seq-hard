@@ -105,14 +105,12 @@ function ReinforceCategorical:_doArgmax(input)
    self.output:zero()
    if self.multisampling > 0 then
      -- take top k attention weights
-     _, self._index = input:topk(self.multisampling, 2, true) -- true for max
+     self._vals, self._index = input:topk(self.multisampling, 2, true) -- true for max
 
      if self.uniform_attn == 1 then
        self.output:scatter(2, self._index, 1/self.multisampling)
      else
-       local mask = self.output:byte():zero()
-       mask:scatter(2, self._index, 1)
-       self.output:maskedCopy(mask, input[mask])
+       self.output:scatter(2, self._index, self._vals)
        -- normalize
        self.output:cdiv(self.output:sum(2):expandAs(self.output))
      end

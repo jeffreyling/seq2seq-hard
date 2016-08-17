@@ -1219,6 +1219,7 @@ function train(train_data, valid_data)
         end
       end
       opt.train_perf[#opt.train_perf + 1] = train_score
+
       local score = eval(valid_data)
       opt.val_perf[#opt.val_perf + 1] = score
       if opt.adagrad == 0 then --unncessary with adagrad
@@ -1611,8 +1612,11 @@ function main()
      assert(opt.cudnn == 1, 'use cudnn!')
      print('using convolution instead of bag of words')
    end
-   if opt.multisampling == 1 then
-     print('sampling attn twice instead of once')
+   if opt.multisampling > 0 then
+     assert(opt.multisampling > 1)
+     print(string.format('sampling attn %d instead of once', opt.multisampling))
+     print('with replace =', opt.with_replace)
+     print('uniform attn =', opt.uniform_attn)
    end
 
    layers = {encoder, decoder, generator, decoder_attn}
