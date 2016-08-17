@@ -131,6 +131,7 @@ function ReinforceCategorical:_doSample(input)
         input.multinomial(self._index, input, 2, true)
         -- one hot encoding
         self.output:zero()
+        self._output = self._output or self.output.new()
         self._output:resizeAs(self.output):zero()
         self.output:scatter(2, self._index:narrow(2,1,1), 0.5)
         self._output:scatter(2, self._index:narrow(2,2,1), 0.5)
@@ -268,8 +269,7 @@ end
 
 function ReinforceNLLCriterion:update_baseline(b, mask, target)
   -- baseline grad
-  local gradInput = torch.Tensor()
-  gradInput = self.criterion:backward(b, target)
+  local gradInput = self.criterion:backward(b, target)
   gradInput:maskedFill(mask, 0)
 
   return gradInput
@@ -285,7 +285,7 @@ end
 
 function variance_reduce(reward, b, scale, mask)
    -- subtract baseline
-   local vrReward = reward:clone()
+   local vrReward = reward
    if type(b) == 'number' then
      vrReward:add(-b)
    else

@@ -687,7 +687,6 @@ function train(train_data, valid_data)
           -- denoising autoencoder
           source, source_char_l = denoise(source, source_l, source_char_l, batch_l, opt.denoise)
         end
-        local pad_mask = source:eq(1) -- padding
         local source_sent_l = source:ne(1):sum(1):squeeze(1) -- batch_l x source_l
         source_sent_l[source_sent_l:eq(0)]:fill(1)
 
@@ -736,7 +735,8 @@ function train(train_data, valid_data)
 
             -- mask out padding on encoder
             if opt.mask_padding == 1 then
-              local cur_mask = pad_mask[t]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+              local cur_mask = source[t]:eq(1)
+              cur_mask = cur_mask:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
               for L = 1, opt.num_layers do
                 out[L*2-1]:maskedFill(cur_mask, 0)
                 out[L*2]:maskedFill(cur_mask, 0)
@@ -1007,7 +1007,8 @@ function train(train_data, valid_data)
 
             if opt.mask_padding == 1 then
               if t < source_char_l then
-                local cur_mask = pad_mask[t+1]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+                local cur_mask = source[t+1]:eq(1)
+                cur_mask = cur_mask:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
                 for L = 1, opt.num_layers do
                   drnn_state_enc[L*2-1]:maskedFill(cur_mask, 0)
                   drnn_state_enc[L*2]:maskedFill(cur_mask, 0)
@@ -1018,7 +1019,8 @@ function train(train_data, valid_data)
             -- attn grads
             drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},{},t}])
             if opt.mask_padding == 1 then
-              local cur_mask = pad_mask[t]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+              local cur_mask = source[t]:eq(1)
+              cur_mask = cur_mask:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
               drnn_state_enc[#drnn_state_enc]:maskedFill(cur_mask, 0)
             end
 
@@ -1253,7 +1255,6 @@ function train(train_data, valid_data)
       local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
       local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
       local source_char_l = d[9]
-      local pad_mask = source:eq(1) -- padding
       local rnn_state_enc = reset_state(init_fwd_enc, batch_l*source_l)
       local context = context_proto[{{1, batch_l}, {1, source_l}, {1, source_char_l}}]
       local context_bow = context_bow_proto[{{1, batch_l}, {1, source_l}}]
@@ -1279,7 +1280,8 @@ function train(train_data, valid_data)
         local out = encoder_clones[1]:forward(encoder_input)
 
         if opt.mask_padding == 1 then
-          local cur_mask = pad_mask[t]:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+          local cur_mask = source[t]:eq(1)
+          cur_mask = cur_mask:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
           for L = 1, opt.num_layers do
             out[L*2-1]:maskedFill(cur_mask, 0)
             out[L*2]:maskedFill(cur_mask, 0)
@@ -1605,6 +1607,9 @@ function main()
    if opt.conv_bow == 1 then
      assert(opt.cudnn == 1, 'use cudnn!')
      print('using convolution instead of bag of words')
+   end
+   if opt.multisampling == 1 then
+     print('sampling attn twice instead of once')
    end
 
    layers = {encoder, decoder, generator, decoder_attn}
