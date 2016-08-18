@@ -11,7 +11,7 @@ cmd = torch.CmdLine()
 
 cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
 cmd:option('-with_replace', 1, [[With replacement for multisampling]])
-cmd:option('-uniform_attn', 1, [[Uniform attention instead of scaling]])
+cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
 
 cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-denoise', 0, [[Denoising autoencoder p]])
@@ -690,7 +690,7 @@ function train(train_data, valid_data)
           -- denoising autoencoder
           source, source_char_l = denoise(source, source_l, source_char_l, batch_l, opt.denoise)
         end
-        local source_sent_l = source:ne(1):sum(1):squeeze(1) -- batch_l x source_l
+        local source_sent_l = source:ne(1):sum(1):cuda():squeeze(1) -- batch_l x source_l
         source_sent_l[source_sent_l:eq(0)]:fill(1)
 
         local loss = 0 -- added by Jeffrey
@@ -1266,7 +1266,7 @@ function train(train_data, valid_data)
       if opt.hierarchical == 1 and opt.bow_encoder_lstm == 1 then
         rnn_state_bow_enc = reset_state(init_fwd_bow_enc, batch_l)
       end
-      local source_sent_l = source:ne(1):sum(1):squeeze(1) -- batch_l x source_l
+      local source_sent_l = source:ne(1):sum(1):cuda():squeeze(1) -- batch_l x source_l
       local rnn_state_mask
       if opt.no_bow == 1 then
         rnn_state_mask = torch.zeros(batch_l, source_l, source_char_l, opt.rnn_size):byte():cuda()
