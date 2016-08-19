@@ -730,26 +730,6 @@ function train(train_data, valid_data)
             cutorch.setDevice(opt.gpuid)
           end	 
 
-          -- forward prop encoder
-          for t = 1, source_char_l do
-            encoder_clones[t]:training()
-            local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
-            local out = encoder_clones[t]:forward(encoder_input)
-
-            -- mask out padding on encoder
-            if opt.mask_padding == 1 then
-              local cur_mask = source[t]:eq(1)
-              cur_mask = cur_mask:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
-              for L = 1, opt.num_layers do
-                out[L*2-1]:maskedFill(cur_mask, 0)
-                out[L*2]:maskedFill(cur_mask, 0)
-              end
-            end
-              
-            rnn_state_enc[t] = out
-            context[{{},{},t}]:copy(out[#out]:view(batch_l, source_l, opt.rnn_size))
-          end
-
           -- forward prop encoder bow
           local bow_out
           local rnn_states
@@ -781,6 +761,27 @@ function train(train_data, valid_data)
               context_bow:copy(bow_out)
             end
           end
+
+          -- forward prop encoder
+          for t = 1, source_char_l do
+            encoder_clones[t]:training()
+            local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+            local out = encoder_clones[t]:forward(encoder_input)
+
+            -- mask out padding on encoder
+            if opt.mask_padding == 1 then
+              local cur_mask = source[t]:eq(1)
+              cur_mask = cur_mask:view(batch_l*source_l, 1):expand(batch_l*source_l, opt.rnn_size)
+              for L = 1, opt.num_layers do
+                out[L*2-1]:maskedFill(cur_mask, 0)
+                out[L*2]:maskedFill(cur_mask, 0)
+              end
+            end
+              
+            rnn_state_enc[t] = out
+            context[{{},{},t}]:copy(out[#out]:view(batch_l, source_l, opt.rnn_size))
+          end
+
           if i % opt.print_batch == 0 then
             print(source:narrow(1,1,10))
             print(source_char_l)

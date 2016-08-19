@@ -3,10 +3,9 @@ require 'string'
 require 'hdf5'
 require 'nngraph'
 
-require 'models.lua'
 require 'data.lua'
+require 'models.lua'
 require 'util.lua'
-require 'hard_attn'
 
 ENTROPY = 0
 GOLD_SIZE = 0
@@ -202,7 +201,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       source_input = source:view(source_char_l, 1)
    end
    local pad_mask = source_input:eq(1)
-   local source_lens = source_input:ne(1):sum(1):squeeze(1)
+   local source_lens = source_input:ne(1):sum(1):cuda():squeeze(1)
    --source_lens[source_lens:eq(0)]:fill(1) -- prevent indexing 0
    local rnn_state_mask
    if model_opt.no_bow == 1 then
