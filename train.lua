@@ -16,7 +16,6 @@ cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
 cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-denoise', 0, [[Denoising autoencoder p]])
 cmd:option('-no_pad', 0, [[Single block of document as image]])
-cmd:option('-concat_doc_bow', 0, [[Concat document BOW to each word representation]])
 cmd:option('-conv_bow', 0, [[Use convolution instead of summing bag of words]])
 cmd:option('-no_bow', 0, [[Use LSTM instead of BOW encoder]])
 cmd:option('-bow_encoder_lstm', 0, [[LSTM over sentence BOW]])
@@ -313,9 +312,6 @@ function train(train_data, valid_data)
      else
        bow_size = opt.word_vec_size
      end
-   end
-   if opt.concat_doc_bow == 1 then
-     bow_size = bow_size + opt.word_vec_size
    end
    local encoder_bow_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, bow_size)
    context_bow_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, bow_size)

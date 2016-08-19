@@ -215,11 +215,6 @@ function make_bow_encoder(data, opt)
     -- bag of words
     output = nn.Sum(3)(embeds) -- batch_l x source_l x word_vec_size
   end
-  if opt.concat_doc_bow == 1 then
-    local doc_bow = nn.Sum(2)(nn.Sum(2)(embeds)) -- batch_l x word_vec_size
-    doc_bow = nn.ReplicateAs(2,2)({doc_bow, input}) -- batch_l x source_l x word_vec_size
-    output = nn.JoinTable(3)({output, doc_bow}) -- batch_l x source_l x {word_vec_size,num_kernels}+word_vec_size
-  end
   if opt.bow_encoder_lstm == 1 then
     -- make output suitable for LSTM
     output = nn.Transpose({1,2})(output) -- source_l x batch_l x {word_vec_size,num_kernels}
