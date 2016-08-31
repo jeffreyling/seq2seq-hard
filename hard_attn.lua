@@ -206,7 +206,7 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      self.gradInput:copy(gradOutput)
    else 
      self.gradInput:copy(self.output)
-     if self.multisampling == 1 then
+     if self.multisampling > 0 then
        self.gradInput:mul(self.multisampling) -- k samples
      end
      self._input = self._input or input.new()
