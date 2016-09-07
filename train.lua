@@ -175,6 +175,7 @@ cmd:option('-cudnn', 0, [[Whether to use cudnn or not for convolutions (for the 
 cmd:option('-save_every', 1, [[Save every this many epochs]])
 cmd:option('-print_every', 50, [[Print stats after this many batches]])
 cmd:option('-seed', 3435, [[Seed for random initialization]])
+cmd:option('-prealloc', 1, [[Use memory preallocation and sharing between cloned encoder/decoders]])
 
 cmd:text("")
 cmd:text("Options for hard attention")
@@ -329,9 +330,11 @@ function train(train_data, valid_data)
    for i = 1, max_word_l_sz do
       if encoder_clones[i].apply then
          encoder_clones[i]:apply(function(m) m:setReuse() end)
+         if opt.prealloc == 1 then encoder_clones[i]:apply(function(m) m:setPrealloc() end) end
       end
       if opt.brnn == 1 then
          encoder_bwd_clones[i]:apply(function(m) m:setReuse() end)
+         if opt.prealloc == 1 then encoder_bwd_clones[i]:apply(function(m) m:setPrealloc() end) end
       end      
    end
    if (opt.hierarchical == 1) and (opt.bow_encoder_lstm == 1) then
@@ -342,6 +345,10 @@ function train(train_data, valid_data)
    for i = 1, opt.max_sent_l_targ do
       if decoder_clones[i].apply then
          decoder_clones[i]:apply(function(m) m:setReuse() end)
+         if opt.prealloc == 1 then decoder_clones[i]:apply(function(m) m:setPrealloc() end) end
+      end
+      if decoder_attn_clones[i].apply then
+         if opt.prealloc == 1 then decoder_attn_clones[i]:apply(function(m) m:setPrealloc() end) end
       end
    end   
 
@@ -526,7 +533,10 @@ function train(train_data, valid_data)
 	 end
       end
       if start_decay == 1 then
-	 opt.learning_rate = opt.learning_rate * opt.lr_decay
+         for j = 1, #layer_etas do
+           layer_etas[j] = layer_etas[j] * opt.lr_decay
+         end
+	 --opt.learning_rate = opt.learning_rate * opt.lr_decay
       end
    end   
 
@@ -1132,7 +1142,8 @@ function train(train_data, valid_data)
           if opt.adagrad == 1 then
             adagradStep(params[j], grad_params[j], layer_etas[j], optStates[j])
           else
-            params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+            --params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+            params[j]:add(grad_params[j]:mul(-layer_etas[j]))
           end	    
           param_norm = param_norm + params[j]:norm()^2
         end	 
@@ -1465,6 +1476,8 @@ function main()
 		       valid_data.source:size(2), valid_data.target:size(2)))   
    print(string.format('Source max sent len: %d', opt.max_word_l))
 
+   preallocateMemory(opt.prealloc)
+
    -- Build model
    if opt.train_from:len() == 0 or opt.start_soft == 1 then
       encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
@@ -1640,14 +1653,19 @@ function main()
       idx = idx + 1
    end
 
-   if opt.adagrad == 1 then
-      layer_etas = {}
-      optStates = {}
-      for i = 1, #layers do
-	 layer_etas[i] = opt.learning_rate
-	 optStates[i] = {}
-      end     
+   layer_etas = {} -- different learning rates
+   layer_etas[1] = opt.learning_rate / 10 -- encoder
+   for i = 2, #layers do
+     layer_etas[i] = opt.learning_rate
    end
+   --if opt.adagrad == 1 then
+      --layer_etas = {}
+      --optStates = {}
+      --for i = 1, #layers do
+	 --layer_etas[i] = opt.learning_rate
+	 --optStates[i] = {}
+      --end     
+   --end
 
    if opt.gpuid >= 0 then
       for i = 1, #layers do	 

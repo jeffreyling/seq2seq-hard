@@ -17,6 +17,7 @@ function make_lstm(data, opt, model, use_chars)
    local dropout = opt.dropout or 0
    local n = opt.num_layers
    local rnn_size = opt.rnn_size
+   local RnnD = {opt.rnn_size, opt.rnn_size}
    local input_size = opt.word_vec_size
    local offset = 0
   -- there will be 2*n+3 inputs
@@ -36,6 +37,7 @@ function make_lstm(data, opt, model, use_chars)
    local x, input_size_L
    local outputs = {}
   for L = 1,n do
+    local nameL = model..'_L'..L..'_'
      -- c,h from previous timesteps
     local prev_c = inputs[L*2+offset]    
     local prev_h = inputs[L*2+1+offset]
@@ -66,7 +68,9 @@ function make_lstm(data, opt, model, use_chars)
        input_size_L = input_size
        if model == 'dec' then
           if opt.input_feed == 1 then
-             x = nn.JoinTable(2)({x, inputs[1+offset]}) -- batch_size x (word_vec_size + rnn_size)
+             x = nn.JoinTable(2):usePrealloc("dec_inputfeed_join", 
+                 {{opt.max_batch_l, opt.word_vec_size},{opt.max_batch_l, opt.rnn_size}})
+                 ({x, inputs[1+offset]}) -- batch_size x (word_vec_size + rnn_size)
              input_size_L = input_size + rnn_size
           end	  
        end
@@ -82,29 +86,38 @@ function make_lstm(data, opt, model, use_chars)
 		--x = multi_attn({x, inputs[2]})
        --end
        if dropout > 0 then
-	  x = nn.Dropout(dropout, nil, false)(x)
+	  x = nn.Dropout(dropout, nil, false):usePrealloc(nameL.."dropout",
+                                                          {{opt.max_batch_l, input_size_L}})(x)
        end       
     end
     -- evaluate the input sums at once for efficiency
-    local i2h = nn.Linear(input_size_L, 4 * rnn_size):reuseMem()(x)
-    local h2h = nn.LinearNoBias(rnn_size, 4 * rnn_size):reuseMem()(prev_h)
+    local i2h = nn.Linear(input_size_L, 4 * rnn_size):usePrealloc(nameL.."i2h-reuse",
+                                                                  {{opt.max_batch_l, input_size_L}},
+                                                                  {{opt.max_batch_l, 4 * rnn_size}})(x)
+    local h2h = nn.LinearNoBias(rnn_size, 4 * rnn_size):usePrealloc(nameL.."h2h-reuse",
+                                                                  {{opt.max_batch_l, rnn_size}},
+                                                                  {{opt.max_batch_l, 4 * rnn_size}})(prev_h)
     local all_input_sums = nn.CAddTable()({i2h, h2h})
 
     local reshaped = nn.Reshape(4, rnn_size, true)(all_input_sums)
-    local n1, n2, n3, n4 = nn.SplitTable(2)(reshaped):split(4)
+    local n1, n2, n3, n4 = nn.SplitTable(2):usePrealloc(nameL.."reshapesplit",
+                                                        {{opt.max_batch_l, 4, rnn_size}})(reshaped):split(4)
     -- decode the gates
-    local in_gate = nn.Sigmoid():reuseMem()(n1)
-    local forget_gate = nn.Sigmoid():reuseMem()(n2)
-    local out_gate = nn.Sigmoid():reuseMem()(n3)
+    local in_gate = nn.Sigmoid():usePrealloc(nameL.."G1-reuse",{RnnD})(n1)
+    local forget_gate = nn.Sigmoid():usePrealloc(nameL.."G2-reuse",{RnnD})(n2)
+    local out_gate = nn.Sigmoid():usePrealloc(nameL.."G3-reuse",{RnnD})(n3)
     -- decode the write inputs
-    local in_transform = nn.Tanh():reuseMem()(n4)
+    local in_transform = nn.Tanh():usePrealloc(nameL.."G4-reuse",{RnnD})(n4)
+
     -- perform the LSTM update
-    local next_c           = nn.CAddTable()({
-        nn.CMulTable()({forget_gate, prev_c}),
-        nn.CMulTable()({in_gate,     in_transform})
+    local next_c = nn.CAddTable():usePrealloc(nameL.."G5a",{RnnD,RnnD})({
+         nn.CMulTable():usePrealloc(nameL.."G5b",{RnnD,RnnD})({forget_gate, prev_c}),
+         nn.CMulTable():usePrealloc(nameL.."G5c",{RnnD,RnnD})({in_gate, in_transform})
       })
+
     -- gated cells form the output
-    local next_h = nn.CMulTable()({out_gate, nn.Tanh():reuseMem()(next_c)})
+    local next_h = nn.CMulTable():usePrealloc(nameL.."G5d",{RnnD,RnnD})
+                                 ({out_gate, nn.Tanh():usePrealloc(nameL.."G6-reuse",{RnnD})(next_c)})
     
     table.insert(outputs, next_c)
     table.insert(outputs, next_h)
@@ -113,6 +126,7 @@ function make_lstm(data, opt, model, use_chars)
 end
 
 function make_lstm_bow(data, opt)
+  assert(false, 'lstm bow broken')
    local dropout = opt.dropout or 0
    local n = opt.num_layers
    local rnn_size = opt.rnn_size
@@ -245,7 +259,10 @@ function make_decoder_attn(data, opt, simple)
    local dropout = opt.dropout or 0
    -- get attention
 
-   local attn = nn.MM()({context, nn.Replicate(1,3)(target_t)}) -- batch_l x (source_l*source_char_l) x 1
+   local attn = nn.MM():usePrealloc("dec_attn_mm1",
+                                {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size}, {opt.rnn_size,opt.rnn_size,1}},
+                                {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, 1}})
+                        ({context, nn.Replicate(1,3)(target_t)}) -- batch_l x (source_l*source_char_l) x 1
    attn = nn.Sum(3)(attn)
    if opt.attn_type == 'hard' then
      local mul_constant = nn.MulConstant(opt.temperature) -- multiply for temperature
@@ -266,19 +283,28 @@ function make_decoder_attn(data, opt, simple)
    attn = nn.Replicate(1,2)(attn) -- batch_l x  1 x (source_l*source_char_l)
 
    -- apply attention to context
-   local context_combined = nn.MM()({attn, context}) -- batch_l x 1 x rnn_size
-   context_combined = nn.Sum(2)(context_combined) -- batch_l x rnn_size
+   local context_combined = nn.MM():usePrealloc("dec_attn_mm2",
+                                                {{opt.max_batch_l, 1, opt.max_sent_l_src*opt.max_word_l},{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size}},
+                                                {{opt.max_batch_l, 1, opt.rnn_size}})
+                                    ({attn, context}) -- batch_l x 1 x rnn_size
+   context_combined = nn.Sum(2):usePrealloc("dec_attn_sum",
+                                            {{opt.max_batch_l, 1, opt.rnn_size}},
+                                            {{opt.max_batch_l, opt.rnn_size}})
+                                (context_combined) -- batch_l x rnn_size
    local context_output
    if simple == 0 then
-      context_combined = nn.JoinTable(2)({context_combined, inputs[1]}) -- batch_l x rnn_size*2
-      context_output = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2,
-						 opt.rnn_size)(context_combined))
+      context_combined = nn.JoinTable(2):usePrealloc("dec_attn_jointable",
+                                                     {{opt.max_batch_l,opt.rnn_size},{opt.max_batch_l, opt.rnn_size}})
+                                         ({context_combined, inputs[1]}) -- batch_l x rnn_size*2
+      context_output = nn.Tanh():usePrealloc("dec_noattn_tanh", {{opt.max_batch_l, opt.rnn_size}})
+                                (nn.LinearNoBias(opt.rnn_size*2,opt.rnn_size):usePrealloc("dec_noattn_linear", {{opt.max_batch_l,2*opt.rnn_size}})(context_combined))
    else
       context_output = nn.CAddTable()({context_combined,inputs[1]})
    end
 
    if dropout > 0 then
-      context_output = nn.Dropout(dropout, nil, false)(context_output)
+      context_output = nn.Dropout(dropout, nil, false):usePrealloc("dec_attn_dropout",{{opt.rnn_size, opt.rnn_size}})
+                                                      (context_output)
    end     
    table.insert(outputs, context_output)
    --return nn.gModule(inputs, {context_output})   
@@ -318,8 +344,10 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    if opt.concat_doc_bow == 1 then
      bow_size = bow_size + opt.word_vec_size
    end
-   local attn1 = nn.MM()({bow_context,
-        nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, bow_size)(target_t))}) -- batch_l x source_l x 1
+   local attn1 = nn.MM():usePrealloc("dec_hier_attn_mm1",
+                                     {{opt.max_batch_l, opt.max_sent_l_src, opt.rnn_size},{opt.rnn_size,opt.rnn_size,1}},
+                                     {{opt.max_batch_l, opt.max_sent_l_src, 1}})
+                         ({bow_context, nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, bow_size)(target_t))}) -- batch_l x source_l x 1
    attn1 = nn.Sum(3)(attn1)
    local mul_constant1 = nn.MulConstant(opt.temperature) -- multiply for temperature
    mul_constant1.name = 'mul_constant'
@@ -337,8 +365,10 @@ function make_hierarchical_decoder_attn(data, opt, simple)
 
    -- attention over words of each sentence
    local reshape_context = nn.Reshape(-1, opt.rnn_size, true)(context) -- batch_l x (source_l*source_char_l) x opt.rnn_size
-   local attn2 = nn.MM()({reshape_context,
-        nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(target_t))}) -- batch_l x (source_l*source_char_l) x 1
+   local attn2 = nn.MM():usePrealloc("dec_hier_attn_mm2",
+                                     {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size},{opt.rnn_size,opt.rnn_size,1}},
+                                     {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, 1}})
+                         ({reshape_context, nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(target_t))}) -- batch_l x (source_l*source_char_l) x 1
    attn2 = nn.Sum(3)(attn2)
    attn2 = nn.View(-1):setNumInputDims(1)(nn.ViewAs(3)({attn2, context})) -- (batch_l*source_l) x source_char_l
    local mul_constant2 = nn.MulConstant(opt.temperature) -- multiply for temperature
@@ -356,23 +386,35 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    end
    attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
    -- multiply attentions together
-   local mul_attn = nn.CMulTable()({nn.ReplicateAs(3,3)({attn1, attn2}), attn2}) -- batch_l x source_l x source_char_l
+   local mul_attn = nn.CMulTable():usePrealloc("dec_hier_attn_cmultable",
+                                               {{opt.max_batch_l, opt.max_sent_l, opt.max_word_l}, {opt.max_batch_l, opt.max_sent_l, opt.max_word_l}})
+                                   ({nn.ReplicateAs(3,3)({attn1, attn2}), attn2}) -- batch_l x source_l x source_char_l
    mul_attn = nn.Replicate(1,2)(nn.View(-1):setNumInputDims(2)(mul_attn)) -- batch_l x 1 x (source_l*source_char_l)
 
    -- apply attention to context
-   local context_combined = nn.MM()({mul_attn, reshape_context}) -- batch_l x 1 x rnn_size
-   context_combined = nn.Sum(2)(context_combined) -- batch_l x rnn_size
+   local context_combined = nn.MM():usePrealloc("dec_hier_attn_mm3",
+                                               {{opt.max_batch_l, 1, opt.max_sent_l_src*opt.max_word_l},{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size}},
+                                                   {{opt.max_batch_l, 1, opt.rnn_size}})
+                                    ({mul_attn, reshape_context}) -- batch_l x 1 x rnn_size
+   context_combined = nn.Sum(2):usePrealloc("dec_hier_attn_sum",
+                                            {{opt.max_batch_l, 1, opt.rnn_size}},
+                                            {{opt.max_batch_l, opt.rnn_size}})
+                                (context_combined) -- batch_l x rnn_size
    local context_output
    if simple == 0 then
-      context_combined = nn.JoinTable(2)({context_combined, inputs[1]}) -- batch_l x rnn_size*2
-      context_output = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2,
-						 opt.rnn_size)(context_combined))
+      context_combined = nn.JoinTable(2):usePrealloc("dec_hier_attn_jointable",
+                                                   {{opt.max_batch_l,opt.rnn_size},{opt.max_batch_l, opt.rnn_size}})
+                                         ({context_combined, inputs[1]}) -- batch_l x rnn_size*2
+
+      context_output = nn.Tanh():usePrealloc("dec_hier_noattn_tanh",{{opt.max_batch_l,opt.rnn_size}})
+                                (nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size):usePrealloc("dec_hier_noattn_linear", {{opt.max_batch_l,2*opt.rnn_size}})(context_combined))
    else
       context_output = nn.CAddTable()({context_combined,inputs[1]})
    end
 
    if dropout > 0 then
-      context_output = nn.Dropout(dropout, nil, false)(context_output)
+      context_output = nn.Dropout(dropout, nil, false):usePrealloc("dec_hier_attn_dropout",
+                                                        {{opt.rnn_size, opt.rnn_size}})(context_output)
    end     
    table.insert(outputs, context_output)
    --return nn.gModule(inputs, {context_output})   
