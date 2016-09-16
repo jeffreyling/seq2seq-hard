@@ -1,4 +1,5 @@
 require 'hard_attn'
+require 'memory'
 
 function nn.Module:reuseMem()
    self.reuse = true

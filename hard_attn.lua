@@ -155,7 +155,7 @@ function ReinforceCategorical:_doSample(input)
         self._output:resizeAs(self.output)
         for i = 1, self.multisampling do
           self._output:zero()
-          self._output:scatter(2, self._index:narrow(2,i,1), 1)
+          self._output:scatter(2, self._index:narrow(2,i,1), 1/self.multisampling)
           self.output:add(self._output)
         end
       else
@@ -206,10 +206,9 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      self.gradInput:copy(gradOutput)
    else 
      self.gradInput:copy(self.output)
-     --if self.multisampling > 0 then
-       --self.gradInput:mul(self.multisampling) -- undo dividing by k
-       --self.gradInput:div(self.multisampling) -- NOTE: this is not technically correct but works way better?
-     --end
+     if self.multisampling > 0 then
+       self.gradInput:mul(self.multisampling) -- undo dividing by k
+     end
      self._input = self._input or input.new()
      -- prevent division by zero error
      self._input:resizeAs(input):copy(input):add(0.00000001) 
@@ -322,4 +321,3 @@ function variance_reduce(reward, b, scale, mask)
    vrReward:maskedFill(mask, 0)
    return vrReward
 end
-

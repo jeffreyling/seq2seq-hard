@@ -53,7 +53,7 @@ cmd:option('-moving_variance', 1, [[Use moving variance to normalize rewards (th
 cmd:option('-soft_curriculum', 1, [[Anneal semi_sampling_p as 1/sqrt(epoch) if set to 1]])
 
 -- hard attention specs (attn_type == 'hard')
-cmd:option('-reward_scale', 0.1, [[Scale reward by this factor]])
+cmd:option('-reward_scale', 0.04, [[Scale reward by this factor]])
 cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
                                     set 0 to always sample]])
@@ -732,9 +732,9 @@ function train(train_data, valid_data)
               rnn_state_bow_enc = reset_state(init_fwd_bow_enc, batch_l, 0)
             end
           end
-          if opt.gpuid >= 0 then
-            cutorch.setDevice(opt.gpuid)
-          end	 
+          --if opt.gpuid >= 0 then
+            --cutorch.setDevice(opt.gpuid)
+          --end	 
 
           -- forward prop encoder bow
           local bow_out
@@ -909,8 +909,9 @@ function train(train_data, valid_data)
                   sum_reward:mul(discount)
                   sum_reward:add(cur_reward)
                 end
-                cur_reward = sum_reward
+                cur_reward = sum_reward:clone()
               end
+              cur_reward:mul(opt.reward_scale) -- helps performance
 
               -- broadcast
               local stochastic_layers = {sampler_layers[t]}
@@ -918,7 +919,7 @@ function train(train_data, valid_data)
                 table.insert(stochastic_layers, sampler_word_layers[t])
               end
               for _,layer in ipairs(stochastic_layers) do
-                layer:reinforce(cur_reward:clone())
+                layer:reinforce(cur_reward)
               end
 
               -- update learned baselines
@@ -1622,6 +1623,7 @@ function main()
      assert(opt.cudnn == 1, 'use cudnn!')
      print('using convolution instead of bag of words')
    end
+   assert(opt.multisampling > 0, 'please use multisampling')
    if opt.multisampling > 0 then
      assert(opt.multisampling > 1)
      print(string.format('sampling attn %d instead of once', opt.multisampling))
@@ -1654,8 +1656,7 @@ function main()
    end
 
    layer_etas = {} -- different learning rates
-   layer_etas[1] = opt.learning_rate / 10 -- encoder
-   for i = 2, #layers do
+   for i = 1, #layers do
      layer_etas[i] = opt.learning_rate
    end
    --if opt.adagrad == 1 then

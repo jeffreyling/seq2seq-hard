@@ -41,11 +41,12 @@ function preallocateTensor(name,D)
   end
   local t=torch.zeros(torch.LongStorage(D))
   if opt.gpuid >= 0 then
-    if opt.gpuid2 >= 0 and string.sub(name,1,"4") == "dec_" then
-      cutorch.setDevice(opt.gpuid2)
-    else
-      cutorch.setDevice(opt.gpuid)
-    end
+    --cutorch.setDevice(opt.gpuid)
+    --if opt.gpuid2 >= 0 and string.sub(name,1,"4") == "dec_" then
+      --cutorch.setDevice(opt.gpuid2)
+    --else
+      --cutorch.setDevice(opt.gpuid)
+    --end
     t=t:cuda()
   end
   return t
