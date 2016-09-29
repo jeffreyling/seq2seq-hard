@@ -407,14 +407,14 @@ function train(train_data, valid_data)
 
    if opt.attn_type == 'hard' then
      -- save stochastic layers
-     sampler_layers = {}
-     mul_constant_layers = {}
-     if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
-       sampler_word_layers = {}
-     end
-     for i = 1, opt.max_sent_l_targ do
-       decoder_attn_clones[i]:apply(get_RL_layer)
-     end
+     --sampler_layers = {}
+     --mul_constant_layers = {}
+     --if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
+       --sampler_word_layers = {}
+     --end
+     --for i = 1, opt.max_sent_l_targ do
+       --decoder_attn_clones[i]:apply(get_RL_layer)
+     --end
 
      if opt.baseline_method == 'average' or opt.baseline_method == 'both' then
        -- baseline should be time dependent on target
@@ -914,12 +914,19 @@ function train(train_data, valid_data)
               cur_reward:mul(opt.reward_scale) -- helps performance
 
               -- broadcast
-              local stochastic_layers = {sampler_layers[t]}
-              if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
-                table.insert(stochastic_layers, sampler_word_layers[t])
+              local cur_sampler
+              function get_single_layer(layer)
+                if layer.name ~= nil then
+                    if layer.name == 'sampler' then
+                      cur_sampler = layer
+                    end
+                end
               end
-              for _,layer in ipairs(stochastic_layers) do
-                layer:reinforce(cur_reward)
+              --if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
+                --table.insert(stochastic_layers, sampler_word_layers[t])
+              --end
+              if opt.attn_type == 'hard' then
+                cur_sampler:reinforce(cur_reward)
               end
 
               -- update learned baselines
