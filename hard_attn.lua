@@ -88,10 +88,13 @@ end
 ------------------------------------------------------------------------
 local ReinforceCategorical, parent = torch.class("nn.ReinforceCategorical", "nn.Reinforce")
 
-function ReinforceCategorical:__init(semi_sampling_p, entropy_scale)
+function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, multisampling, with_replace, uniform_attn)
   parent.__init(self)
   self.semi_sampling_p = semi_sampling_p or 0
   self.entropy_scale = entropy_scale or 0
+  self.multisampling = multisampling or 0
+  self.with_replace = with_replace or 1
+  self.uniform_attn = uniform_attn or 1
   self.through = false -- pass prob weights through
 
   self.time_step = 0
@@ -99,9 +102,31 @@ function ReinforceCategorical:__init(semi_sampling_p, entropy_scale)
 end
 
 function ReinforceCategorical:_doArgmax(input)
-   _, self._index = input:max(2)
    self.output:zero()
-   self.output:scatter(2, self._index, 1)
+   if self.multisampling > 0 then
+     -- take top k attention weights
+     local k = self.multisampling
+     if k > input:size(2) then
+       -- fewer rows than we would like to sample
+       k = input:size(2)
+     end
+     self._vals, self._index = input:topk(k, 2, true) -- true for max
+
+     if self.uniform_attn == 1 then
+       self.output:scatter(2, self._index, 1/k)
+     else
+       self.output:scatter(2, self._index, self._vals)
+       -- normalize
+       self.output:cdiv(self.output:sum(2):expandAs(self.output))
+     end
+   else
+     _, self._index = input:max(2)
+     self.output:scatter(2, self._index, 1)
+   end
+
+   if type(self._index) ~= 'torch.CudaTensor' then
+     self._index = self._index:cuda()
+   end
 end
 
 function ReinforceCategorical:_doSample(input)
@@ -114,10 +139,31 @@ function ReinforceCategorical:_doSample(input)
       self._input = self._input or input.new()
       -- prevent division by zero error (see updateGradInput)
       self._input:resizeAs(input):copy(input):add(0.00000001) 
-      input.multinomial(self._index, input, 1)
-      -- one hot encoding
-      self.output:zero()
-      self.output:scatter(2, self._index, 1)
+
+      if self.multisampling > 0 then
+        -- sample k times
+        if self.with_replace == 1 then
+          input.multinomial(self._index, input, self.multisampling, true)
+        else
+          assert(false, 'fix policy gradient first')
+          input.multinomial(self._index, input, self.multisampling, false)
+        end
+
+        self.output:zero()
+        -- TODO: undesirable loop...
+        self._output = self._output or self.output.new()
+        self._output:resizeAs(self.output)
+        for i = 1, self.multisampling do
+          self._output:zero()
+          self._output:scatter(2, self._index:narrow(2,i,1), 1/self.multisampling)
+          self.output:add(self._output)
+        end
+      else
+        input.multinomial(self._index, input, 1)
+        -- one hot encoding
+        self.output:zero()
+        self.output:scatter(2, self._index, 1)
+      end
    end
 end
 
@@ -160,6 +206,9 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      self.gradInput:copy(gradOutput)
    else 
      self.gradInput:copy(self.output)
+     if self.multisampling > 0 then
+       self.gradInput:mul(self.multisampling) -- undo dividing by k
+     end
      self._input = self._input or input.new()
      -- prevent division by zero error
      self._input:resizeAs(input):copy(input):add(0.00000001) 
@@ -258,7 +307,7 @@ end
 
 function variance_reduce(reward, b, scale, mask)
    -- subtract baseline
-   local vrReward = reward:clone()
+   local vrReward = reward
    if type(b) == 'number' then
      vrReward:add(-b)
    else
@@ -272,4 +321,3 @@ function variance_reduce(reward, b, scale, mask)
    vrReward:maskedFill(mask, 0)
    return vrReward
 end
-

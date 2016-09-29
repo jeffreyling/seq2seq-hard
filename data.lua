@@ -105,7 +105,7 @@ function data.__index(self, idx)
       local source_l = self.batches[idx][7]
       local target_l_all = self.batches[idx][8]
       if opt.gpuid >= 0 then --if multi-gpu, source lives in gpuid1, rest on gpuid2
-	 cutorch.setDevice(opt.gpuid)
+	 --cutorch.setDevice(opt.gpuid)
 	 source_input = source_input:cuda()
 	 target_input = target_input:cuda()
 	 target_output = target_output:cuda()

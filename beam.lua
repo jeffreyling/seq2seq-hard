@@ -3,10 +3,9 @@ require 'string'
 require 'hdf5'
 require 'nngraph'
 
-require 'models.lua'
 require 'data.lua'
+require 'models.lua'
 require 'util.lua'
-require 'hard_attn'
 
 ENTROPY = 0
 GOLD_SIZE = 0
@@ -17,9 +16,8 @@ cmd = torch.CmdLine()
 
 -- check attn options
 cmd:option('-view_attn', 0, [[View attention weights at each time step]])
-cmd:option('-print_attn', 0, [[Print attention weights]])
-cmd:option('-sent_attn', 0, [[Print sentence attention instead of all attn]])
-cmd:option('-print_gold_attn', 0, [[Print attention weights for gold]])
+cmd:option('-print_attn', 1, [[Print attention weights]])
+cmd:option('-print_sent_attn', 1, [[Print sentence attention instead of all attn]])
 
 -- file location
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])
@@ -704,10 +702,11 @@ function main()
    for _,line in ipairs(src_sents) do
       sent_id = sent_id + 1
 
+      local source, source_str
+      local target, target_str
       if opt.src_hdf5 == '' then 
         line = clean_sent(line)      
         print('SENT ' .. sent_id .. ': ' ..line)
-        local source, source_str
         if model_opt.use_chars_enc == 0 then
            source, source_str = sent2wordidx(line, word2idx_src, model_opt.start_symbol)
         else

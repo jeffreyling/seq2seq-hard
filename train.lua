@@ -9,6 +9,18 @@ require 'model_utils.lua'
 
 cmd = torch.CmdLine()
 
+cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
+cmd:option('-with_replace', 1, [[With replacement for multisampling]])
+cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
+
+cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
+cmd:option('-denoise', 0, [[Denoising autoencoder p]])
+cmd:option('-debug', 0, [[Debug]])
+cmd:option('-num_layers', 2, [[Number of layers in the LSTM encoder/decoder]])
+cmd:option('-rnn_size', 500, [[Size of LSTM hidden states]])
+cmd:option('-word_vec_size', 500, [[Word embedding sizes]])
+cmd:option('-attn_type', 'hard', [[Hard or soft attention on decoder side]])
+
 -- FIX THESE FOR TRANSLATION
 cmd:option('-init_dec', 0, [[Initialize the hidden/cell state of the decoder at time 
                            0 to be the last hidden/cell state of the encoder. If 0, 
@@ -30,7 +42,7 @@ cmd:option('-moving_variance', 1, [[Use moving variance to normalize rewards (th
 cmd:option('-soft_curriculum', 1, [[Anneal semi_sampling_p as 1/sqrt(epoch) if set to 1]])
 
 -- hard attention specs (attn_type == 'hard')
-cmd:option('-reward_scale', 0.1, [[Scale reward by this factor]])
+cmd:option('-reward_scale', 0.04, [[Scale reward by this factor]])
 cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
                                     set 0 to always sample]])
@@ -72,10 +84,6 @@ cmd:text("")
 cmd:text("**Model options**")
 cmd:text("")
 
-cmd:option('-num_layers', 2, [[Number of layers in the LSTM encoder/decoder]])
-cmd:option('-rnn_size', 500, [[Size of LSTM hidden states]])
-cmd:option('-word_vec_size', 500, [[Word embedding sizes]])
-cmd:option('-attn_type', 'hard', [[Hard or soft attention on decoder side]])
 cmd:option('-use_chars_enc', 0, [[If = 1, use character on the encoder
                                   side (instead of word embeddings]])
 cmd:option('-use_chars_dec', 0, [[If = 1, use character on the decoder 
@@ -99,11 +107,11 @@ cmd:text("Below options only apply if using the character model.")
 cmd:text("")
 
 -- char-cnn model specs (if use_chars == 1)
-cmd:option('-char_vec_size', 25, [[Size of the character embeddings]])
+--cmd:option('-char_vec_size', 25, [[Size of the character embeddings]])
 cmd:option('-kernel_width', 6, [[Size (i.e. width) of the convolutional filter]])
-cmd:option('-num_kernels', 1000, [[Number of convolutional filters (feature maps). So the
+cmd:option('-num_kernels', 600, [[Number of convolutional filters (feature maps). So the
                                  representation from characters will have this many dimensions]])
-cmd:option('-num_highway_layers', 2, [[Number of highway layers in the character model]])
+cmd:option('-num_highway_layers', 0, [[Number of highway layers in the character model]])
 
 cmd:text("")
 cmd:text("**Optimization options**")
@@ -156,6 +164,7 @@ cmd:option('-cudnn', 0, [[Whether to use cudnn or not for convolutions (for the 
 cmd:option('-save_every', 1, [[Save every this many epochs]])
 cmd:option('-print_every', 50, [[Print stats after this many batches]])
 cmd:option('-seed', 3435, [[Seed for random initialization]])
+cmd:option('-prealloc', 1, [[Use memory preallocation and sharing between cloned encoder/decoders]])
 
 cmd:text("")
 cmd:text("Options for hard attention")
@@ -261,14 +270,20 @@ function train(train_data, valid_data)
    for i = 1, opt.max_sent_l_src do
       if encoder_clones[i].apply then
          encoder_clones[i]:apply(function(m) m:setReuse() end)
+         if opt.prealloc == 1 then encoder_clones[i]:apply(function(m) m:setPrealloc() end) end
       end
       if opt.brnn == 1 then
          encoder_bwd_clones[i]:apply(function(m) m:setReuse() end)
+         if opt.prealloc == 1 then encoder_bwd_clones[i]:apply(function(m) m:setPrealloc() end) end
       end      
    end
    for i = 1, opt.max_sent_l_targ do
       if decoder_clones[i].apply then
          decoder_clones[i]:apply(function(m) m:setReuse() end)
+         if opt.prealloc == 1 then decoder_clones[i]:apply(function(m) m:setPrealloc() end) end
+      end
+      if decoder_attn_clones[i].apply then
+         if opt.prealloc == 1 then decoder_attn_clones[i]:apply(function(m) m:setPrealloc() end) end
       end
    end   
 
@@ -399,7 +414,10 @@ function train(train_data, valid_data)
 	 end
       end
       if start_decay == 1 then
-	 opt.learning_rate = opt.learning_rate * opt.lr_decay
+         for j = 1, #layer_etas do
+           layer_etas[j] = layer_etas[j] * opt.lr_decay
+         end
+	 --opt.learning_rate = opt.learning_rate * opt.lr_decay
       end
    end   
 
@@ -677,13 +695,14 @@ function train(train_data, valid_data)
                   sum_reward:mul(discount)
                   sum_reward:add(cur_reward)
                 end
-                cur_reward = sum_reward
+                cur_reward = sum_reward:clone()
               end
+              cur_reward:mul(opt.reward_scale) -- helps performance
 
               -- broadcast
               local stochastic_layers = {sampler_layers[t]}
               for _,layer in ipairs(stochastic_layers) do
-                layer:reinforce(cur_reward:clone())
+                layer:reinforce(cur_reward)
               end
 
               -- update learned baselines
@@ -839,7 +858,8 @@ function train(train_data, valid_data)
           if opt.adagrad == 1 then
             adagradStep(params[j], grad_params[j], layer_etas[j], optStates[j])
           else
-            params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+            --params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+            params[j]:add(grad_params[j]:mul(-layer_etas[j]))
           end	    
           param_norm = param_norm + params[j]:norm()^2
         end	 
@@ -920,6 +940,7 @@ function train(train_data, valid_data)
         end
       end
       opt.train_perf[#opt.train_perf + 1] = train_score
+
       local score = eval(valid_data)
       opt.val_perf[#opt.val_perf + 1] = score
       if opt.adagrad == 0 then --unncessary with adagrad
@@ -1042,6 +1063,20 @@ function get_RL_layer(layer)
    end
 end
 
+function copy_params(targ, src)
+  local targ_params = targ:parameters()
+  local src_params = src:parameters()
+
+  if torch.isTensor(targ_params) then
+    targ_params:copy(src_params) 
+  else
+    -- table
+    for i,p in ipairs(targ_params) do
+      p:copy(src_params[i])
+    end
+  end
+end
+
 function main() 
     -- parse input params
    opt = cmd:parse(arg)
@@ -1082,11 +1117,43 @@ function main()
    print(string.format('Source max sent len: %d, Target max sent len: %d',
 		       valid_data.source:size(2), valid_data.target:size(2)))   
 
+   preallocateMemory(opt.prealloc)
+
    -- Build model
-   if opt.train_from:len() == 0 then
+   if opt.train_from:len() == 0 or opt.start_soft == 1 then
       encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
       decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
       generator, criterion = make_generator(valid_data, opt)
+      if opt.brnn == 1 then
+	 encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
+      end      
+
+      if opt.start_soft == 1 then
+        -- Load params
+        assert(path.exists(opt.train_from), 'checkpoint path invalid')
+        print('loading ' .. opt.train_from .. '...')
+        local checkpoint = torch.load(opt.train_from)
+        local model, model_opt = checkpoint[1], checkpoint[2]
+        opt.num_layers = model_opt.num_layers
+        opt.rnn_size = model_opt.rnn_size
+        opt.input_feed = model_opt.input_feed
+        opt.init_dec = model_opt.init_dec
+        opt.brnn = model_opt.brnn
+        opt.hierarchical = model_opt.hierarchical
+
+        -- copy params
+        local save_idx = model_opt.save_idx
+        copy_params(encoder, model[1]:double())
+        copy_params(decoder, model[2]:double())
+        copy_params(generator, model[3]:double())
+        copy_params(decoder_attn, model[4]:double())
+        if model_opt.brnn == 1 then
+          copy_params(encoder_bwd, model[save_idx['encoder_bwd']]:double())
+        end      
+        if model_opt.hierarchical == 1 then
+          copy_params(bow_encoder, model[save_idx['bow_encoder']]:double())
+        end
+      end
 
       if opt.attn_type == 'hard' then
         if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
@@ -1107,9 +1174,6 @@ function main()
           opt.reward_variance = 0 -- RL stddev
         end
       end
-      if opt.brnn == 1 then
-	 encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
-      end      
 
       -- check for word2vec
       --assert(opt.pre_word_vecs_enc ~= '', 'not using word2vec!')
@@ -1124,11 +1188,7 @@ function main()
       opt.input_feed = model_opt.input_feed
       opt.init_dec = model_opt.init_dec
       opt.brnn = model_opt.brnn
-
       opt.hierarchical = model_opt.hierarchical
-      opt.attn_type = model_opt.attn_type
-      opt.attn_word_type = model_opt.attn_word_type
-      opt.baseline_method = model_opt.baseline_method
 
       local save_idx = model_opt.save_idx
       encoder = model[1]:double()
@@ -1166,6 +1226,13 @@ function main()
    if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
      print('using learned baseline method')
    end
+   assert(opt.multisampling > 0, 'please use multisampling')
+   if opt.multisampling > 0 then
+     assert(opt.multisampling > 1)
+     print(string.format('sampling attn %d instead of once', opt.multisampling))
+     print('with replace =', opt.with_replace)
+     print('uniform attn =', opt.uniform_attn)
+   end
 
    layers = {encoder, decoder, generator}
    layers_idx = {encoder=1, decoder=2, generator=3}
@@ -1181,14 +1248,18 @@ function main()
       idx = idx + 1
    end
 
-   if opt.adagrad == 1 then
-      layer_etas = {}
-      optStates = {}
-      for i = 1, #layers do
-	 layer_etas[i] = opt.learning_rate
-	 optStates[i] = {}
-      end     
+   layer_etas = {} -- different learning rates
+   for i = 1, #layers do
+     layer_etas[i] = opt.learning_rate
    end
+   --if opt.adagrad == 1 then
+      --layer_etas = {}
+      --optStates = {}
+      --for i = 1, #layers do
+	 --layer_etas[i] = opt.learning_rate
+	 --optStates[i] = {}
+      --end     
+   --end
 
    if opt.gpuid >= 0 then
       for i = 1, #layers do	 
