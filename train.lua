@@ -303,13 +303,13 @@ function train(train_data, valid_data)
 
    if opt.attn_type == 'hard' then
      -- save stochastic layers
-     sampler_layers = {}
-     mul_constant_layers = {}
-     decoder_attn_layers = {}
-     for i = 1, opt.max_sent_l_targ do
-       decoder_clones[i]:apply(get_RL_layer)
-       decoder_attn_layers[i]:apply(get_RL_layer)
-     end
+     --sampler_layers = {}
+     --mul_constant_layers = {}
+     --decoder_attn_layers = {}
+     --for i = 1, opt.max_sent_l_targ do
+       --decoder_clones[i]:apply(get_RL_layer)
+       --decoder_attn_layers[i]:apply(get_RL_layer)
+     --end
 
      if opt.baseline_method == 'average' or opt.baseline_method == 'both' then
        -- baseline should be time dependent on target
@@ -697,7 +697,19 @@ function train(train_data, valid_data)
               --cur_reward:mul(opt.reward_scale) -- helps performance
 
               -- broadcast
-              sampler_layers[t]:reinforce(cur_reward)
+              local cur_decoder_attn, cur_sampler
+              function get_single_layer(layer)
+                 if layer.name ~= nil then
+                    if layer.name == 'decoder_attn' then
+                      cur_decoder_attn = layer
+                    elseif layer.name == 'sampler' then
+                      cur_sampler = layer
+                    end
+                 end
+              end
+              decoder_clones[t]:apply(get_single_layer)
+              cur_decoder_attn:apply(get_single_layer)
+              cur_sampler:reinforce(cur_reward)
 
               -- update learned baselines
               if opt.baseline_method == 'learned' then
