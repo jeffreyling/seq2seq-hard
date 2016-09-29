@@ -709,7 +709,9 @@ function train(train_data, valid_data)
               end
               decoder_clones[t]:apply(get_single_layer)
               cur_decoder_attn:apply(get_single_layer)
-              cur_sampler:reinforce(cur_reward)
+              if opt.attn_type == 'hard' then
+                cur_sampler:reinforce(cur_reward)
+              end
 
               -- update learned baselines
               if opt.baseline_method == 'learned' then
