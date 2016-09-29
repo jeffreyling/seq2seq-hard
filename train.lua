@@ -1623,12 +1623,14 @@ function main()
      assert(opt.cudnn == 1, 'use cudnn!')
      print('using convolution instead of bag of words')
    end
-   assert(opt.multisampling > 0, 'please use multisampling')
+   --assert(opt.multisampling > 0, 'please use multisampling')
    if opt.multisampling > 0 then
      assert(opt.multisampling > 1)
      print(string.format('sampling attn %d instead of once', opt.multisampling))
      print('with replace =', opt.with_replace)
      print('uniform attn =', opt.uniform_attn)
+   else
+     print('NOT multisampling')
    end
 
    layers = {encoder, decoder, generator, decoder_attn}
