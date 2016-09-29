@@ -697,10 +697,7 @@ function train(train_data, valid_data)
               --cur_reward:mul(opt.reward_scale) -- helps performance
 
               -- broadcast
-              local stochastic_layers = {sampler_layers[t]}
-              for _,layer in ipairs(stochastic_layers) do
-                layer:reinforce(cur_reward)
-              end
+              sampler_layers[t]:reinforce(cur_reward)
 
               -- update learned baselines
               if opt.baseline_method == 'learned' then
@@ -719,6 +716,7 @@ function train(train_data, valid_data)
             local dl_dpred = criterion:backward(pred, target_out[t])
             dl_dpred:div(batch_l)
             local dl_dtarget = generator:backward(preds[t], dl_dpred)
+
             drnn_state_dec[#drnn_state_dec]:add(dl_dtarget)
             local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
