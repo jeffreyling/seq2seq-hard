@@ -186,7 +186,7 @@ function make_decoder_attn(data, opt, simple)
 
    -- apply attention to context
    local context_combined = nn.MM():usePrealloc("dec_attn_mm2",
-                                                {{opt.max_batch_l, 1, opt.max_sent_l_src*opt.max_word_l},{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size}},
+                                                {{opt.max_batch_l, 1, opt.max_sent_l_src},{opt.max_batch_l, opt.max_sent_l_src, opt.rnn_size}},
                                                 {{opt.max_batch_l, 1, opt.rnn_size}})
                                     ({attn, context}) -- batch_l x 1 x rnn_size
    context_combined = nn.Sum(2):usePrealloc("dec_attn_sum",

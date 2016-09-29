@@ -16,9 +16,11 @@ cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
 cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-denoise', 0, [[Denoising autoencoder p]])
 cmd:option('-debug', 0, [[Debug]])
-cmd:option('-num_layers', 2, [[Number of layers in the LSTM encoder/decoder]])
-cmd:option('-rnn_size', 500, [[Size of LSTM hidden states]])
-cmd:option('-word_vec_size', 500, [[Word embedding sizes]])
+cmd:option('-num_layers', 1, [[Number of layers in the LSTM encoder/decoder]])
+cmd:option('-rnn_size', 256, [[Size of LSTM hidden states]])
+cmd:option('-word_vec_size', 256, [[Word embedding sizes]])
+cmd:option('-brnn', 0, [[If = 1, use a bidirectional RNN. Hidden states of the fwd/bwd
+                              RNNs are summed.]])
 cmd:option('-attn_type', 'hard', [[Hard or soft attention on decoder side]])
 
 -- FIX THESE FOR TRANSLATION
@@ -59,8 +61,6 @@ cmd:option('-num_samples', 1, [[Number of times to sample for each data point (m
 cmd:option('-temperature', 1, [[Temperature for sampling]])
 
 cmd:option('-stupid_hack', 0, [[Stupid hack]])
-cmd:option('-brnn', 1, [[If = 1, use a bidirectional RNN. Hidden states of the fwd/bwd
-                              RNNs are summed.]])
 
 
 -- data files
@@ -281,9 +281,6 @@ function train(train_data, valid_data)
       if decoder_clones[i].apply then
          decoder_clones[i]:apply(function(m) m:setReuse() end)
          if opt.prealloc == 1 then decoder_clones[i]:apply(function(m) m:setPrealloc() end) end
-      end
-      if decoder_attn_clones[i].apply then
-         if opt.prealloc == 1 then decoder_attn_clones[i]:apply(function(m) m:setPrealloc() end) end
       end
    end   
 
@@ -697,7 +694,7 @@ function train(train_data, valid_data)
                 end
                 cur_reward = sum_reward:clone()
               end
-              cur_reward:mul(opt.reward_scale) -- helps performance
+              --cur_reward:mul(opt.reward_scale) -- helps performance
 
               -- broadcast
               local stochastic_layers = {sampler_layers[t]}
@@ -1226,12 +1223,13 @@ function main()
    if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
      print('using learned baseline method')
    end
-   assert(opt.multisampling > 0, 'please use multisampling')
    if opt.multisampling > 0 then
      assert(opt.multisampling > 1)
      print(string.format('sampling attn %d instead of once', opt.multisampling))
      print('with replace =', opt.with_replace)
      print('uniform attn =', opt.uniform_attn)
+   else
+     print('NOT MULTISAMPLING')
    end
 
    layers = {encoder, decoder, generator}
