@@ -1180,7 +1180,7 @@ function train(train_data, valid_data)
         local time_taken = timer:time().real - start_time
         if i % opt.print_every == 0 then
           local stats = string.format('Epoch: %d, Batch: %d/%d, Batch size: %d, LR: %.4f, ',
-          epoch, i, data:size(), batch_l, opt.learning_rate)
+          epoch, i, data:size(), batch_l, layer_etas[1])
           stats = stats .. string.format('PPL: %.2f, |Param|: %.2f, |GParam|: %.2f, ',
           math.exp(train_loss/train_nonzeros), param_norm, grad_norm)
           stats = stats .. string.format('Training: %d/%d/%d total/(source sentences)/target tokens/sec',
