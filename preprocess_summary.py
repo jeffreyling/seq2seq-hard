@@ -119,6 +119,8 @@ def get_data(args):
 
     def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0, truncate=0, no_pad=0, targetseqlength=100, pretrain=0):
         num_docs = 0
+        num_blank_docs = 0
+        num_bad_targs = 0
         for i, (src_orig, targ_orig) in \
                 enumerate(itertools.izip(open(srcfile,'r'), open(targetfile,'r'))):
             src_orig = src_indexer.clean(src_orig.strip())
@@ -127,6 +129,7 @@ def get_data(args):
             src = src_orig.strip().strip("</s>").split("</s>") # splits the doc into sentences
             targ = targ_orig.strip().split()
             if len(src) < 1 or len(src[0]) < 1:
+              num_blank_docs += 1
               continue
             if len(src) > seqlength and no_pad == 0:
               if truncate == 1:
@@ -135,6 +138,7 @@ def get_data(args):
                 continue
             if pretrain == 0:
               if len(targ) < 1 or len(targ) > targetseqlength:
+                num_bad_targs += 1
                 continue
 
             if pretrain > 0:
@@ -157,7 +161,7 @@ def get_data(args):
             # print src, targ
             # raw_input()
                 
-        return max_sent_l, num_docs
+        return max_sent_l, num_docs, num_blank_docs, num_bad_targs
                 
     def convert(srcfile, targetfile, batchsize, seqlength, outfile, num_docs,
                 max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0,
@@ -387,12 +391,14 @@ def get_data(args):
         return max_doc_l
 
     print("First pass through data to get vocab...")
-    max_sent_l, num_docs_train = make_vocab(args.srcfile, args.targetfile,
+    max_sent_l, num_docs_train, num_blank_docs, num_bad_targs = make_vocab(args.srcfile, args.targetfile,
                                              args.seqlength, 0, args.truncate, args.no_pad, args.targetseqlength, args.pretrain)
     print("Number of docs in training: {}".format(num_docs_train))
-    max_sent_l, num_docs_valid = make_vocab(args.srcvalfile, args.targetvalfile,
+    print("Blank docs: {}, bad targs: {}".format(num_blank_docs, num_bad_targs))
+    max_sent_l, num_docs_valid, num_blank_docs, num_bad_targs = make_vocab(args.srcvalfile, args.targetvalfile,
                                              args.seqlength, max_sent_l, args.truncate, args.no_pad, args.targetseqlength, args.pretrain)
     print("Number of docs in valid: {}".format(num_docs_valid))    
+    print("Blank docs: {}, bad targs: {}".format(num_blank_docs, num_bad_targs))
     print("Max sentence length (before cutting): {}".format(max_sent_l))
     max_sent_l = min(max_sent_l, args.maxsentlength)
     print("Max sentence length (after cutting): {}".format(max_sent_l))

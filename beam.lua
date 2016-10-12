@@ -16,12 +16,12 @@ cmd = torch.CmdLine()
 
 -- check attn options
 cmd:option('-view_attn', 0, [[View attention weights at each time step]])
-cmd:option('-print_attn', 1, [[Print attention weights]])
-cmd:option('-print_sent_attn', 1, [[Print sentence attention instead of all attn]])
+cmd:option('-print_attn', 0, [[Print attention weights]])
+cmd:option('-print_sent_attn', 0, [[Print sentence attention instead of all attn]])
 
-cmd:option('-no_pad', 0, [[No pad format for data]])
+cmd:option('-no_pad', 1, [[No pad format for data]])
 cmd:option('-no_pad_sent_l', 10, [[Number of `sentences` we have for a doc]])
-cmd:option('-repeat_words', 0, [[Repeat words format for data]])
+cmd:option('-repeat_words', 5, [[Repeat words format for data]])
 
 -- file location
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])

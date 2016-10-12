@@ -99,12 +99,17 @@ def format(path, outfile, dataset, max_num_sent=-1):
               src = src[:max_num_sent]
               src = ' </s> '.join(src) + ' </s>'
             targ = parts[1].replace('</s>', '').strip()  # TODO: consider making all highlights relevant
-            # if src == '':
-              # print src
-              # print targ
-              # print text
-              # print url_hash
-              # raw_input()
+            if src == '':
+              print 'empty', url_hash
+              continue
+            if src[-4:] != '</s>':
+              src = src + ' </s>'
+
+            # print src
+            # print targ
+            # print text
+            # print url_hash
+            # raw_input()
 
             # if counter == 1128:
               # print parts

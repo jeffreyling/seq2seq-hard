@@ -50,7 +50,7 @@ cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
 cmd:option('-oracle_epoch', 0, [[Do oracle training on this epoch]])
 cmd:option('-zero_one', 0, [[Use zero-one loss instead of log-prob]])
 cmd:option('-moving_variance', 1, [[Use moving variance to normalize rewards (thus ignoring reward_scale)]])
-cmd:option('-soft_curriculum', 1, [[Anneal semi_sampling_p as 1/sqrt(epoch) if set to 1]])
+cmd:option('-soft_curriculum', 0, [[Anneal semi_sampling_p as 1/sqrt(epoch) if set to 1]])
 
 -- hard attention specs (attn_type == 'hard')
 cmd:option('-reward_scale', 0.04, [[Scale reward by this factor]])
@@ -142,7 +142,7 @@ cmd:option('-dropout', 0.3, [[Dropout probability.
                             Dropout is applied between vertical LSTM stacks.]])
 cmd:option('-lr_decay', 0.5, [[Decay learning rate by this much if (i) perplexity does not decrease
                       on the validation set or (ii) epoch has gone past the start_decay_at_limit]])
---cmd:option('-start_decay_at', 9, [[Start decay after this epoch]])
+cmd:option('-start_decay', 0, [[Start decay if 1]])
 cmd:option('-curriculum', 0, [[For this many epochs, order the minibatches based on source
                 sequence length. Sometimes setting this to 1 will increase convergence speed.]])
 cmd:option('-pre_word_vecs_enc', '', [[If a valid path is specified, then this will load 
@@ -521,9 +521,9 @@ function train(train_data, valid_data)
    -- decay learning rate if val perf does not improve or we hit the opt.start_decay_at limit
    function decay_lr(epoch)
       print(opt.val_perf)
-      --if epoch >= opt.start_decay_at then
-	 --start_decay = 1
-      --end
+      if opt.start_decay == 1 then
+         start_decay = 1
+      end
       
       if opt.val_perf[#opt.val_perf] ~= nil and opt.val_perf[#opt.val_perf-1] ~= nil then
 	 local curr_ppl = opt.val_perf[#opt.val_perf]
@@ -654,14 +654,14 @@ function train(train_data, valid_data)
         if opt.soft_curriculum == 1 then
           local p = 1/math.sqrt(epoch)
           print(string.format('soft curriculum sampling p = %.2f', p))
-          for _,module in ipairs(sampler_layers) do
-            module.semi_sampling_p = p
-          end
-          if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
-            for _, module in ipairs(sampler_word_layers) do
-              module.semi_sampling_p = p
-            end
-          end
+          --for _,module in ipairs(sampler_layers) do
+            --module.semi_sampling_p = p
+          --end
+          --if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
+            --for _, module in ipairs(sampler_word_layers) do
+              --module.semi_sampling_p = p
+            --end
+          --end
         end
       end
       
@@ -914,11 +914,13 @@ function train(train_data, valid_data)
               cur_reward:mul(opt.reward_scale) -- helps performance
 
               -- broadcast
-              local cur_sampler
+              local cur_sampler, cur_word_sampler
               function get_single_layer(layer)
                 if layer.name ~= nil then
                     if layer.name == 'sampler' then
                       cur_sampler = layer
+                    elseif layer.name == 'sampler_word' then
+                      cur_word_sampler = layer
                     end
                 end
               end
@@ -926,7 +928,18 @@ function train(train_data, valid_data)
                 --table.insert(stochastic_layers, sampler_word_layers[t])
               --end
               if opt.attn_type == 'hard' then
+                decoder_attn_clones[t]:apply(get_single_layer)
+                local p = 1/math.sqrt(epoch)
+                if opt.soft_curriculum == 1 then
+                  cur_sampler.semi_sampling_p = p
+                end
                 cur_sampler:reinforce(cur_reward)
+                if opt.attn_word_type == 'hard' then
+                  if opt.soft_curriculum == 1 then
+                    cur_sampler.semi_sampling_p = p
+                  end
+                  cur_word_sampler:reinforce(cur_reward)
+                end
               end
 
               -- update learned baselines
