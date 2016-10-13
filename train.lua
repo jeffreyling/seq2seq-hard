@@ -12,6 +12,8 @@ cmd = torch.CmdLine()
 cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
 cmd:option('-with_replace', 1, [[With replacement for multisampling]])
 cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
+cmd:option('-use_sigmoid', 0, [[Use sigmoid instead of softmax for sent attn (SOFT ONLY!)]])
+cmd:option('-hop_attn', 1, [[Do multiple hops for attention]])
 
 cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-denoise', 0, [[Denoising autoencoder p]])
@@ -67,9 +69,8 @@ cmd:option('-global_variance', 1, [[Variance global instead of time dependent. G
 cmd:option('-discount', 0.5, [[Discount factor for rewards, between 0 and 1]])
 cmd:option('-soft_anneal', 0, [[Train with soft attention for this many epochs to begin]])
 cmd:option('-num_samples', 1, [[Number of times to sample for each data point (most people do 1)]])
-cmd:option('-temperature', 1, [[Temperature for sampling]])
+--cmd:option('-temperature', 1, [[Temperature for sampling]])
 
-cmd:option('-stupid_hack', 0, [[Stupid hack]])
 cmd:option('-brnn', 0, [[If = 1, use a bidirectional RNN. Hidden states of the fwd/bwd
                               RNNs are summed.]])
 
@@ -688,6 +689,7 @@ function train(train_data, valid_data)
           end
         else
           d = data[batch_order[i]]
+          --d = data[data:size(1)-1]
         end
         local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
         local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
@@ -914,13 +916,13 @@ function train(train_data, valid_data)
               cur_reward:mul(opt.reward_scale) -- helps performance
 
               -- broadcast
-              local cur_sampler, cur_word_sampler
+              local cur_samplers = {}
               function get_single_layer(layer)
                 if layer.name ~= nil then
                     if layer.name == 'sampler' then
-                      cur_sampler = layer
+                      table.insert(cur_samplers, layer)
                     elseif layer.name == 'sampler_word' then
-                      cur_word_sampler = layer
+                      table.insert(cur_samplers, layer)
                     end
                 end
               end
@@ -930,15 +932,11 @@ function train(train_data, valid_data)
               if opt.attn_type == 'hard' then
                 decoder_attn_clones[t]:apply(get_single_layer)
                 local p = 1/math.sqrt(epoch)
-                if opt.soft_curriculum == 1 then
-                  cur_sampler.semi_sampling_p = p
-                end
-                cur_sampler:reinforce(cur_reward)
-                if opt.attn_word_type == 'hard' then
+                for _,layer in ipairs(cur_samplers) do
                   if opt.soft_curriculum == 1 then
-                    cur_sampler.semi_sampling_p = p
+                    layer.semi_sampling_p = p
                   end
-                  cur_word_sampler:reinforce(cur_reward)
+                  layer:reinforce(cur_reward)
                 end
               end
 
@@ -1645,13 +1643,14 @@ function main()
    end
    --assert(opt.multisampling > 0, 'please use multisampling')
    if opt.multisampling > 0 then
-     assert(opt.multisampling > 1)
+     assert(opt.hop_attn > 1 or opt.multisampling > 1, 'please do more than one sample')
      print(string.format('sampling attn %d instead of once', opt.multisampling))
      print('with replace =', opt.with_replace)
      print('uniform attn =', opt.uniform_attn)
    else
      print('NOT multisampling')
    end
+   print('hops:', opt.hop_attn)
 
    layers = {encoder, decoder, generator, decoder_attn}
    layers_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
