@@ -12,8 +12,10 @@ cmd = torch.CmdLine()
 cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
 cmd:option('-with_replace', 1, [[With replacement for multisampling]])
 cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
-cmd:option('-use_sigmoid', 0, [[Use sigmoid instead of softmax for sent attn (SOFT ONLY!)]])
-cmd:option('-hop_attn', 1, [[Do multiple hops for attention]])
+cmd:option('-use_sigmoid_sent', 0, [[Use sigmoid instead of softmax for sent attn (SOFT ONLY!)]])
+cmd:option('-use_sigmoid_word', 0, [[Use sigmoid instead of softmax for word attn (SOFT ONLY!)]])
+cmd:option('-hop_attn', 1, [[Do this many hops for attention]])
+--cmd:option('-different_sampling', 1, [[Make this many distributions for sampling, then sum]])
 
 cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-denoise', 0, [[Denoising autoencoder p]])
@@ -45,11 +47,8 @@ cmd:option('-use_chars_enc', 1, [[If = 1, use character on the encoder
 cmd:option('-share_embed', 0, [[ Autoencoder mode: share enc/dec embeddings ]])
 cmd:option('-fix_encoder', 0, [[Fix encoder]])
 cmd:option('-fix_decoder', 0, [[Fix decoder]])
-cmd:option('-save_batch', 0, [[Save at this batch]])
-cmd:option('-print_batch', 0, [[Print at this batch attention weights and stuff]])
 cmd:option('-reinit_encoder', 0, [[Reinit encoder weights]])
 cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
-cmd:option('-oracle_epoch', 0, [[Do oracle training on this epoch]])
 cmd:option('-zero_one', 0, [[Use zero-one loss instead of log-prob]])
 cmd:option('-moving_variance', 1, [[Use moving variance to normalize rewards (thus ignoring reward_scale)]])
 cmd:option('-soft_curriculum', 0, [[Anneal semi_sampling_p as 1/sqrt(epoch) if set to 1]])
@@ -790,16 +789,6 @@ function train(train_data, valid_data)
             context[{{},{},t}]:copy(out[#out]:view(batch_l, source_l, opt.rnn_size))
           end
 
-          if i % opt.print_batch == 0 then
-            print(source:narrow(1,1,10))
-            print(source_char_l)
-            print('loss:', train_loss)
-            --print('memory:', cutorch.getMemoryUsage(opt.gpuid))
-            --print('i:', i)
-            --print('source length:', source_l, 'time step:', t)
-            io.read()
-          end
-
           -- forward prop decoder
           local rnn_state_dec = reset_state(init_fwd_dec, batch_l, 0)
           if opt.init_dec == 1 then
@@ -834,23 +823,6 @@ function train(train_data, valid_data)
                 rnn_state_dec[0][L*2-1+opt.input_feed]:add(init_dec_modules_bwd[L*2-1]:forward(rnn_state_enc_bwd[1][L*2-1]))
                 rnn_state_dec[0][L*2+opt.input_feed]:add(init_dec_modules_bwd[L*2]:forward(rnn_state_enc_bwd[1][L*2]))
               end
-            end
-          end
-
-          if opt.oracle_epoch > 0 then
-            if epoch == opt.oracle_epoch then
-              -- cheating oracle for attn
-              for t = 1, target_l do
-                sampler_layers[t].oracle = true
-                sampler_layers[t].time_step = t
-              end
-            else
-              for t = 1, target_l do
-                sampler_layers[t].oracle = false
-              end
-              -- fix encoder, decoder
-              --opt.fix_encoder = 1
-              --opt.fix_decoder = 1
             end
           end
 
@@ -913,7 +885,9 @@ function train(train_data, valid_data)
                 end
                 cur_reward = sum_reward:clone()
               end
-              cur_reward:mul(opt.reward_scale) -- helps performance
+              if opt.moving_variance == 1 then
+                cur_reward:mul(opt.reward_scale) -- helps performance
+              end
 
               -- broadcast
               local cur_samplers = {}
@@ -1199,15 +1173,6 @@ function train(train_data, valid_data)
           num_words_source / time_taken,
           num_words_target / time_taken)			   
           print(stats)
-
-          if i == opt.save_batch then
-            print(string.format('saving at batch %d', i))
-            local savefile = string.format('%s_epoch%d_batch%d_%.2f.t7', opt.savefile, epoch,
-                                            i, math.exp(train_loss/train_nonzeros))      
-            print('saving checkpoint to ' .. savefile)
-            clean_layer(generator)
-            save_checkpoint(savefile)
-          end
         end
         if i % 200 == 0 then
           collectgarbage()
@@ -1643,7 +1608,7 @@ function main()
    end
    --assert(opt.multisampling > 0, 'please use multisampling')
    if opt.multisampling > 0 then
-     assert(opt.hop_attn > 1 or opt.multisampling > 1, 'please do more than one sample')
+     assert(opt.different_sampling > 0 or opt.hop_attn > 1 or opt.multisampling > 1, 'please do more than one sample')
      print(string.format('sampling attn %d instead of once', opt.multisampling))
      print('with replace =', opt.with_replace)
      print('uniform attn =', opt.uniform_attn)
@@ -1651,6 +1616,7 @@ function main()
      print('NOT multisampling')
    end
    print('hops:', opt.hop_attn)
+   print('number of distributions:', opt.different_sampling)
 
    layers = {encoder, decoder, generator, decoder_attn}
    layers_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}

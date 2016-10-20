@@ -247,10 +247,8 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    local context = inputs[2]
    local bow_context = inputs[3]
    simple = simple or 0
-   local dropout = opt.dropout or 0
    -- get attention
 
-   -- attention over sentences
    local bow_size
    if opt.bow_encoder_lstm == 1 then
      bow_size = opt.rnn_size
@@ -265,87 +263,121 @@ function make_hierarchical_decoder_attn(data, opt, simple)
      bow_size = bow_size + opt.word_vec_size
    end
 
-   local reshape_context = nn.Reshape(-1, opt.rnn_size, true)(context) -- batch_l x (source_l*source_char_l) x opt.rnn_size
-   local cur_target_t = target_t -- will change over hops
+   local cur_target_t = target_t
    for hop = 1, opt.hop_attn do
-     local attn1 = nn.MM():usePrealloc("dec_hier_attn_mm1_" .. hop,
-                                       {{opt.max_batch_l, opt.max_sent_l_src, opt.rnn_size},{opt.rnn_size,opt.rnn_size,1}},
-                                       {{opt.max_batch_l, opt.max_sent_l_src, 1}})
-                           ({bow_context, nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, bow_size)(cur_target_t))}) -- batch_l x source_l x 1
-     attn1 = nn.Sum(3)(attn1)
-     local softmax_attn1 = nn.SoftMax()
-     if opt.use_sigmoid == 1 then
-       softmax_attn1 = nn.Sigmoid()
-     end
-     softmax_attn1.name = 'softmax_attn1_' .. hop
-     attn1 = softmax_attn1(attn1) -- batch_l x source_l
-     if opt.attn_type == 'hard' then
-       -- sample (hard attention)
-       local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
-                                              opt.with_replace, opt.uniform_attn)
-       sampler.name = 'sampler'
-       attn1 = sampler(attn1) -- one hot
-     end
+     local hop_attn = make_hier_hop(data, opt, simple, bow_size, hop)
+     cur_target_t = hop_attn({cur_target_t, context, bow_context})
+   end
 
-     -- attention over words of each sentence
-     local attn2 = nn.MM():usePrealloc("dec_hier_attn_mm2_" .. hop,
-                                       {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size},{opt.rnn_size,opt.rnn_size,1}},
-                                       {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, 1}})
-                           ({reshape_context, nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(cur_target_t))}) -- batch_l x (source_l*source_char_l) x 1
-     attn2 = nn.Sum(3)(attn2)
-     attn2 = nn.View(-1):setNumInputDims(1)(nn.ViewAs(3)({attn2, context})) -- (batch_l*source_l) x source_char_l
-     local softmax_attn2 = nn.SoftMax()
-     if opt.use_sigmoid == 1 then
-       softmax_attn2 = nn.Sigmoid()
-     end
-     softmax_attn2.name = 'softmax_attn2_' .. hop
-     attn2 = softmax_attn2(attn2)
-     if opt.attn_word_type == 'hard' then
-       -- word level sampling
-       local sampler_word = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
-                                                    opt.with_replace, opt.uniform_attn)
-       sampler_word.name = 'sampler_word'
-       attn2 = sampler_word(attn2) -- one hot
-     end
-     attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
+   return nn.gModule(inputs, {cur_target_t})
+end
+
+function make_hier_hop(data, opt, simple, bow_size, hop)
+   local inputs = {}
+   table.insert(inputs, nn.Identity()())
+   table.insert(inputs, nn.Identity()())
+   table.insert(inputs, nn.Identity()())
+   local target_t = inputs[1]
+   local context = inputs[2]
+   local bow_context = inputs[3] -- batch_l x source_l x bow_size
+   simple = simple or 0
+   local dropout = opt.dropout or 0
+   -- get attention
+
+   -- attention over sentences
+   local reshape_context = nn.Reshape(-1, opt.rnn_size, true)(context) -- batch_l x (source_l*source_char_l) x opt.rnn_size
+   local attn_k = {} -- attn_k[k] is batch_l x source_l
+  local K = opt.different_sampling
+  local big_target_t = nn.LinearNoBias(opt.rnn_size, bow_size*K)(target_t) -- batch_l x (bow_size*K)
+  for k = 1, K do
+    local cur_target_t = nn.Narrow(2, bow_size*(k-1)+1, bow_size)(big_target_t) -- batch_l x bow_size
+    local attn1 = nn.MM():usePrealloc("dec_hier_attn_mm1_" .. hop .. '_' .. k,
+                                      {{opt.max_batch_l, opt.max_sent_l_src, bow_size},{bow_size,bow_size,1}},
+                                      {{opt.max_batch_l, opt.max_sent_l_src, 1}})
+                          ({bow_context, nn.Replicate(1,3)(cur_target_t)}) -- batch_l x source_l x 1
+    attn1 = nn.Sum(3)(attn1)
+    local softmax_attn = nn.SoftMax()
+    if opt.use_sigmoid == 1 then
+      softmax_attn = nn.Sigmoid()
+    end
+    softmax_attn.name = 'softmax_attn1_' .. hop .. '_' .. k
+    attn1 = softmax_attn(attn1) -- batch_l x source_l
+    if opt.attn_type == 'hard' then
+      -- sample (hard attention)
+      local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
+                                             opt.with_replace, opt.uniform_attn)
+      sampler.name = 'sampler'
+      attn1 = sampler(attn1) -- one hot
+    end
+    table.insert(attn_k, attn1)
+  end
+
+   -- attention over words of each sentence
+   local attn2 = nn.MM():usePrealloc("dec_hier_attn_mm2_" .. hop,
+                                     {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size},{opt.rnn_size,opt.rnn_size,1}},
+                                     {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, 1}})
+                         ({reshape_context, nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(target_t))}) -- batch_l x (source_l*source_char_l) x 1
+   attn2 = nn.Sum(3)(attn2)
+   attn2 = nn.View(-1):setNumInputDims(1)(nn.ViewAs(3)({attn2, context})) -- (batch_l*source_l) x source_char_l
+   local softmax_attn2 = nn.SoftMax()
+   if opt.use_sigmoid_word == 1 then
+     softmax_attn2 = nn.Sigmoid()
+   end
+   softmax_attn2.name = 'softmax_attn2_' .. hop
+   attn2 = softmax_attn2(attn2)
+   if opt.attn_word_type == 'hard' then
+     -- word level sampling
+     local sampler_word = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
+                                                  opt.with_replace, opt.uniform_attn)
+     sampler_word.name = 'sampler_word'
+     attn2 = sampler_word(attn2) -- one hot
+   end
+   attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
+
+   local all_context_outputs = {}
+   for k = 1, K do
      -- multiply attentions together
-     local mul_attn = nn.CMulTable():usePrealloc("dec_hier_attn_cmultable" .. hop,
+     local mul_attn = nn.CMulTable():usePrealloc("dec_hier_attn_cmultable" .. hop .. '_' .. k,
                                                  {{opt.max_batch_l, opt.max_sent_l, opt.max_word_l}, {opt.max_batch_l, opt.max_sent_l, opt.max_word_l}})
-                                     ({nn.ReplicateAs(3,3)({attn1, attn2}), attn2}) -- batch_l x source_l x source_char_l
+                                     ({nn.ReplicateAs(3,3)({attn_k[k], attn2}), attn2}) -- batch_l x source_l x source_char_l
      mul_attn = nn.Replicate(1,2)(nn.View(-1):setNumInputDims(2)(mul_attn)) -- batch_l x 1 x (source_l*source_char_l)
 
      -- apply attention to context
-     local context_combined = nn.MM():usePrealloc("dec_hier_attn_mm3_" .. hop,
+     local context_combined = nn.MM():usePrealloc("dec_hier_attn_mm3_" .. hop .. '_' .. k,
                                                  {{opt.max_batch_l, 1, opt.max_sent_l_src*opt.max_word_l},{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size}},
                                                      {{opt.max_batch_l, 1, opt.rnn_size}})
                                       ({mul_attn, reshape_context}) -- batch_l x 1 x rnn_size
-     context_combined = nn.Sum(2):usePrealloc("dec_hier_attn_sum" .. hop,
+     context_combined = nn.Sum(2):usePrealloc("dec_hier_attn_sum" .. hop .. '_' .. k,
                                               {{opt.max_batch_l, 1, opt.rnn_size}},
                                               {{opt.max_batch_l, opt.rnn_size}})
                                   (context_combined) -- batch_l x rnn_size
      local context_output
      if simple == 0 then
-        context_combined = nn.JoinTable(2):usePrealloc("dec_hier_attn_jointable" .. hop,
+        context_combined = nn.JoinTable(2):usePrealloc("dec_hier_attn_jointable"..hop..'_'..k,
                                                      {{opt.max_batch_l,opt.rnn_size},{opt.max_batch_l, opt.rnn_size}})
                                            ({context_combined, inputs[1]}) -- batch_l x rnn_size*2
 
-        context_output = nn.Tanh():usePrealloc("dec_hier_noattn_tanh" .. hop,{{opt.max_batch_l,opt.rnn_size}})
-                                  (nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size):usePrealloc("dec_hier_noattn_linear" .. hop, {{opt.max_batch_l,2*opt.rnn_size}})(context_combined))
+      context_output = nn.Tanh():usePrealloc("dec_hier_noattn_tanh"..hop..'_'..k, {{opt.max_batch_l,opt.rnn_size}})
+                                (nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size):usePrealloc("dec_hier_noattn_linear" .. hop..'_'..k, {{opt.max_batch_l,2*opt.rnn_size}})(context_combined))
      else
         context_output = nn.CAddTable()({context_combined,inputs[1]})
      end
 
      if dropout > 0 then
-        context_output = nn.Dropout(dropout, nil, false):usePrealloc("dec_hier_attn_dropout" .. hop,
+        context_output = nn.Dropout(dropout, nil, false):usePrealloc("dec_hier_attn_dropout" .. hop..'_'..k,
                                                           {{opt.rnn_size, opt.rnn_size}})(context_output)
      end     
-     cur_target_t = context_output
+     table.insert(all_context_outputs, context_output)
    end
 
    -- finished hops
-   table.insert(outputs, cur_target_t)
-   --return nn.gModule(inputs, {context_output})   
-   return nn.gModule(inputs, outputs)   
+   local out
+   if opt.different_sampling > 1 then
+     out = nn.CAddTable()(all_context_outputs)
+   else
+     out = all_context_outputs[1]
+   end
+   return nn.gModule(inputs, {out})   
 end
 
 function make_init_dec_module(opt, batch_l, source_l)
