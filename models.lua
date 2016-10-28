@@ -286,31 +286,38 @@ function make_hier_hop(data, opt, simple, bow_size, hop)
 
    -- attention over sentences
    local reshape_context = nn.Reshape(-1, opt.rnn_size, true)(context) -- batch_l x (source_l*source_char_l) x opt.rnn_size
-   local attn_k = {} -- attn_k[k] is batch_l x source_l
-  local K = opt.different_sampling
-  local big_target_t = nn.LinearNoBias(opt.rnn_size, bow_size*K)(target_t) -- batch_l x (bow_size*K)
-  for k = 1, K do
-    local cur_target_t = nn.Narrow(2, bow_size*(k-1)+1, bow_size)(big_target_t) -- batch_l x bow_size
-    local attn1 = nn.MM():usePrealloc("dec_hier_attn_mm1_" .. hop .. '_' .. k,
-                                      {{opt.max_batch_l, opt.max_sent_l_src, bow_size},{bow_size,bow_size,1}},
-                                      {{opt.max_batch_l, opt.max_sent_l_src, 1}})
-                          ({bow_context, nn.Replicate(1,3)(cur_target_t)}) -- batch_l x source_l x 1
-    attn1 = nn.Sum(3)(attn1)
-    local softmax_attn = nn.SoftMax()
-    if opt.use_sigmoid == 1 then
-      softmax_attn = nn.Sigmoid()
-    end
-    softmax_attn.name = 'softmax_attn1_' .. hop .. '_' .. k
-    attn1 = softmax_attn(attn1) -- batch_l x source_l
-    if opt.attn_type == 'hard' then
-      -- sample (hard attention)
-      local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
-                                             opt.with_replace, opt.uniform_attn)
-      sampler.name = 'sampler'
-      attn1 = sampler(attn1) -- one hot
-    end
-    table.insert(attn_k, attn1)
-  end
+   local K = opt.different_sampling
+   local attn_k = {}
+   local cur_target_t = nn.LinearNoBias(opt.rnn_size, bow_size)(target_t) -- batch_l x bow_size
+   local scalars = nn.SoftPlus()(nn.LinearNoBias(opt.rnn_size, K)(target_t))
+   if opt.diff_method == 'oneplus' then
+     scalars = nn.AddConstant(1, true)(scalars)
+   end
+   for k = 1, K do
+     local attn1 = nn.MM():usePrealloc("dec_hier_attn_mm1_" .. hop .. '_' .. k,
+                                       {{opt.max_batch_l, opt.max_sent_l_src, bow_size},{bow_size,bow_size,1}},
+                                       {{opt.max_batch_l, opt.max_sent_l_src, 1}})
+                           ({bow_context, nn.Replicate(1,3)(cur_target_t)}) -- batch_l x source_l x 1
+     attn1 = nn.Sum(3)(attn1)
+     local scalar = nn.ReplicateAs(2,2)({nn.Select(2,k)(scalars), attn1}) -- for spiky distribution
+     attn1 = nn.CMulTable(2)({scalar, attn1})
+     local softmax_attn = nn.SoftMax()
+     if opt.use_sigmoid_sent == 1 then
+       softmax_attn = nn.Sigmoid()
+     end
+     softmax_attn.name = 'softmax_attn1_' .. hop
+     attn1 = softmax_attn(attn1) -- batch_l x source_l
+     if opt.attn_type == 'hard' then
+       -- sample (hard attention)
+       local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
+                                              opt.with_replace, opt.uniform_attn)
+                                              :usePrealloc("sampler_" .. hop .. '_' .. k,
+                                              {{opt.max_sent_l_src, opt.max_sent_l_src}})
+       sampler.name = 'sampler'
+       attn1 = sampler(attn1) -- one hot
+     end
+     table.insert(attn_k, attn1)
+   end
 
    -- attention over words of each sentence
    local attn2 = nn.MM():usePrealloc("dec_hier_attn_mm2_" .. hop,
@@ -334,6 +341,7 @@ function make_hier_hop(data, opt, simple, bow_size, hop)
    end
    attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
 
+   -- apply to contexts
    local all_context_outputs = {}
    for k = 1, K do
      -- multiply attentions together
@@ -357,8 +365,10 @@ function make_hier_hop(data, opt, simple, bow_size, hop)
                                                      {{opt.max_batch_l,opt.rnn_size},{opt.max_batch_l, opt.rnn_size}})
                                            ({context_combined, inputs[1]}) -- batch_l x rnn_size*2
 
-      context_output = nn.Tanh():usePrealloc("dec_hier_noattn_tanh"..hop..'_'..k, {{opt.max_batch_l,opt.rnn_size}})
-                                (nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size):usePrealloc("dec_hier_noattn_linear" .. hop..'_'..k, {{opt.max_batch_l,2*opt.rnn_size}})(context_combined))
+
+        local dec_hier_linear = nn.LinearNoBias(opt.rnn_size*2, opt.rnn_size):usePrealloc("dec_hier_noattn_linear" .. hop..'_'..k, {{opt.max_batch_l,2*opt.rnn_size}})
+        context_output = nn.Tanh():usePrealloc("dec_hier_noattn_tanh"..hop..'_'..k, {{opt.max_batch_l,opt.rnn_size}})
+                                (dec_hier_linear(context_combined))
      else
         context_output = nn.CAddTable()({context_combined,inputs[1]})
      end
