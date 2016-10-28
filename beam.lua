@@ -347,6 +347,9 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       end
       local attn_out = model[layers_idx['decoder_attn']]:forward(decoder_attn_input)
       local out = model[3]:forward(attn_out) -- K x vocab_size
+      print('softplus weights')
+      print(probe_layer.output)
+      io.read()
       
       rnn_state_dec = {} -- to be modified later
       if model_opt.input_feed == 1 then
@@ -629,6 +632,9 @@ function get_layer(layer)
       elseif layer.name == 'word_vecs_dec' then
          word_vecs_dec = layer
       end       
+   end
+   if layer.__typename == 'nn.SoftPlus' then
+     probe_layer = layer
    end
 end
 

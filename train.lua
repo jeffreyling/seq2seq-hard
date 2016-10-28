@@ -7,15 +7,19 @@ require 'util.lua'
 require 'models.lua'
 require 'model_utils.lua'
 
+--nngraph.setDebug(true)
+
 cmd = torch.CmdLine()
 
 cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
+cmd:option('-sampling_curric', 0, [[Set 1 to anneal 5,4,3,2,1 samples]])
 cmd:option('-with_replace', 1, [[With replacement for multisampling]])
 cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
 cmd:option('-use_sigmoid_sent', 0, [[Use sigmoid instead of softmax for sent attn (SOFT ONLY!)]])
 cmd:option('-use_sigmoid_word', 0, [[Use sigmoid instead of softmax for word attn (SOFT ONLY!)]])
 cmd:option('-hop_attn', 1, [[Do this many hops for attention]])
 --cmd:option('-different_sampling', 1, [[Make this many distributions for sampling, then sum]])
+cmd:option('-diff_method', 'oneplus', [[softplus or oneplus]])
 
 cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-denoise', 0, [[Denoising autoencoder p]])
@@ -406,16 +410,7 @@ function train(train_data, valid_data)
   end
 
    if opt.attn_type == 'hard' then
-     -- save stochastic layers
-     --sampler_layers = {}
-     --mul_constant_layers = {}
-     --if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
-       --sampler_word_layers = {}
-     --end
-     --for i = 1, opt.max_sent_l_targ do
-       --decoder_attn_clones[i]:apply(get_RL_layer)
-     --end
-
+     -- get stochastic layers
      if opt.baseline_method == 'average' or opt.baseline_method == 'both' then
        -- baseline should be time dependent on target
        if opt.global_baseline == 0 and type(opt.baseline) == 'number' then
@@ -632,6 +627,23 @@ function train(train_data, valid_data)
       local num_samples = opt.num_samples
 
       if opt.attn_type == 'hard' then
+         if opt.sampling_curric == 1 then
+           sampler_layers = {}
+           --if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
+             --sampler_word_layers = {}
+           --end
+           for i = 1, opt.max_sent_l_targ do
+             decoder_attn_clones[i]:apply(get_RL_layer)
+           end
+           for i = 1, opt.max_sent_l_targ do
+              local cur_layer = sampler_layers[i]
+              if epoch > 5 and cur_layer.multisampling > 1 then
+                -- run with multisampling for 5 epochs then decrease
+                cur_layer.multisampling = cur_layer.multisampling - 1
+              end
+           end
+         end
+
         -- soft anneal 
         local cur_soft_anneal = false
         if opt.soft_anneal > 0 then
@@ -909,6 +921,12 @@ function train(train_data, valid_data)
                 for _,layer in ipairs(cur_samplers) do
                   if opt.soft_curriculum == 1 then
                     layer.semi_sampling_p = p
+                  end
+                  if opt.sampling_curric == 1 then
+                    if epoch > 5 and layer.multisampling > 1 then
+                      -- run with multisampling for 5 epochs then decrease
+                      layer.multisampling = layer.multisampling - 1
+                    end
                   end
                   layer:reinforce(cur_reward)
                 end
@@ -1498,6 +1516,8 @@ function main()
         copy_params(encoder, model[1]:double())
         copy_params(decoder, model[2]:double())
         copy_params(generator, model[3]:double())
+        print(decoder_attn:parameters())
+        print(model[4]:double():parameters())
         copy_params(decoder_attn, model[4]:double())
         if model_opt.brnn == 1 then
           copy_params(encoder_bwd, model[save_idx['encoder_bwd']]:double())
@@ -1608,7 +1628,7 @@ function main()
    end
    --assert(opt.multisampling > 0, 'please use multisampling')
    if opt.multisampling > 0 then
-     assert(opt.different_sampling > 0 or opt.hop_attn > 1 or opt.multisampling > 1, 'please do more than one sample')
+     --assert(opt.hop_attn > 1 or opt.multisampling > 1, 'please do more than one sample')
      print(string.format('sampling attn %d instead of once', opt.multisampling))
      print('with replace =', opt.with_replace)
      print('uniform attn =', opt.uniform_attn)
@@ -1616,7 +1636,6 @@ function main()
      print('NOT multisampling')
    end
    print('hops:', opt.hop_attn)
-   print('number of distributions:', opt.different_sampling)
 
    layers = {encoder, decoder, generator, decoder_attn}
    layers_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
