@@ -6,11 +6,22 @@ require 'data.lua'
 require 'util.lua'
 require 'models.lua'
 require 'model_utils.lua'
+require 'logging.lua'
 
 --nngraph.setDebug(true)
 
 cmd = torch.CmdLine()
 
+cmd:option('-log_path', '', [[Logging path]])
+
+cmd:option('-inf_mask', 0, [[Mask out attention for padding]])
+cmd:option('-add_sent_context', 0, [[Add previous sentence context to each row]])
+cmd:option('-add_sent_context_init', 0, [[Init encoder with previous sent context]])
+cmd:option('-pos_embeds', 0, [[Use positional embeddings as encoder initialization]])
+cmd:option('-pos_embeds_sent', 0, [[Use positional embeddings for each sentence]])
+cmd:option('-pos_dim', 25, [[Embedding size for bow context pos]])
+
+cmd:option('-beta_attn', 1, [[Beta value for attention]])
 cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
 cmd:option('-sampling_curric', 0, [[Set 1 to anneal 5,4,3,2,1 samples]])
 cmd:option('-with_replace', 1, [[With replacement for multisampling]])
@@ -19,7 +30,7 @@ cmd:option('-use_sigmoid_sent', 0, [[Use sigmoid instead of softmax for sent att
 cmd:option('-use_sigmoid_word', 0, [[Use sigmoid instead of softmax for word attn (SOFT ONLY!)]])
 cmd:option('-hop_attn', 1, [[Do this many hops for attention]])
 --cmd:option('-different_sampling', 1, [[Make this many distributions for sampling, then sum]])
-cmd:option('-diff_method', 'oneplus', [[softplus or oneplus]])
+--cmd:option('-diff_method', 'oneplus', [[softplus or oneplus]])
 
 cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-denoise', 0, [[Denoising autoencoder p]])
@@ -191,32 +202,37 @@ opt = cmd:parse(arg)
 torch.manualSeed(opt.seed)
 
 function save_checkpoint(savefile)
-  local save_table = {encoder, decoder, generator, decoder_attn}
-  local save_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
-  local idx = 5
-  if opt.hierarchical == 1 then
-    table.insert(save_table, bow_encoder)
-    save_idx['bow_encoder'] = idx
-    idx = idx + 1
-    if opt.bow_encoder_lstm == 1 then
-      table.insert(save_table, bow_encoder_lstm)
-      save_idx['bow_encoder_lstm'] = idx
-      idx = idx + 1
-    end
-  end
-  if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
-    table.insert(save_table, baseline_m)
-    save_idx['baseline_m'] = idx
-    idx = idx + 1
-  end
-  if opt.brnn == 1 then
-    table.insert(save_table, encoder_bwd)
-    save_idx['encoder_bwd'] = idx
-    idx = idx + 1
-  end
-  opt.save_idx = save_idx
+  --local save_table = {encoder, decoder, generator, decoder_attn}
+  --local save_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
+  --local idx = 5
+  --if opt.hierarchical == 1 then
+    --table.insert(save_table, bow_encoder)
+    --save_idx['bow_encoder'] = idx
+    --idx = idx + 1
+    --if opt.pos_embeds == 1 then
+      --table.insert(save_table, pos_embeds)
+      --save_idx['pos_embeds'] = idx
+      --idx = idx + 1
+    --end
+    --if opt.bow_encoder_lstm == 1 then
+      --table.insert(save_table, bow_encoder_lstm)
+      --save_idx['bow_encoder_lstm'] = idx
+      --idx = idx + 1
+    --end
+  --end
+  --if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
+    --table.insert(save_table, baseline_m)
+    --save_idx['baseline_m'] = idx
+    --idx = idx + 1
+  --end
+  --if opt.brnn == 1 then
+    --table.insert(save_table, encoder_bwd)
+    --save_idx['encoder_bwd'] = idx
+    --idx = idx + 1
+  --end
+  opt.save_idx = layers_idx
   if opt.debug == 0 then
-    torch.save(savefile, {save_table, opt})
+    torch.save(savefile, {layers, opt})
   end
 end
 
@@ -258,6 +274,11 @@ function train(train_data, valid_data)
 	 word_vec_layers[2].weight[i]:copy(pre_word_vecs[i])
       end      
    end
+   if opt.hierarchical == 1 then
+     -- copy word2vec to bow_encoder
+     num_params = num_params - word_vec_layers[1].weight:nElement()
+     word_vecs_bow.weight:copy(word_vec_layers[1].weight)
+   end
 
    if opt.share_embed == 1 then
      -- share word vecs
@@ -275,12 +296,7 @@ function train(train_data, valid_data)
       --end            
    end
 
-   if opt.hierarchical == 1 then
-     -- subtract shared params for bow encoder
-     num_params = num_params - word_vecs_bow.weight:nElement()
-     word_vecs_bow.weight:copy(word_vec_layers[1].weight)
-   end
-   print("Number of parameters: " .. num_params)
+   logging:info("Number of parameters: " .. num_params)
    
    -- padding
    word_vec_layers[1].weight[1]:zero()            
@@ -291,7 +307,7 @@ function train(train_data, valid_data)
    if opt.hierarchical == 1 then
      word_vecs_bow.weight[1]:zero()
    end
-   
+
    -- prototypes for gradients so there is no need to clone
    local max_word_l_sz = opt.max_word_l
    if opt.denoise > 0 then
@@ -300,32 +316,43 @@ function train(train_data, valid_data)
    local encoder_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, max_word_l_sz, opt.rnn_size)
    local encoder_bwd_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, max_word_l_sz, opt.rnn_size)
    context_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, max_word_l_sz, opt.rnn_size)
-   local bow_size -- output size of bow encoder
    local encoder_bow_lstm_grad_proto
    if opt.bow_encoder_lstm == 1 then
-     bow_size = opt.rnn_size
+     local grad_sz
      if opt.no_bow == 1 then
-       encoder_bow_lstm_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.rnn_size)
+       grad_sz = opt.rnn_size
      else
-       local sz
-       if opt.conv_bow == 1 then sz = opt.num_kernels else sz = opt.word_vec_size end
-       encoder_bow_lstm_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, sz)
+       grad_sz = opt.word_vec_size
+       if opt.conv_bow == 1 then
+         grad_sz = opt.num_kernels
+       end
      end
-   else
-     if opt.conv_bow == 1 then
-       bow_size = opt.num_kernels
-     else
-       bow_size = opt.word_vec_size
+     if opt.pos_embeds_sent == 1 then
+       grad_sz = grad_sz + opt.pos_dim
      end
+     encoder_bow_lstm_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, grad_sz)
    end
    local encoder_bow_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, bow_size)
    context_bow_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, bow_size)
-   
+   if opt.pos_embeds == 1 or opt.pos_embeds_sent == 1 then
+     pos_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l):cuda()
+     for t = 1, opt.max_sent_l do
+       pos_proto[{{}, {t}}]:fill(t)
+     end
+     if opt.pos_embeds == 1 then
+       pos_grad_proto = torch.zeros(opt.max_batch_l*opt.max_sent_l, opt.num_layers*opt.rnn_size*2):cuda()
+     end
+   end
+   local add_sent_context_init_grad_proto
+   if opt.add_sent_context_init == 1 then
+     add_sent_context_init_grad_proto = torch.zeros(opt.max_batch_l*opt.max_sent_l, opt.num_layers*opt.rnn_size*2):cuda()
+   end
+
    -- clone encoder/decoder up to max source/target length   
    decoder_clones = clone_many_times(decoder, opt.max_sent_l_targ)
    decoder_attn_clones = clone_many_times(decoder_attn, opt.max_sent_l_targ)
    encoder_clones = clone_many_times(encoder, max_word_l_sz)
-   if (opt.hierarchical == 1) and (opt.bow_encoder_lstm == 1) then
+   if opt.hierarchical == 1 and opt.bow_encoder_lstm == 1 then
      bow_encoder_lstm_clones = clone_many_times(bow_encoder_lstm, opt.max_sent_l_src)
    end
    if opt.brnn == 1 then
@@ -341,7 +368,7 @@ function train(train_data, valid_data)
          if opt.prealloc == 1 then encoder_bwd_clones[i]:apply(function(m) m:setPrealloc() end) end
       end      
    end
-   if (opt.hierarchical == 1) and (opt.bow_encoder_lstm == 1) then
+   if opt.hierarchical == 1 and opt.bow_encoder_lstm == 1 then
       for i = 1, opt.max_sent_l_src do
         bow_encoder_lstm_clones[i]:apply(function(m) m:setReuse() end)
       end
@@ -471,7 +498,6 @@ function train(train_data, valid_data)
       end
    end      
 
-   --dec_offset = 3 -- offset depends on input feeding
    dec_offset = 2 -- offset depends on input feeding
    if opt.input_feed == 1 then
       dec_offset = dec_offset + 1
@@ -515,7 +541,7 @@ function train(train_data, valid_data)
 
    -- decay learning rate if val perf does not improve or we hit the opt.start_decay_at limit
    function decay_lr(epoch)
-      print(opt.val_perf)
+      logging:info(opt.val_perf)
       if opt.start_decay == 1 then
          start_decay = 1
       end
@@ -665,7 +691,7 @@ function train(train_data, valid_data)
         -- soft curriculum
         if opt.soft_curriculum == 1 then
           local p = 1/math.sqrt(epoch)
-          print(string.format('soft curriculum sampling p = %.2f', p))
+          logging:info(string.format('soft curriculum sampling p = %.2f', p))
           --for _,module in ipairs(sampler_layers) do
             --module.semi_sampling_p = p
           --end
@@ -677,17 +703,17 @@ function train(train_data, valid_data)
         end
       end
       
-      local curric_length = 13 -- starting length of curriculum
-      curric_length = curric_length + 10 * (epoch-1) -- reach max after 5 epochs
-      local max_curric_i = 0
-      if epoch <= opt.curriculum then
-        print(string.format('curriculum length: %d', curric_length))
-        for i = 1, data:size() do
-          local d = data[i]
-          if d[7] > curric_length then break end -- check source_l
-          max_curric_i = i
-        end
-      end
+      --local curric_length = 13 -- starting length of curriculum
+      --curric_length = curric_length + 10 * (epoch-1) -- reach max after 5 epochs
+      --local max_curric_i = 0
+      --if epoch <= opt.curriculum then
+        --logging:info(string.format('curriculum length: %d', curric_length))
+        --for i = 1, data:size() do
+          --local d = data[i]
+          --if d[7] > curric_length then break end -- check source_l
+          --max_curric_i = i
+        --end
+      --end
 
       for i = 1, data:size() do
         zero_table(grad_params, 'zero')
@@ -700,7 +726,9 @@ function train(train_data, valid_data)
           end
         else
           d = data[batch_order[i]]
-          --d = data[data:size(1)-1]
+          --local idx, b,t,s,sc = data:get_worst()
+          --print(b,t,s,sc)
+          --d = data[idx]
         end
         local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
         local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
@@ -722,14 +750,14 @@ function train(train_data, valid_data)
           if opt.hierarchical == 1 and opt.bow_encoder_lstm == 1 then
             encoder_bow_lstm_grads = encoder_bow_lstm_grad_proto[{{1, batch_l}, {1, source_l}}]
           end
-          local rnn_state_enc = reset_state(init_fwd_enc, batch_l*source_l, 0) -- different batch size for summary
           local context = context_proto[{{1, batch_l}, {1, source_l}, {1, source_char_l}}]
           local rnn_state_mask -- selects last LSTM state of each sentence within batch
           if opt.no_bow == 1 then
-            rnn_state_mask = torch.zeros(batch_l, source_l, source_char_l, opt.rnn_size):byte():cuda()
+            rnn_state_mask = torch.zeros(batch_l, source_l, source_char_l, opt.rnn_size):cudaByte()
             for j = 1, batch_l do
               for t = 1, source_l do
                 local idx = source_sent_l[j][t]
+                if idx == 0 then idx = 1 end
                 rnn_state_mask[j][t][idx]:fill(1)
               end
             end
@@ -750,28 +778,31 @@ function train(train_data, valid_data)
           --end	 
 
           -- forward prop encoder bow
-          local bow_out
-          local rnn_states
-          if opt.no_bow == 1 then
-            masked_selecter = make_last_state_selecter(opt, batch_l, source_l)
-            rnn_states = masked_selecter:forward({context, rnn_state_mask})
-          end
+          local rnn_states -- rnn states for no_bow
+          local bow_out -- context per sentence
           if opt.hierarchical == 1 then
-            if opt.no_bow == 0 then
+            if opt.no_bow == 1 then
+              masked_selecter = make_last_state_selecter(opt, batch_l, source_l)
+              rnn_states = masked_selecter:forward({context, rnn_state_mask})
+              if opt.pos_embeds_sent == 1 then
+                local pos = pos_proto[{{1,batch_l}, {1, source_l}}]
+                bow_out = pos_embeds_sent:forward({rnn_states, pos})
+              end
+            else
               bow_encoder:training()
-              bow_out = bow_encoder:forward(source:permute(2,3,1):contiguous())
+              if opt.pos_embeds_sent == 1 then
+                local pos = pos_proto[{{1,batch_l}, {1, source_l}}]
+                bow_out = bow_encoder:forward({source:permute(2,3,1):contiguous(), pos})
+              else
+                bow_out = bow_encoder:forward(source:permute(2,3,1):contiguous())
+              end
             end
               
             if opt.bow_encoder_lstm == 1 then
               -- pass bag of words through LSTM over sentences for context
               for t = 1, source_l do
                 bow_encoder_lstm_clones[t]:training()
-                local bow_encoder_input
-                if opt.no_bow == 1 then
-                  bow_encoder_input = {rnn_states[t], table.unpack(rnn_state_bow_enc[t-1])}
-                else
-                  bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc[t-1])}
-                end
+                local bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc[t-1])}
                 local out = bow_encoder_lstm_clones[t]:forward(bow_encoder_input)
                 rnn_state_bow_enc[t] = out
                 context_bow[{{}, t}]:copy(out[#out])
@@ -781,10 +812,49 @@ function train(train_data, valid_data)
             end
           end
 
+          local rnn_state_enc = reset_state(init_fwd_enc, batch_l*source_l, 0) -- different batch size for summary, batch_l*source_l x 2*num_layers
+
+          -- pos embeddings
+          if opt.pos_embeds == 1 and opt.hierarchical == 1 then
+            pos_embeds:training()
+            local pos = pos_proto[{{1,batch_l}, {1, source_l}}]:reshape(batch_l*source_l)
+            local pos_states = pos_embeds:forward(pos) -- batch_l*source_l x num_layers*rnn_size*2
+
+            for l = 1, opt.num_layers do
+              rnn_state_enc[0][l*2-1]:copy(pos_states[{{},{(l*2-2)*opt.rnn_size+1, (l*2-1)*opt.rnn_size}}])
+              rnn_state_enc[0][l*2]:copy(pos_states[{{},{(l*2-1)*opt.rnn_size+1, (l*2)*opt.rnn_size}}])
+            end
+          end
+
+          local sent_context
+          if opt.add_sent_context_init == 1 then
+            sent_context = add_sent_context_init:forward(context_bow:contiguous())
+            if source_l >= 2 then
+              sent_context[{{}, {2,source_l}}]:copy(sent_context[{{}, {1,source_l-1}}])
+            end
+            sent_context[{{}, {1}}]:zero()
+            sent_context = sent_context:view(batch_l*source_l, opt.num_layers*opt.rnn_size*2)
+
+            for l = 1, opt.num_layers do
+              rnn_state_enc[0][l*2-1]:copy(sent_context[{{},{(l*2-2)*opt.rnn_size+1, (l*2-1)*opt.rnn_size}}])
+              rnn_state_enc[0][l*2]:copy(sent_context[{{},{(l*2-1)*opt.rnn_size+1, (l*2)*opt.rnn_size}}])
+            end
+          elseif opt.add_sent_context == 1 then
+            sent_context = torch.zeros(batch_l, source_l, bow_size):cuda()
+            if source_l >= 2 then
+              sent_context[{{}, {2,source_l}}]:copy(context_bow[{{}, {1,source_l-1}}])
+            end
+          end
+
           -- forward prop encoder
           for t = 1, source_char_l do
             encoder_clones[t]:training()
-            local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+            local encoder_input
+            if opt.add_sent_context == 1 then
+              encoder_input = {source[t], sent_context, table.unpack(rnn_state_enc[t-1])}
+            else
+              encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+            end
             local out = encoder_clones[t]:forward(encoder_input)
 
             -- mask out padding on encoder
@@ -840,6 +910,10 @@ function train(train_data, valid_data)
 
           local preds = {}
           local decoder_out = {}
+          local inf_mask
+          if opt.hierarchical == 1 and opt.inf_mask == 1 then
+            inf_mask = source:permute(2,3,1):contiguous():eq(1):mul(-math.huge):cuda() -- batch_l x source_l x source_char_l
+          end
           for t = 1, target_l do
             decoder_clones[t]:training()
             decoder_attn_clones[t]:training()
@@ -848,7 +922,10 @@ function train(train_data, valid_data)
             table.insert(decoder_out, out[#out]) -- for backprop
             local decoder_attn_input
             if opt.hierarchical == 1 then
-              decoder_attn_input = {out[#out], context, context_bow} 
+              decoder_attn_input = {out[#out], context, context_bow}
+              if opt.inf_mask == 1 then
+                table.insert(decoder_attn_input, inf_mask)
+              end
             else
               decoder_attn_input = {out[#out], context}
             end
@@ -865,15 +942,19 @@ function train(train_data, valid_data)
             rnn_state_dec[t] = next_state
           end
 
-          -- backward prop decoder
+          -- zero out grads
           encoder_grads:zero()
           if opt.brnn == 1 then
             encoder_bwd_grads:zero()
           end
           if opt.hierarchical == 1 then
             encoder_bow_grads:zero()
+            if opt.bow_encoder_lstm == 1 then
+              encoder_bow_lstm_grads:zero()
+            end
           end
 
+          -- backward prop decoder
           local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
           local sum_reward -- for hard attn
           local discount = opt.discount
@@ -951,7 +1032,10 @@ function train(train_data, valid_data)
             local dl_dtarget = generator:backward(preds[t], dl_dpred)
             local decoder_attn_input
             if opt.hierarchical == 1 then
-              decoder_attn_input = {decoder_out[t], context, context_bow} 
+              decoder_attn_input = {decoder_out[t], context, context_bow}
+              if opt.inf_mask == 1 then
+                table.insert(decoder_attn_input, inf_mask)
+              end
             else
               decoder_attn_input = {decoder_out[t], context}
             end
@@ -982,38 +1066,6 @@ function train(train_data, valid_data)
             word_vec_layers[2].gradWeight:zero()
           end
 
-          -- encoder bow
-          local drnn_state_bow_enc = reset_state(init_bwd_bow_enc, batch_l)
-          if opt.hierarchical == 1 then
-            if opt.bow_encoder_lstm == 1 then
-              for t = source_l, 1, -1 do
-                local bow_encoder_input
-                if opt.no_bow == 1 then
-                  bow_encoder_input = {rnn_states[t], table.unpack(rnn_state_bow_enc[t-1])}
-                else
-                  bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc[t-1])}
-                end
-                drnn_state_bow_enc[#drnn_state_bow_enc]:add(encoder_bow_grads[{{},t}])
-                local dlst = bow_encoder_lstm_clones[t]:backward(bow_encoder_input, drnn_state_bow_enc)
-                for j = 1, #drnn_state_bow_enc do
-                  drnn_state_bow_enc[j]:copy(dlst[j+1])
-                end
-                encoder_bow_lstm_grads[{{},t}]:copy(dlst[1])
-              end
-
-              -- backward through word embeds
-              if opt.no_bow == 1 then
-                local ctx_grads = masked_selecter:backward({context, rnn_state_mask}, encoder_bow_lstm_grads)[1]
-                encoder_grads:add(ctx_grads)
-              else
-                bow_encoder:backward(source:permute(2,3,1):contiguous(), encoder_bow_lstm_grads:contiguous())
-              end
-            else
-              bow_encoder:backward(source:permute(2,3,1):contiguous(), encoder_bow_grads:contiguous())
-            end
-            word_vecs_bow.gradWeight[1]:zero()
-          end
-
           -- backward prop encoder
           local drnn_state_enc = reset_state(init_bwd_enc, batch_l*source_l)
           if opt.init_dec == 1 then
@@ -1024,7 +1076,12 @@ function train(train_data, valid_data)
           end
 
           for t = source_char_l, 1, -1 do
-            local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+            local encoder_input
+            if opt.add_sent_context == 1 then
+              encoder_input = {source[t], sent_context, table.unpack(rnn_state_enc[t-1])}
+            else
+              encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+            end
 
             if opt.mask_padding == 1 then
               if t < source_char_l then
@@ -1046,9 +1103,96 @@ function train(train_data, valid_data)
             end
 
             local dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
-            for j = 1, #drnn_state_enc do
+            for j = 1+opt.add_sent_context, #drnn_state_enc do
               drnn_state_enc[j]:copy(dlst[j+1])
             end	    
+
+            if opt.add_sent_context == 1 then
+              if source_l >= 2 then
+                encoder_bow_grads[{{}, {1,source_l-1}}]:add(dlst[2][{{}, {2,source_l}}])
+              end
+            end
+          end
+
+          -- backward add_sent_context_init
+          if opt.add_sent_context_init == 1 then
+            local add_sent_context_init_grads = add_sent_context_init_grad_proto[{{1,batch_l*source_l}}]
+            add_sent_context_init_grads:zero()
+            for l = 1, opt.num_layers do
+              add_sent_context_init_grads[{{}, {(l*2-2)*opt.rnn_size+1, (l*2-1)*opt.rnn_size}}]:copy(drnn_state_enc[l*2-1])
+              add_sent_context_init_grads[{{}, {(l*2-1)*opt.rnn_size+1, (l*2)*opt.rnn_size}}]:copy(drnn_state_enc[l*2])
+            end
+            local sent_context_grad = add_sent_context_init_grads:view(batch_l, source_l, opt.num_layers*opt.rnn_size*2)
+            if source_l >= 2 then
+              sent_context_grad[{{}, {1,source_l-1}}]:copy(sent_context_grad[{{}, {2,source_l}}])
+            end
+            sent_context_grad[{{}, {source_l}}]:zero()
+            encoder_bow_grads:add(add_sent_context_init:backward(context_bow:contiguous(), sent_context_grad))
+          end
+
+          -- backward pos embeds
+          if opt.pos_embeds == 1 and opt.hierarchical == 1 then
+            local pos_grads = pos_grad_proto[{{1,batch_l*source_l}}]
+            pos_grads:zero()
+            for l = 1, opt.num_layers do
+              pos_grads[{{}, {(l*2-2)*opt.rnn_size+1, (l*2-1)*opt.rnn_size}}]:copy(drnn_state_enc[l*2-1])
+              pos_grads[{{}, {(l*2-1)*opt.rnn_size+1, (l*2)*opt.rnn_size}}]:copy(drnn_state_enc[l*2])
+            end
+            local pos = pos_proto[{{1,batch_l}, {1, source_l}}]:reshape(batch_l*source_l)
+            pos_embeds:backward(pos, pos_grads)
+          end
+
+          -- encoder bow
+          local drnn_state_bow_enc = reset_state(init_bwd_bow_enc, batch_l)
+          if opt.hierarchical == 1 then
+            if opt.bow_encoder_lstm == 1 then
+              for t = source_l, 1, -1 do
+                local bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc[t-1])}
+                drnn_state_bow_enc[#drnn_state_bow_enc]:add(encoder_bow_grads[{{},t}])
+                local dlst = bow_encoder_lstm_clones[t]:backward(bow_encoder_input, drnn_state_bow_enc)
+                for j = 1, #drnn_state_bow_enc do
+                  drnn_state_bow_enc[j]:copy(dlst[j+1])
+                end
+                encoder_bow_lstm_grads[{{},t}]:copy(dlst[1])
+              end
+
+              local dl_dpos_embeds
+              if opt.pos_embeds_sent == 1 then
+                local pos = pos_proto[{{1,batch_l}, {1, source_l}}]
+                dl_dpos_embeds = pos_embeds_sent:backward({rnn_states, pos},  encoder_bow_lstm_grads)[1]
+              end
+
+              -- backward through word embeds
+              if opt.no_bow == 1 then
+                local cur_grads = encoder_bow_lstm_grads
+                if opt.pos_embeds_sent == 1 then
+                  cur_grads = dl_dpos_embeds
+                end
+                local ctx_grads = masked_selecter:backward({context, rnn_state_mask}, cur_grads)[1]
+                encoder_grads:add(ctx_grads)
+              else
+                bow_encoder:backward(source:permute(2,3,1):contiguous(), cur_grads:contiguous())
+              end
+            else
+              if opt.no_bow == 1 then
+                if opt.pos_embeds_sent == 1 then
+                  local pos = pos_proto[{{1,batch_l}, {1, source_l}}]
+                  encoder_bow_grads:add(pos_embeds_sent:backward({rnn_states, pos}, encoder_bow_grads)[1])
+                end
+
+                -- backward encoder_bow_grads to the LSTM sentence encoder
+                local ctx_grads = masked_selecter:backward({context, rnn_state_mask}, encoder_bow_grads)[1]
+                encoder_grads:add(ctx_grads)
+              else
+                if opt.pos_embeds_sent == 1 then
+                  local pos = pos_proto[{{1,batch_l}, {1, source_l}}]
+                  bow_encoder:backward({source:permute(2,3,1):contiguous(),pos}, encoder_bow_grads:contiguous())
+                else
+                  bow_encoder:backward(source:permute(2,3,1):contiguous(), encoder_bow_grads:contiguous())
+                end
+              end
+            end
+            word_vecs_bow.gradWeight[1]:zero()
           end
 
           if opt.brnn == 1 then
@@ -1091,17 +1235,20 @@ function train(train_data, valid_data)
         end
 
         local grad_norm = 0
-        -- encoder, decoder, generator
-        grad_norm = grad_params[1]:norm()^2 + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
-        grad_norm = grad_norm + grad_params[layers_idx['decoder_attn']]:norm()^2
-        if opt.hierarchical == 1 then
-          grad_norm = grad_norm + grad_params[layers_idx['bow_encoder']]:norm()^2
+        local grad_stats = ''
+        for name, idx in pairs(layers_idx) do
+          local cur_norm = grad_params[idx]:norm()^2
+          grad_norm = grad_norm + cur_norm
+          grad_stats = grad_stats .. string.format('%s: %.2f, ', name, cur_norm)
         end
-        if opt.brnn == 1 then
-          grad_norm = grad_norm + grad_params[layers_idx['encoder_bwd']]:norm()^2
+        if i % 50 == 0 then
+          logging:info(grad_stats)
         end
         grad_norm = grad_norm^0.5	 
 
+        if opt.hierarchical == 1 then
+          word_vec_layers[1].gradWeight:add(word_vecs_bow.gradWeight)
+        end
         if opt.brnn == 1 then
           word_vec_layers[1].gradWeight:add(word_vec_layers[3].gradWeight)
           --if opt.use_chars_enc == 1 then
@@ -1110,9 +1257,6 @@ function train(train_data, valid_data)
             --end
           --end	    
         end	 
-        if opt.hierarchical == 1 then
-          word_vec_layers[1].gradWeight:add(word_vecs_bow.gradWeight)
-        end
         if opt.share_embed == 1 then
           word_vec_layers[1].gradWeight:add(word_vec_layers[2].gradWeight)
         end
@@ -1124,11 +1268,11 @@ function train(train_data, valid_data)
           -- don't fix attention weights though
           local _, g = decoder_attn_layers[1]:parameters()
           local save_grads = {}
-          for i = 1, #g do
+          for j = 1, #g do
             table.insert(save_grads, g[i]:clone())
           end
           grad_params[2]:zero()
-          for i = 1, #g do
+          for j = 1, #g do
             g[i]:copy(save_grads[i])
           end
         end
@@ -1137,7 +1281,7 @@ function train(train_data, valid_data)
         local param_norm = 0
         local shrinkage = opt.max_grad_norm / grad_norm
         for j = 1, #grad_params do
-          if j == layers_idx['baseline_m'] and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
+          if j == layers_idx['baseline_m'] and opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
             -- special case
             local n = grad_params[j]:norm()
             local s = opt.max_grad_norm / n
@@ -1159,6 +1303,9 @@ function train(train_data, valid_data)
           param_norm = param_norm + params[j]:norm()^2
         end	 
         param_norm = param_norm^0.5
+        if opt.hierarchical == 1 then
+          word_vecs_bow.weight:copy(word_vec_layers[1].weight)
+        end
         if opt.brnn == 1 then
           word_vec_layers[3].weight:copy(word_vec_layers[1].weight)
           --if opt.use_chars_enc == 1 then
@@ -1166,9 +1313,6 @@ function train(train_data, valid_data)
               --charcnn_layers[j+charcnn_offset]:copy(charcnn_layers[j])
             --end
           --end	    
-        end
-        if opt.hierarchical == 1 then
-          word_vecs_bow.weight:copy(word_vec_layers[1].weight)
         end
           if opt.share_embed == 1 then
             word_vec_layers[2].weight:copy(word_vec_layers[1].weight)
@@ -1190,7 +1334,7 @@ function train(train_data, valid_data)
           (num_words_target+num_words_source) / time_taken,
           num_words_source / time_taken,
           num_words_target / time_taken)			   
-          print(stats)
+          logging:info(stats)
         end
         if i % 200 == 0 then
           collectgarbage()
@@ -1208,7 +1352,7 @@ function train(train_data, valid_data)
         local shard_order = torch.randperm(opt.num_shards)
         for s = 1, opt.num_shards do
           local fn = train_data .. '.' .. shard_order[s] .. '.hdf5'
-          print('loading shard #' .. shard_order[s])
+          logging:info('loading shard #' .. shard_order[s])
           local shard_data = data.new(opt, fn)
           batch_loss, batch_nonzeros = train_batch(shard_data, epoch)
           total_loss = total_loss + batch_loss
@@ -1218,14 +1362,14 @@ function train(train_data, valid_data)
         total_loss, total_nonzeros = train_batch(train_data, epoch)
       end
       local train_score = math.exp(total_loss/total_nonzeros)
-      print('Train', train_score)
-      print(opt.train_perf)
+      logging:info('Train ' .. train_score)
+      logging:info(opt.train_perf)
       if opt.attn_type == 'hard' and opt.debug == 1 then
-        print('baseline:')
-        print(opt.baseline)
+        logging:info('baseline:')
+        logging:info(opt.baseline)
         if opt.moving_variance == 1 then
-          print('variance:')
-          print(opt.reward_variance)
+          logging:info('variance:')
+          logging:info(opt.reward_variance)
         end
       end
       opt.train_perf[#opt.train_perf + 1] = train_score
@@ -1238,13 +1382,13 @@ function train(train_data, valid_data)
       -- clean and save models
       local savefile = string.format('%s_epoch%d_%.2f.t7', opt.savefile, epoch, score)      
       if epoch % opt.save_every == 0 then
-        print('saving checkpoint to ' .. savefile)
+        logging:info('saving checkpoint to ' .. savefile)
         clean_layer(generator)
         save_checkpoint(savefile)
       end      
 
     end
-    print('done!')
+    logging:info('done!')
   end
 
   function eval(data)
@@ -1260,7 +1404,23 @@ function train(train_data, valid_data)
       if opt.bow_encoder_lstm == 1 then
         bow_encoder_lstm_clones[1]:evaluate()
       end
+      if opt.pos_embeds == 1 then
+        pos_embeds:evaluate()
+      end
     end
+    local bow_size
+     if opt.no_bow == 1 then
+       bow_size = opt.rnn_size
+     else
+       if opt.conv_bow == 1 then
+         bow_size = opt.num_kernels
+       else
+         bow_size = opt.word_vec_size
+       end
+     end
+     if opt.pos_embeds_sent == 1 then
+       bow_size = bow_size + opt.pos_dim
+     end
 
     local nll = 0
     local total = 0
@@ -1279,18 +1439,55 @@ function train(train_data, valid_data)
       local source_sent_l = source:ne(1):sum(1):cuda():squeeze(1) -- batch_l x source_l
       local rnn_state_mask
       if opt.no_bow == 1 then
-        rnn_state_mask = torch.zeros(batch_l, source_l, source_char_l, opt.rnn_size):byte():cuda()
+        rnn_state_mask = torch.zeros(batch_l, source_l, source_char_l, opt.rnn_size):cudaByte()
         for j = 1, batch_l do
           for t = 1, source_l do
             local idx = source_sent_l[j][t]
+            if idx == 0 then idx = 1 end
             rnn_state_mask[j][t][idx]:fill(1)
           end
         end
       end
 
+      -- pos embeds
+      if opt.pos_embeds == 1 and opt.hierarchical == 1 then
+        local pos = pos_proto[{{1,batch_l}, {1, source_l}}]:reshape(batch_l*source_l)
+        local pos_states = pos_embeds:forward(pos) -- batch_l*source_l x num_layers*rnn_size*2
+
+        for l = 1, opt.num_layers do
+          rnn_state_enc[l*2-1]:copy(pos_states[{{},{(l*2-2)*opt.rnn_size+1, (l*2-1)*opt.rnn_size}}])
+          rnn_state_enc[l*2]:copy(pos_states[{{},{(l*2-1)*opt.rnn_size+1, (l*2)*opt.rnn_size}}])
+        end
+      end
+
+      local sent_context
+      if opt.add_sent_context_init == 1 then
+        sent_context = add_sent_context_init:forward(context_bow:contiguous())
+        if source_l >= 2 then
+          sent_context[{{}, {2,source_l}}]:copy(sent_context[{{}, {1,source_l-1}}])
+        end
+        sent_context[{{}, {1}}]:zero()
+        sent_context = sent_context:view(batch_l*source_l, opt.num_layers*opt.rnn_size*2)
+
+        for l = 1, opt.num_layers do
+          rnn_state_enc[l*2-1]:copy(sent_context[{{},{(l*2-2)*opt.rnn_size+1, (l*2-1)*opt.rnn_size}}])
+          rnn_state_enc[l*2]:copy(sent_context[{{},{(l*2-1)*opt.rnn_size+1, (l*2)*opt.rnn_size}}])
+        end
+      elseif opt.add_sent_context == 1 then
+        sent_context = torch.zeros(batch_l, source_l, bow_size):cuda()
+        if source_l >= 2 then
+          sent_context[{{}, {2,source_l}}]:copy(context_bow[{{}, {1,source_l-1}}])
+        end
+      end
+
       -- forward prop encoder
       for t = 1, source_char_l do
-        local encoder_input = {source[t], table.unpack(rnn_state_enc)}
+        local encoder_input
+        if opt.add_sent_context == 1 then
+          encoder_input = {source[t], sent_context, table.unpack(rnn_state_enc)}
+        else
+          encoder_input = {source[t], table.unpack(rnn_state_enc)}
+        end
         local out = encoder_clones[1]:forward(encoder_input)
 
         if opt.mask_padding == 1 then
@@ -1308,23 +1505,29 @@ function train(train_data, valid_data)
 
       -- bow encoder
       local rnn_states
-      if opt.no_bow == 1 then
-        masked_selecter = make_last_state_selecter(opt, batch_l, source_l)
-        rnn_states = masked_selecter:forward({context, rnn_state_mask})
-      end
+      local bow_out 
       if opt.hierarchical == 1 then
-        local bow_out = bow_encoder:forward(source:permute(2,3,1):contiguous())
+        if opt.no_bow == 1 then
+          masked_selecter = make_last_state_selecter(opt, batch_l, source_l)
+          rnn_states = masked_selecter:forward({context, rnn_state_mask})
+          if opt.pos_embeds_sent == 1 then
+            local pos = pos_proto[{{1,batch_l}, {1, source_l}}]
+            bow_out = pos_embeds_sent:forward({rnn_states, pos})
+          end
+        else
+          if opt.pos_embeds_sent == 1 then
+            local pos = pos_proto[{{1,batch_l}, {1, source_l}}]
+            bow_out = bow_encoder:forward({source:permute(2,3,1):contiguous(), pos})
+          else
+            bow_out = bow_encoder:forward(source:permute(2,3,1):contiguous())
+          end
+        end
 
         if opt.bow_encoder_lstm == 1 then
           -- pass bag of words through LSTM over sentences for context
           for t = 1, source_l do
-            local bow_encoder_input
-            if opt.no_bow == 1 then
-              bow_encoder_input = {rnn_states[t], table.unpack(rnn_state_bow_enc)}
-            else
-              bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc)}
-            end
-            local out = bow_encoder_lstm_clones[t]:forward(bow_encoder_input)
+            local bow_encoder_input = {bow_out[t], table.unpack(rnn_state_bow_enc)}
+            local out = bow_encoder_lstm_clones[1]:forward(bow_encoder_input)
             rnn_state_bow_enc = out
             context_bow[{{}, t}]:copy(out[#out])
           end
@@ -1358,6 +1561,11 @@ function train(train_data, valid_data)
         end	 
       end      	 	 
 
+      local inf_mask
+      if opt.hierarchical == 1 and opt.inf_mask == 1 then
+        inf_mask = source:permute(2,3,1):contiguous():eq(1):mul(-math.huge):cuda() -- batch_l x source_l x source_char_l
+      end
+
       local loss = 0
       for t = 1, target_l do
         local decoder_input = {target[t], table.unpack(rnn_state_dec)}
@@ -1365,7 +1573,10 @@ function train(train_data, valid_data)
         local out = decoder_clones[1]:forward(decoder_input)
         local decoder_attn_input
         if opt.hierarchical == 1 then
-          decoder_attn_input = {out[#out], context, context_bow} 
+          decoder_attn_input = {out[#out], context, context_bow}
+          if opt.inf_mask == 1 then
+            table.insert(decoder_attn_input, inf_mask)
+          end
         else
           decoder_attn_input = {out[#out], context}
         end
@@ -1385,7 +1596,7 @@ function train(train_data, valid_data)
       total = total + nonzeros
     end
     local valid = math.exp(nll / total)
-    print("Valid", valid)
+    logging:info("Valid "..valid)
     collectgarbage()
     return valid
   end
@@ -1440,12 +1651,17 @@ end
 function main() 
     -- parse input params
    opt = cmd:parse(arg)
+   assert(opt.log_path ~= '', 'need to set logging')
+   logging = logger(opt.log_path)
+   logging:info("Command line args:")
+   logging:info(arg)
+   logging:info("End command line args")
    if opt.gpuid >= 0 then
-      print('using CUDA on GPU ' .. opt.gpuid .. '...')
+      logging:info('using CUDA on GPU ' .. opt.gpuid .. '...')
       require 'cutorch'
       require 'cunn'
       if opt.cudnn == 1 then
-	 print('loading cudnn...')
+	 logging:info('loading cudnn...')
 	 require 'cudnn'
       end      
       cutorch.setDevice(opt.gpuid)
@@ -1453,7 +1669,7 @@ function main()
    end
 
    -- Create the data loader class.
-   print('loading data...')
+   logging:info('loading data...')
    if opt.num_shards == 0 then
       train_data = data.new(opt, opt.data_file)
    else
@@ -1461,8 +1677,8 @@ function main()
    end
 
    valid_data = data.new(opt, opt.val_data_file)
-   print('done!')
-   print(string.format('Source vocab size: %d, Target vocab size: %d',
+   logging:info('done!')
+   logging:info(string.format('Source vocab size: %d, Target vocab size: %d',
 		       valid_data.source_size, valid_data.target_size))   
    opt.max_sent_l_src = valid_data.source:size(2)
    opt.max_sent_l_targ = valid_data.target:size(2)
@@ -1474,9 +1690,29 @@ function main()
    if opt.use_chars_enc == 1 or opt.use_chars_dec == 1 then
       opt.max_word_l = valid_data.source_char_l:max()
    end
-   print(string.format('Source max doc len: %d, Target max sent len: %d',
+
+   -- set output size of bow encoder
+   bow_size = 0
+   if opt.bow_encoder_lstm == 1 then
+     bow_size = opt.rnn_size
+   else
+     if opt.no_bow == 1 then
+       bow_size = opt.rnn_size
+     else
+       if opt.conv_bow == 1 then
+         bow_size = opt.num_kernels
+       else
+         bow_size = opt.word_vec_size
+       end
+     end
+     if opt.pos_embeds_sent == 1 then
+       bow_size = bow_size + opt.pos_dim
+     end
+   end
+
+   logging:info(string.format('Source max doc len: %d, Target max sent len: %d',
 		       valid_data.source:size(2), valid_data.target:size(2)))   
-   print(string.format('Source max sent len: %d', opt.max_word_l))
+   logging:info(string.format('Source max sent len: %d', opt.max_word_l))
 
    preallocateMemory(opt.prealloc)
 
@@ -1487,8 +1723,17 @@ function main()
       if opt.hierarchical == 1 then
         decoder_attn = make_hierarchical_decoder_attn(valid_data, opt)
         bow_encoder = make_bow_encoder(valid_data, opt)
+        if opt.pos_embeds == 1 then
+          pos_embeds = make_pos_embeds(valid_data, opt)
+        end
+        if opt.pos_embeds_sent == 1 and opt.no_bow == 1 then
+          pos_embeds_sent = make_pos_embeds_sent(valid_data, opt)
+        end
         if opt.bow_encoder_lstm == 1 then
-          bow_encoder_lstm = make_lstm_bow(valid_data, opt, 'bow')
+          bow_encoder_lstm = make_lstm(valid_data, opt, 'bow_enc', 0)
+        end
+        if opt.add_sent_context_init == 1 then
+          add_sent_context_init = make_add_sent_context_init(valid_data, opt, bow_size)
         end
       else
         decoder_attn = make_decoder_attn(valid_data, opt)
@@ -1501,7 +1746,7 @@ function main()
       if opt.start_soft == 1 then
         -- Load params
         assert(path.exists(opt.train_from), 'checkpoint path invalid')
-        print('loading ' .. opt.train_from .. '...')
+        logging:info('loading ' .. opt.train_from .. '...')
         local checkpoint = torch.load(opt.train_from)
         local model, model_opt = checkpoint[1], checkpoint[2]
         opt.num_layers = model_opt.num_layers
@@ -1516,8 +1761,6 @@ function main()
         copy_params(encoder, model[1]:double())
         copy_params(decoder, model[2]:double())
         copy_params(generator, model[3]:double())
-        print(decoder_attn:parameters())
-        print(model[4]:double():parameters())
         copy_params(decoder_attn, model[4]:double())
         if model_opt.brnn == 1 then
           copy_params(encoder_bwd, model[save_idx['encoder_bwd']]:double())
@@ -1529,7 +1772,7 @@ function main()
 
       if opt.attn_type == 'hard' then
         if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
-          print('using learned baseline method')
+          logging:info('using learned baseline method')
           baseline_m, reward_criterion = make_reinforce(valid_data, opt)
         else
           _, reward_criterion = make_reinforce(valid_data, opt)
@@ -1555,7 +1798,7 @@ function main()
       end
    else
       assert(path.exists(opt.train_from), 'checkpoint path invalid')
-      print('loading ' .. opt.train_from .. '...')
+      logging:info('loading ' .. opt.train_from .. '...')
       local checkpoint = torch.load(opt.train_from)
       local model, model_opt = checkpoint[1], checkpoint[2]
       opt.num_layers = model_opt.num_layers
@@ -1574,6 +1817,9 @@ function main()
         encoder_bwd = model[save_idx['encoder_bwd']]:double()
       end      
       if model_opt.hierarchical == 1 then
+        if model_opt.pos_embeds == 1 then
+          pos_embeds = model[save_idx['pos_embeds']]:double()
+        end
         bow_encoder = model[save_idx['bow_encoder']]:double()
       end
 
@@ -1600,42 +1846,40 @@ function main()
    end   
 
    -- print options
-   print('init dec:', opt.init_dec)
-   print('input feed:', opt.input_feed)
-   print('attention on sentences:', opt.attn_type)
+   logging:info('init dec: ' .. opt.init_dec)
+   logging:info('input feed: ' .. opt.input_feed)
+   logging:info('attention on sentences:', opt.attn_type)
    if opt.hierarchical == 1 then
-     print('doing hierarchical model')
-     print(string.format('using %s attn for words', opt.attn_word_type))
+     logging:info('doing hierarchical model')
+     logging:info(string.format('using %s attn for words', opt.attn_word_type))
    else
-     print('doing full attention over doc')
+     logging:info('doing full attention over doc')
    end
    if opt.mask_padding == 1 then
-     print('masking padding for encoder hidden states')
+     logging:info('masking padding for encoder hidden states')
    end
    if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
-     print('using learned baseline method')
+     logging:info('using learned baseline method')
    end
    if opt.no_bow == 1 then
-     assert(opt.bow_encoder_lstm == 1, 'need BOW lstm if using no bow')
-     print('using no bow')
+     logging:info('using no bow')
    end
    if opt.bow_encoder_lstm == 1 then
-     print('using bow encoder lstm')
+     logging:info('using bow encoder lstm')
    end
    if opt.conv_bow == 1 then
      assert(opt.cudnn == 1, 'use cudnn!')
-     print('using convolution instead of bag of words')
+     logging:info('using convolution instead of bag of words')
    end
    --assert(opt.multisampling > 0, 'please use multisampling')
    if opt.multisampling > 0 then
      --assert(opt.hop_attn > 1 or opt.multisampling > 1, 'please do more than one sample')
-     print(string.format('sampling attn %d instead of once', opt.multisampling))
-     print('with replace =', opt.with_replace)
-     print('uniform attn =', opt.uniform_attn)
+     logging:info(string.format('sampling attn %d instead of once', opt.multisampling))
+     logging:info('with replace = ' .. opt.with_replace)
+     logging:info('uniform attn = ' .. opt.uniform_attn)
    else
-     print('NOT multisampling')
+     logging:info('NOT multisampling')
    end
-   print('hops:', opt.hop_attn)
 
    layers = {encoder, decoder, generator, decoder_attn}
    layers_idx = {encoder=1, decoder=2, generator=3, decoder_attn=4}
@@ -1644,9 +1888,24 @@ function main()
      table.insert(layers, bow_encoder)
      layers_idx['bow_encoder'] = idx
      idx = idx + 1
+     if opt.pos_embeds == 1 then
+       table.insert(layers, pos_embeds)
+       layers_idx['pos_embeds'] = idx
+       idx = idx + 1
+     end
+     if opt.pos_embeds_sent == 1 and opt.no_bow == 1 then
+       table.insert(layers, pos_embeds_sent)
+       layers_idx['pos_embeds_sent'] = idx
+       idx = idx + 1
+     end
      if opt.bow_encoder_lstm == 1 then
        table.insert(layers, bow_encoder_lstm)
        layers_idx['bow_encoder_lstm'] = idx
+       idx = idx + 1
+     end
+     if opt.add_sent_context_init == 1 then
+       table.insert(layers, add_sent_context_init)
+       layers_idx['add_sent_context_init'] = idx
        idx = idx + 1
      end
    end

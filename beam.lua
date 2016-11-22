@@ -15,9 +15,10 @@ stringx = require('pl.stringx')
 cmd = torch.CmdLine()
 
 -- check attn options
+cmd:option('-num_argmax', 0, [[Change multisampling to do different number of argmax]])
 cmd:option('-view_attn', 0, [[View attention weights at each time step]])
 cmd:option('-print_attn', 0, [[Print attention weights]])
-cmd:option('-print_sent_attn', 0, [[Print sentence attention instead of all attn]])
+cmd:option('-print_sent_attn', 1, [[Print sentence attention instead of all attn]])
 
 cmd:option('-no_pad', 1, [[No pad format for data]])
 cmd:option('-no_pad_sent_l', 10, [[Number of `sentences` we have for a doc]])
@@ -223,6 +224,18 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    if model_opt.bow_encoder_lstm == 1 then
      rnn_state_bow_enc = reset_state(init_fwd_bow_enc, 1)
    end
+
+    -- pos embeds
+    if model_opt.pos_embeds == 1 and model_opt.hierarchical == 1 then
+      local pos = pos_proto[{{}, {1, source_sent_l}}]:reshape(1*source_sent_l)
+      local pos_states = model[layers_idx['pos_embeds']]:forward(pos) -- 1*source_sent_l x num_layers*rnn_size*2
+
+      for l = 1, model_opt.num_layers do
+        rnn_state_enc[l*2-1]:copy(pos_states[{{},{(l*2-2)*model_opt.rnn_size+1, (l*2-1)*model_opt.rnn_size}}])
+        rnn_state_enc[l*2]:copy(pos_states[{{},{(l*2-1)*model_opt.rnn_size+1, (l*2)*model_opt.rnn_size}}])
+      end
+    end
+
    
    for t = 1, source_char_l do
       local encoder_input = {source_input[t], table.unpack(rnn_state_enc)}
@@ -241,11 +254,17 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
 
    local masked_selecter, rnn_states
    if model_opt.no_bow == 1 then
-     masked_selecter = make_last_state_selecter(model_opt, batch_l, source_l)
+     masked_selecter = make_last_state_selecter(model_opt.rnn_size, 1, source_sent_l) -- TODO: seems wrong
      rnn_states = masked_selecter:forward({context, rnn_state_mask})
    end
    if model_opt.hierarchical == 1 then
-     local bow_out = model[layers_idx['bow_encoder']]:forward(source_input:permute(2,3,1):contiguous())
+     local bow_out
+     if model_opt.pos_embeds == 1 then -- TODO: change to pos_embeds_sent
+       local pos = pos_proto[{{}, {1, source_sent_l}}]
+       bow_out = model[layers_idx['bow_encoder']]:forward({source_input:permute(2,3,1):contiguous(), pos})
+     else
+       bow_out = model[layers_idx['bow_encoder']]:forward(source_input:permute(2,3,1):contiguous())
+     end
 
      if model_opt.bow_encoder_lstm == 1 then
        -- pass bag of words through LSTM over sentences for context
@@ -301,15 +320,20 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    end   
    context = context:expand(K, source_sent_l, source_char_l, model_opt.rnn_size)
    if model_opt.hierarchical == 1 then
+     local bow_size
      if model_opt.bow_encoder_lstm == 1 then
-       context_bow = context_bow:expand(K, source_sent_l, model_opt.rnn_size)
+       bow_size = model_opt.rnn_size
      else
        if model_opt.conv_bow == 1 then
-         context_bow = context_bow:expand(K, source_sent_l, model_opt.num_kernels)
+         bow_size = model_opt.num_kernels
        else
-         context_bow = context_bow:expand(K, source_sent_l, model_opt.word_vec_size)
+         bow_size = model_opt.word_vec_size
        end
      end
+     if model_opt.pos_embeds == 1 then
+       bow_size = bow_size + model_opt.pos_dim
+     end
+     context_bow = context_bow:expand(K, source_sent_l, bow_size)
    end
    
    out_float = torch.FloatTensor()
@@ -347,9 +371,6 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       end
       local attn_out = model[layers_idx['decoder_attn']]:forward(decoder_attn_input)
       local out = model[3]:forward(attn_out) -- K x vocab_size
-      print('softplus weights')
-      print(probe_layer.output)
-      io.read()
       
       rnn_state_dec = {} -- to be modified later
       if model_opt.input_feed == 1 then
@@ -515,7 +536,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
            decoder_attn_input = {out_decoder[#out_decoder], context[{{1}}]}
          end
          local attn_out = model[layers_idx['decoder_attn']]:forward(decoder_attn_input)
-         if opt.print_attn == 1 then
+         if opt.print_attn == 1 or opt.print_sent_attn == 1 then
              gold_sentence_attn_list[t] = {}
              gold_attn_list[t] = {}
              if model_opt.hierarchical == 1 then
@@ -572,11 +593,11 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
       if opt.print_attn == 1 then
         print('ATTN GOLD')
         pretty_print(gold_attn_list)
-        if opt.print_sent_attn == 1 then
-          -- sentence attn
-          print('ATTN LEVEL GOLD')
-          pretty_print(gold_sentence_attn_list)
-        end
+      end
+      if opt.print_sent_attn == 1 then
+        -- sentence attn
+        print('ATTN LEVEL GOLD')
+        pretty_print(gold_sentence_attn_list)
 
         for j = 2, #gold_sentence_attn_list do
           local p = gold_sentence_attn_list[j]
@@ -631,6 +652,8 @@ function get_layer(layer)
          word_vecs_enc = layer
       elseif layer.name == 'word_vecs_dec' then
          word_vecs_dec = layer
+      elseif layer.name == 'sampler' then
+        sampler_layer = layer
       end       
    end
    if layer.__typename == 'nn.SoftPlus' then
@@ -932,6 +955,11 @@ function main()
     if model_opt.hierarchical == 0 then
       assert(decoder_softmax_words == nil)
     end
+    if model_opt.hierarchical == 1 and model_opt.attn_type == 'hard' then
+      if opt.num_argmax > 0 then
+        sampler_layer.multisampling = opt.num_argmax -- do this number of argmax
+      end
+    end
     attn_layer = torch.zeros(opt.beam, MAX_SENT_L)      
    
    
@@ -947,7 +975,16 @@ function main()
        bow_size = model_opt.word_vec_size
      end
    end
+   if model_opt.pos_embeds == 1 then
+     bow_size = bow_size + model_opt.pos_dim
+   end
    context_bow_proto = torch.zeros(1, MAX_SENT_L, bow_size)
+   if model_opt.pos_embeds == 1 or model_opt.pos_embeds_sent == 1 then
+     pos_proto = torch.zeros(1, MAX_SENT_L):cuda()
+     for t = 1, MAX_SENT_L do
+       pos_proto[{{}, {t}}]:fill(t)
+     end
+   end
 
    local h_init_dec = torch.zeros(opt.beam, model_opt.rnn_size)
    --local h_init_enc = torch.zeros(1, model_opt.rnn_size) 
@@ -1049,15 +1086,16 @@ function main()
       if opt.print_attn == 1 then
         print('ATTN PRED')
         pretty_print(attn_list)
-        if opt.print_sent_attn == 1 then
-          print('ATTN LEVEL PRED')
-          pretty_print(sentence_attn_list)
-        end
-        deficit_list[1] = 0
-        total_deficit = total_deficit + torch.Tensor(deficit_list):sum()
-        --print(deficit_list)
-        --io.read()
       end
+      if opt.print_sent_attn == 1 then
+        print('ATTN LEVEL PRED')
+        pretty_print(sentence_attn_list)
+      end
+        --deficit_list[1] = 0
+        --total_deficit = total_deficit + torch.Tensor(deficit_list):sum()
+        ----print(deficit_list)
+        ----io.read()
+      --end
 
       print('')
    end

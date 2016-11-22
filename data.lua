@@ -42,7 +42,7 @@ function data:__init(opt, data_file)
            self.source_char = self.source_char[{{},{},{2, self.source_char:size(3)-1}}] -- get rid of start,end token
            self.source_char[self.source_char:eq(4)] = 1 -- replace EOS with pad
          else
-           print('using no_pad = 1')
+           logging:info('using no_pad = 1')
          end
       end      
    end
@@ -129,6 +129,25 @@ function data.__index(self, idx)
       return {target_input, target_output, nonzeros, source_input,
 	      batch_l, target_l, source_l, target_l_all, source_char_l}
    end
+end
+
+function data:get_worst()
+  local worst_idx = 1
+  local worst = 0
+  local worst_stats = {}
+  for idx = 1, self:size() do
+      local batch_l = self.batches[idx][5]
+      local target_l = self.batches[idx][6]
+      local source_l = self.batches[idx][7]
+      local source_char_l = self.batches[idx][9]
+      local ans = batch_l*target_l*source_l*source_char_l
+      if ans > worst then
+        worst_idx = idx
+        worst = ans
+        worst_stats = {batch_l, target_l, source_l, source_char_l}
+      end
+  end
+  return worst_idx, table.unpack(worst_stats)
 end
 
 return data
