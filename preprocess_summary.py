@@ -117,7 +117,7 @@ def get_data(args):
     word_indexer = Indexer(["<blank>","<unk>","<s>", "</s>"]) # for both source and target
     word_indexer.add_w([src_indexer.BOS, src_indexer.EOS])
 
-    def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0, truncate=0, no_pad=0, targetseqlength=100, pretrain=0):
+    def make_vocab(srcfile, targetfile, seqlength, max_sent_l=0, truncate=0, no_pad=0, targetseqlength=50, pretrain=0):
         num_docs = 0
         num_blank_docs = 0
         num_bad_targs = 0
@@ -165,7 +165,7 @@ def get_data(args):
                 
     def convert(srcfile, targetfile, batchsize, seqlength, outfile, num_docs,
                 max_sent_l, max_doc_l=0, unkfilter=0, shuffle=0,
-                truncate=0, no_pad=0, repeat_words=0, targetseqlength=100, pretrain=0):
+                truncate=0, no_pad=0, repeat_words=0, targetseqlength=50, pretrain=0, max_total_words=400):
         
         if no_pad == 1:
             newseqlength = seqlength
@@ -270,7 +270,7 @@ def get_data(args):
                 if targ_unks > unkfilter or src_unks > unkfilter:
                     dropped += 1
                     continue
-                
+
             if pretrain > 0:
                 for j in xrange(len(targ)):
                   targets[doc_id] = np.array(targ[j][:-1],dtype=int) # get all but the last pad
@@ -311,6 +311,34 @@ def get_data(args):
                   sources_word[doc_id] = np.array(src_word, dtype=int)
                 source_word_l[doc_id] = (sources_word[doc_id] != 1).sum(1).max() # get max sent len for doc
 
+                # let's update the sources to fit a maximum number of words
+                if no_pad == 0:
+                    def get_new_source_len(src_word, cur_source_len, max_words):
+                        total_words = 0
+                        new_len = 0
+                        new_word_len = 0
+                        for idx in range(cur_source_len):
+                            l = (src_word[idx] != 1).sum()
+                            total_words = total_words + l
+                            if total_words > max_words:
+                                if new_len * new_word_len > max_words:
+                                    # truncate long sentence
+                                    new_word_len = max_words / new_len
+                                return new_len, new_word_len
+                            new_len += 1
+                            new_word_len = max(new_word_len, l)
+
+                        if new_len * new_word_len > max_words:
+                            # truncate long sentence
+                            new_word_len = max_words / new_len
+                        return new_len, new_word_len
+
+                    new_len, new_word_len = get_new_source_len(sources_word[doc_id], source_lengths[doc_id], max_total_words) # get rid of sentences to accomodate long ones at front
+                    # new_len = min(source_lengths[doc_id], max_total_words / source_word_l[doc_id])
+                    source_lengths[doc_id] = new_len
+                    source_word_l[doc_id] = new_word_len
+                    assert new_len*new_word_len <= max_total_words, 'new_len: {}, new_word_len: {}'.format(new_len, new_word_len)
+
                 doc_id += 1
             if doc_id % 100000 == 0:
                 print("{}/{} docs processed".format(doc_id, num_docs))
@@ -327,23 +355,43 @@ def get_data(args):
             source_word_l = source_word_l[rand_idx]
         
         #break up batches based on source lengths
-        # get source_lengths into a particular shape then sort by length
+        # get source_lengths into a particular shape then sort by length, and break up batches on source word lengtsh
         source_lengths = source_lengths[:doc_id]
-        source_sort = np.argsort(source_lengths) 
+        source_word_l = source_word_l[:doc_id]
+        source_sort = np.lexsort((source_word_l, source_lengths))
 
         sources = sources[source_sort]
         targets = targets[source_sort]
         target_output = target_output[source_sort]
         target_l = target_lengths[source_sort] # define new arrays to be the lengths
         source_l = source_lengths[source_sort]
+        sources_word = sources_word[source_sort]
+        source_word_l = source_word_l[source_sort]
 
         curr_l = 0
         l_location = [] #idx where sent length changes
         
-        for j,i in enumerate(source_sort): # iterate over the indices of the sorted sentences
-            if source_lengths[i] > curr_l:
-                curr_l = source_lengths[i]
-                l_location.append(j+1)
+        word_l_buckets = [20,40,60,80,100]
+        def find_bucket(x):
+          if x < word_l_buckets[0]: return 0
+          for i in range(1,5):
+            # Find starting bucket
+            if x >= word_l_buckets[i-1] and x < word_l_buckets[i]:
+              return i
+          return 4
+
+        curr_word_l_idx = find_bucket(source_word_l[0])
+
+        for i in range(len(source_word_l)): # iterate over the indices of the sorted sentences
+            if source_l[i] > curr_l:
+                curr_l = source_l[i]
+                l_location.append(i+1)
+                curr_word_l_idx = find_bucket(source_word_l[i]) # reset word batching
+            else:
+                curr_bucket = find_bucket(source_word_l[i])
+                if curr_bucket > curr_word_l_idx:
+                    curr_word_l_idx = curr_bucket
+                    l_location.append(i+1)
         l_location.append(len(sources)) # l_location is array where sentence length changes happen
 
         #get batch sizes
@@ -352,6 +400,7 @@ def get_data(args):
         nonzeros = [] # number of non padding entries
         batch_l = [] # batch lengths (number of docs in the batch)
         batch_w = [] # batch widths (length of the docs in the batch)
+        batch_char_l = [] # batch max sentence length
         target_l_max = []
         for i in range(len(l_location)-1): # iterate over all the different document lengths
             while curr_idx < l_location[i+1]:
@@ -360,6 +409,7 @@ def get_data(args):
         for i in range(len(batch_idx)-1): # iterate over batch_idx
             batch_l.append(batch_idx[i+1] - batch_idx[i])            
             batch_w.append(source_l[batch_idx[i]-1])
+            batch_char_l.append(max(source_word_l[batch_idx[i]-1:batch_idx[i+1]-1]))
             nonzeros.append((target_output[batch_idx[i]-1:batch_idx[i+1]-1] != 1).sum().sum())
             target_l_max.append(max(target_l[batch_idx[i]-1:batch_idx[i+1]-1]))
 
@@ -380,10 +430,8 @@ def get_data(args):
         f["target_size"] = np.array([len(word_indexer.d)])
         f["char_size"] = np.array([len(word_indexer.d)])
         del sources, targets, target_output
-        sources_word = sources_word[source_sort]
-        source_word_l = source_word_l[source_sort]
         f["source_char"] = sources_word
-        f["source_char_l"] = np.array(source_word_l, dtype=int)
+        f["source_char_l"] = np.array(batch_char_l, dtype=int)
         del sources_word, source_word_l
         print("Saved {} documents (dropped {} due to length/unk filter)".format(
             len(f["source"]), dropped))
@@ -422,14 +470,14 @@ def get_data(args):
     max_doc_l = convert(args.srcvalfile, args.targetvalfile, args.batchsize, args.seqlength,
                          args.outputfile + "-val.hdf5", num_docs_valid,
                          max_sent_l, max_doc_l, args.unkfilter, args.shuffle,
-                         args.truncate, args.no_pad, args.repeat_words, args.targetseqlength, args.pretrain)
+                         args.truncate, args.no_pad, args.repeat_words, args.targetseqlength, args.pretrain, args.max_total_words)
     max_doc_l = convert(args.srcfile, args.targetfile, args.batchsize, args.seqlength,
                          args.outputfile + "-train.hdf5", num_docs_train, max_sent_l,
                          max_doc_l, args.unkfilter, args.shuffle,
-                         args.truncate, args.no_pad, args.repeat_words, args.targetseqlength, args.pretrain)
+                         args.truncate, args.no_pad, args.repeat_words, args.targetseqlength, args.pretrain, args.max_total_words)
     
     print("Max doc length (before dropping): {}".format(max_doc_l))
-    
+
 def main(arguments):
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -455,13 +503,13 @@ def main(arguments):
     parser.add_argument('--targetvalfile', help="Path to target txt validation data.", required=True)
     parser.add_argument('--batchsize', help="Size of each minibatch.", type=int, default=64)
     parser.add_argument('--seqlength', help="Maximum sequence (document) length. Sequences longer "
-                                               "than this are dropped.", type=int, default=20)
-    parser.add_argument('--targetseqlength', help="Maximum sequence (document) length. Sequences longer "
-                                               "than this are dropped.", type=int, default=100)
-    parser.add_argument('--outputfile', help="Prefix of the output file names. ", type=str, required=True)
+                                               "than this are dropped.", type=int, default=10)
+    parser.add_argument('--targetseqlength', help="Maximum target length. Sequences longer "
+                                               "than this are dropped.", type=int, default=50)
     parser.add_argument('--maxsentlength', help="For the character models, words are "
                                            "(if longer than maxwordlength) or zero-padded "
-                                            "(if shorter) to maxwordlength", type=int, default=30)
+                                            "(if shorter) to maxwordlength", type=int, default=100)
+    parser.add_argument('--outputfile', help="Prefix of the output file names. ", type=str, required=True)
     parser.add_argument('--word2vec', help="Path to word2vec", type = str, default='')
     parser.add_argument('--unkfilter', help="Ignore sentences with too many UNK tokens. "
                                        "Can be an absolute count limit (if > 1) "
@@ -471,13 +519,15 @@ def main(arguments):
                                            "source length).",
                                           type = int, default = 0)
     parser.add_argument('--truncate', help="If = 1, truncate docs instead of dropping.",
-                                          type = int, default = 0)
+                                          type = int, default = 1)
     parser.add_argument('--no_pad', help="If = 1, fill image instead of padding sentences",
                                           type = int, default = 0)
     parser.add_argument('--repeat_words', help="If > 1, repeat words at end of each row to next row",
                                           type = int, default = 0)
     parser.add_argument('--pretrain', help="If > 1, emit pretraining data - target is number of random sents from source",
                                           type = int, default = 0)
+    parser.add_argument('--max_total_words', help="With new batching scheme, take up to this many words from each doc, cutting the number of sentences accordingly",
+                                          type = int, default = 400)
     parser.add_argument('--sample_sents', help="If = 1, sample sentences from doc up to seqlength",
                                           type = int, default = 0)
     parser.add_argument('--seed', help="random seed", type = int, default = 3435)
