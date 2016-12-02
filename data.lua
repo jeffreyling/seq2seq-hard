@@ -68,10 +68,16 @@ function data:__init(opt, data_file)
       local target_l_i = self.target_l_all:sub(self.batch_idx[i],
 					       self.batch_idx[i]+self.batch_l[i]-1)
       if opt.use_chars_enc == 1 then
-	 source_i = self.source_char:sub(self.batch_idx[i],
-					      self.batch_idx[i] + self.batch_l[i]-1, 1,
-					      self.source_l[i], 1, self.source_char_l[i]):permute(3,1,2):contiguous()
-                                              -- permute to get words, batch, sents
+         source_i = self.source_char:sub(self.batch_idx[i],
+                                              self.batch_idx[i] + self.batch_l[i]-1, 1,
+                                              self.source_l[i], 1, self.source_char_l[i])
+         if opt.all_lstm == 1 then
+           source_i = source_i:reshape(source_i:size(1), self.source_l[i]*self.source_char_l[i])
+           source_i = source_i:transpose(1,2):contiguous()
+         else
+           source_i = source_i:permute(3,1,2):contiguous()
+                                                -- permute to get words, batch, sents
+          end
       else
 	 source_i =  self.source:sub(self.batch_idx[i], self.batch_idx[i]+self.batch_l[i]-1,
 				     1, self.source_l[i]):transpose(1,2)

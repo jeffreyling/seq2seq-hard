@@ -57,3 +57,9 @@ function adagradStep(x, dfdx, eta, state)
    state.std:sqrt(state.var)
    x:addcdiv(-eta, dfdx, state.std:add(1e-10))
 end
+
+function get_indices(t, source_char_l)
+  local t1 = math.floor((t-1)/source_char_l) + 1
+  local t2 = ((t-1) % source_char_l) + 1
+  return t1, t2
+end

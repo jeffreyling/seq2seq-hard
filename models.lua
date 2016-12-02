@@ -1,17 +1,6 @@
 require 'hard_attn'
 require 'memory'
 
-function nn.Module:reuseMem()
-   self.reuse = true
-   return self
-end
-
-function nn.Module:setReuse()
-   if self.reuse then
-      self.gradInput = self.output
-   end
-end
-
 function make_lstm(data, opt, model, use_chars)
    assert(model == 'enc' or model == 'dec' or model == 'bow_enc')
    local name = '_' .. model
@@ -32,17 +21,12 @@ function make_lstm(data, opt, model, use_chars)
        input_size = input_size + opt.pos_dim
      end
    end
-   -- set bow_size
-   local bow_size = opt.word_vec_size
-   if opt.no_bow == 1 then
-     bow_size = opt.rnn_size
+
+   local batch_size
+   if model == 'enc' and opt.all_lstm == 0 then
+     batch_size = opt.max_batch_l*opt.max_sent_l
    else
-     if opt.conv_bow == 1 then
-       bow_size = opt.num_kernels
-     end
-   end
-   if opt.pos_embeds_sent == 1 then
-     bow_size = bow_size + opt.pos_dim
+     batch_size = opt.max_batch_l
    end
 
    local offset = 0
@@ -112,12 +96,12 @@ function make_lstm(data, opt, model, use_chars)
           end	  
         elseif model == 'enc' then
           if opt.add_sent_context == 1 then
-            local sent_context = nn.Reshape(-1, bow_size, false)(inputs[1+offset])
+            local sent_context = nn.Reshape(-1, opt.bow_size, false)(inputs[1+offset])
             x = nn.JoinTable(2)({x, sent_context})
 --:usePrealloc("enc_sent_context_join",
                 --{{opt.max_batch_l*opt.max_sent_l, opt.word_vec_size}, {opt.max_batch_l*opt.max_sent_l, bow_size}})
 
-            input_size_L = input_size + bow_size
+            input_size_L = input_size + opt.bow_size
           end
        end
     else
@@ -133,25 +117,25 @@ function make_lstm(data, opt, model, use_chars)
        --end
        if dropout > 0 then
 	  x = nn.Dropout(dropout, nil, false):usePrealloc(nameL.."dropout",
-                                                          {{opt.max_batch_l, input_size_L}})(x)
+                                                          {{batch_size, input_size_L}})(x)
        end       
     end
     -- evaluate the input sums at once for efficiency
     local i2h = nn.Linear(input_size_L, 4 * rnn_size):usePrealloc(nameL.."i2h-reuse",
-                                                                  {{opt.max_batch_l, input_size_L}},
-                                                                  {{opt.max_batch_l, 4 * rnn_size}})(x)
+                                                                  {{batch_size, input_size_L}},
+                                                                  {{batch_size, 4 * rnn_size}})(x)
     local h2h = nn.LinearNoBias(rnn_size, 4 * rnn_size):usePrealloc(nameL.."h2h-reuse",
-                                                                  {{opt.max_batch_l, rnn_size}},
-                                                                  {{opt.max_batch_l, 4 * rnn_size}})(prev_h)
+                                                                  {{batch_size, rnn_size}},
+                                                                  {{batch_size, 4 * rnn_size}})(prev_h)
     local all_input_sums = nn.CAddTable():usePrealloc(nameL.."allinput",
-            {{opt.max_batch_l, 4*rnn_size}, {opt.max_batch_l, 4*rnn_size}},
-            {{opt.max_batch_l, 4*rnn_size}})({i2h, h2h})
+            {{batch_size, 4*rnn_size}, {batch_size, 4*rnn_size}},
+            {{batch_size, 4*rnn_size}})({i2h, h2h})
 
     local reshaped = nn.Reshape(4, rnn_size, true):usePrealloc(nameL.."reshape2",
-            {{opt.max_batch_l, 4*rnn_size}}, {{opt.max_batch_l, 4, rnn_size}})
+            {{batch_size, 4*rnn_size}}, {{batch_size, 4, rnn_size}})
             (all_input_sums)
     local n1, n2, n3, n4 = nn.SplitTable(2):usePrealloc(nameL.."reshapesplit",
-                                                        {{opt.max_batch_l, 4, rnn_size}})(reshaped):split(4)
+                                                        {{batch_size, 4, rnn_size}})(reshaped):split(4)
     -- decode the gates
     local in_gate = nn.Sigmoid():usePrealloc(nameL.."G1-reuse",{RnnD})(n1)
     local forget_gate = nn.Sigmoid():usePrealloc(nameL.."G2-reuse",{RnnD})(n2)
@@ -183,7 +167,7 @@ function make_bow_encoder(data, opt)
   local word_vecs = nn.LookupTable(data.char_size, opt.word_vec_size)
   word_vecs.name = 'word_vecs_bow'
   local embeds = word_vecs(nn.Reshape(-1, true)(input)) -- batch_l x (source_l*source_char_l) x word_vec_size
-  embeds = nn.ViewAs()({embeds, nn.Replicate(opt.word_vec_size, 4)(input)}) -- batch_l x source_l x source_char_l x (word_vec_size + pos_dim)
+  embeds = nn.ViewAs()({embeds, nn.Replicate(opt.word_vec_size, 4)(input)}) -- batch_l x source_l x source_char_l x word_vec_size
 
   local output
   if opt.conv_bow == 1 then
@@ -242,13 +226,13 @@ function make_pos_embeds_sent(data, opt)
   return nn.gModule(inputs, {output})
 end
 
-function make_add_sent_context_init(data, opt, bow_size)
+function make_add_sent_context_init(data, opt)
     local inputs = {}
     local bow_context = nn.Identity()()
     table.insert(inputs, bow_context)
 
     local sz = opt.num_layers*opt.rnn_size*2
-    local new_state = nn.Linear(bow_size, sz)(nn.View(-1):setNumInputDims(1)(bow_context)) -- batch_l*source_l x sz
+    local new_state = nn.Linear(opt.bow_size, sz)(nn.View(-1):setNumInputDims(1)(bow_context)) -- batch_l*source_l x sz
     local out = nn.ViewAs()({new_state, nn.Replicate(sz, 3)(nn.Sum(3)(bow_context))}) -- batch_l x source_l x sz
     return nn.gModule(inputs, {out})
 end
@@ -261,8 +245,7 @@ function make_decoder_attn(data, opt, simple)
    local outputs = {}
    table.insert(inputs, nn.Identity()())
    table.insert(inputs, nn.Identity()())
-   local target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size):usePrealloc('dec_attn_linear1', {{opt.max_batch_l, opt.rnn_size}}, 
-            {{opt.max_batch_l, opt.rnn_size}})(inputs[1])
+   local target_t = nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(inputs[1])
    local context = nn.Reshape(-1, opt.rnn_size, true)(inputs[2]) -- batch_l x (source_l*source_char_l) x rnn_size
    simple = simple or 0
    local dropout = opt.dropout or 0
@@ -341,27 +324,9 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    simple = simple or 0
    -- get attention
 
-   local bow_size
-   if opt.bow_encoder_lstm == 1 then
-     bow_size = opt.rnn_size
-   else
-     if opt.no_bow == 1 then
-       bow_size = opt.rnn_size
-     else
-       if opt.conv_bow == 1 then
-         bow_size = opt.num_kernels
-       else
-         bow_size = opt.word_vec_size
-       end
-     end
-     if opt.pos_embeds_sent == 1 then
-       bow_size = bow_size + opt.pos_dim
-     end
-   end
-
    local cur_target_t = target_t
    for hop = 1, opt.hop_attn do
-     local hop_attn = make_hier_hop(data, opt, simple, bow_size, hop)
+     local hop_attn = make_hier_hop(data, opt, simple, hop)
      local inp = {cur_target_t, context, bow_context}
      if opt.inf_mask == 1 then
        table.insert(inp, inf_mask)
@@ -372,7 +337,7 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    return nn.gModule(inputs, {cur_target_t})
 end
 
-function make_hier_hop(data, opt, simple, bow_size, hop)
+function make_hier_hop(data, opt, simple, hop)
    local inputs = {}
    table.insert(inputs, nn.Identity()())
    table.insert(inputs, nn.Identity()())
@@ -391,7 +356,7 @@ function make_hier_hop(data, opt, simple, bow_size, hop)
 
    -- attention over sentences
    local reshape_context = nn.Reshape(-1, opt.rnn_size, true)(context) -- batch_l x (source_l*source_char_l) x opt.rnn_size
-   local cur_target_t = nn.LinearNoBias(opt.rnn_size, bow_size)(target_t) -- :usePrealloc('dec_hier_attn_linear1_'..hop, {{opt.max_batch_l, opt.rnn_size}}, 
+   local cur_target_t = nn.LinearNoBias(opt.rnn_size, opt.bow_size)(target_t) -- :usePrealloc('dec_hier_attn_linear1_'..hop, {{opt.max_batch_l, opt.rnn_size}}, 
           --{{opt.max_batch_l, bow_size}})(target_t) -- batch_l x bow_size
    local attn1 = nn.MM()({bow_context, nn.Replicate(1,3)(cur_target_t)}) -- batch_l x source_l x 1
    -- :usePrealloc("dec_hier_attn_mm1_" .. hop, {{opt.max_batch_l, opt.max_sent_l_src, bow_size},{bow_size,bow_size,1}}, {{opt.max_batch_l, opt.max_sent_l_src, 1}})
