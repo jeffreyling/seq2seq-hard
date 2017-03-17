@@ -219,7 +219,7 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
      -- multiply by -1 ( gradient descent on input )
      self.gradInput:mul(-1)
 
-     -- add entropy term
+     -- add entropy term (we want high entropy, so add the negative)
      local grad_ent = self._input:log():add(1)
      self.gradInput:add(self.entropy_scale, grad_ent)
    end

@@ -6,13 +6,16 @@ require 'nngraph'
 require 'data.lua'
 require 'models.lua'
 require 'util.lua'
+require 'logging'
 
 ENTROPY = 0
 GOLD_SIZE = 0
+MUTE = true
 
 stringx = require('pl.stringx')
 
 cmd = torch.CmdLine()
+cmd:option('-log_path', '', [[Logging path]])
 
 -- check attn options
 cmd:option('-num_argmax', 0, [[Change multisampling to do different number of argmax]])
@@ -22,7 +25,7 @@ cmd:option('-print_sent_attn', 1, [[Print sentence attention instead of all attn
 
 cmd:option('-no_pad', 1, [[No pad format for data]])
 cmd:option('-no_pad_sent_l', 10, [[Number of `sentences` we have for a doc]])
-cmd:option('-repeat_words', 5, [[Repeat words format for data]])
+cmd:option('-repeat_words', 0, [[Repeat words format for data]])
 
 -- file location
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])
@@ -121,19 +124,21 @@ function StateAll.heuristic(state)
 end
 
 function StateAll.print(state)
+   local result = ""
    for i = 1, #state do
-      io.write(state[i] .. " ")
+      result = result .. state[i] .. " "
    end
-   print()
+   logging:info(result, MUTE)
 end
 
 function pretty_print(t)
   for i,x in ipairs(t) do
+    local result = ""
     if i > 1 then
       for j = 1, x:size(1) do
-        io.write(string.format("%.4f ", x[j]))
+        result = result .. string.format("%.4f ", x[j])
       end
-      print('')
+      logging:info(result, MUTE)
     end
   end
 end
@@ -411,7 +416,8 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
              
              if i < 2 or diff then
                  if opt.view_attn == 1 then
-                   print('decoder attention at time ', i)
+                   -- outdated...
+                   print('decoder attention at time ' .. i)
                    if model_opt.hierarchical == 1 then
                      print('row:', decoder_softmax.output) -- K x source_sent_l
                      print('words:', decoder_softmax_words.output:view(K, source_sent_l, source_char_l))
@@ -591,12 +597,12 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
 
       end      
       if opt.print_attn == 1 then
-        print('ATTN GOLD')
+        logging:info('ATTN GOLD', MUTE)
         pretty_print(gold_attn_list)
       end
       if opt.print_sent_attn == 1 then
         -- sentence attn
-        print('ATTN LEVEL GOLD')
+        logging:info('ATTN LEVEL GOLD', MUTE)
         pretty_print(gold_sentence_attn_list)
 
         for j = 2, #gold_sentence_attn_list do
@@ -788,7 +794,7 @@ function wordidx2sent(sent, idx2word, source_str, attn, skip_end)
          if opt.replace_unk == 1 then
             local s = source_str[attn[i]]
             if phrase_table[s] ~= nil then
-               print(s .. ':' ..phrase_table[s])
+               logging:info(s .. ':' ..phrase_table[s])
             end            
             local r = phrase_table[s] or s
             table.insert(t, r)            
@@ -835,16 +841,23 @@ function main()
    PAD_WORD = '<blank>'; UNK_WORD = '<unk>'; START_WORD = '<d>'; END_WORD = '</d>'
    START_CHAR = '{'; END_CHAR = '}'
    MAX_SENT_L = opt.max_sent_l
-   print('max_sent_l:', MAX_SENT_L)
+
+   -- parse input params
+   opt = cmd:parse(arg)
+   assert(opt.log_path ~= '', 'need to set logging')
+   logging = logger(opt.log_path)
+   logging:info("Command line args:")
+   logging:info(arg)
+   logging:info("End command line args")
+
+   logging:info('max_sent_l: ' .. MAX_SENT_L)
    if path.exists(opt.src_hdf5) then
-     print('using hdf5 file ' .. opt.src_hdf5)
+     logging:info('using hdf5 file ' .. opt.src_hdf5)
    else
      assert(path.exists(opt.src_file), 'src_file does not exist')
      assert(path.exists(opt.model), 'model does not exist')
    end
    
-   -- parse input params
-   opt = cmd:parse(arg)
    if opt.gpuid >= 0 then
       require 'cutorch'
       require 'cunn'
@@ -852,9 +865,9 @@ function main()
          require 'cudnn'
       end      
    end      
-   print('loading ' .. opt.model .. '...')
+   logging:info('loading ' .. opt.model .. '...')
    checkpoint = torch.load(opt.model)
-   print('done!')
+   logging:info('done!')
 
    if opt.replace_unk == 1 then
       phrase_table = {}
@@ -1033,7 +1046,7 @@ function main()
       local target, target_str
       if opt.src_hdf5 == '' then 
         line = clean_sent(line)      
-        print('SENT ' .. sent_id .. ': ' ..line)
+        logging:info('SENT ' .. sent_id .. ': ' ..line, MUTE)
         if model_opt.use_chars_enc == 0 then
            source, source_str = sent2wordidx(line, word2idx_src, model_opt.start_symbol)
         else
@@ -1045,7 +1058,7 @@ function main()
       else
         -- line is a tensor
         source_str = wordidx2sent(line:view(line:nElement()), idx2word_src, nil, nil, false)
-        print('SENT ' .. sent_id .. ': ' .. source_str)
+        logging:info('SENT ' .. sent_id .. ': ' .. source_str, MUTE)
         source = line
         if opt.score_gold == 1 then
           target = gold[sent_id]
@@ -1062,15 +1075,15 @@ function main()
       pred_words_total = pred_words_total + #pred - 1
       pred_sent = wordidx2sent(pred, idx2word_targ, source_str, attn, true)
       out_file:write(pred_sent .. '\n')      
-      print('PRED ' .. sent_id .. ': ' .. pred_sent)
+      logging:info('PRED ' .. sent_id .. ': ' .. pred_sent, MUTE)
       if gold ~= nil then
          if opt.src_hdf5 == '' then
-           print('GOLD ' .. sent_id .. ': ' .. gold[sent_id])
+           logging:info('GOLD ' .. sent_id .. ': ' .. gold[sent_id], MUTE)
          else
-           print('GOLD ' .. sent_id .. ': ' .. target_str)
+           logging:info('GOLD ' .. sent_id .. ': ' .. target_str, MUTE)
          end
          if opt.score_gold == 1 then
-            print(string.format("PRED SCORE: %.4f, GOLD SCORE: %.4f", pred_score, gold_score))
+            logging:info(string.format("PRED SCORE: %.4f, GOLD SCORE: %.4f", pred_score, gold_score), MUTE)
             gold_score_total = gold_score_total + gold_score
             gold_words_total = gold_words_total + target:size(1) - 1                     
          end
@@ -1079,16 +1092,16 @@ function main()
          for n = 1, opt.n_best do
             pred_sent_n = wordidx2sent(all_sents[n], idx2word_targ, source_str, all_attn[n], false)
             local out_n = string.format("%d ||| %s ||| %.4f", n, pred_sent_n, all_scores[n])
-            print(out_n)
+            logging:info(out_n, MUTE)
             out_file:write(out_n .. '\n')
          end         
       end
       if opt.print_attn == 1 then
-        print('ATTN PRED')
+        logging:info('ATTN PRED', MUTE)
         pretty_print(attn_list)
       end
       if opt.print_sent_attn == 1 then
-        print('ATTN LEVEL PRED')
+        logging:info('ATTN LEVEL PRED', MUTE)
         pretty_print(sentence_attn_list)
       end
         --deficit_list[1] = 0
@@ -1097,17 +1110,17 @@ function main()
         ----io.read()
       --end
 
-      print('')
+      logging:info('', MUTE)
    end
-   print(string.format("PRED AVG SCORE: %.4f, PRED PPL: %.4f", pred_score_total / pred_words_total,
+   logging:info(string.format("PRED AVG SCORE: %.4f, PRED PPL: %.4f", pred_score_total / pred_words_total,
                        math.exp(-pred_score_total/pred_words_total)))
    if opt.score_gold == 1 then      
-      print(string.format("GOLD AVG SCORE: %.4f, GOLD PPL: %.4f",
+      logging:info(string.format("GOLD AVG SCORE: %.4f, GOLD PPL: %.4f",
                           gold_score_total / gold_words_total,
                           math.exp(-gold_score_total/gold_words_total)))
    end
-   print(string.format("attn deficit: %.4f", total_deficit/pred_words_total))
-   print(string.format("gold entropy: %.4f", ENTROPY / GOLD_SIZE))
+   logging:info(string.format("attn deficit: %.4f", total_deficit/pred_words_total))
+   logging:info(string.format("gold entropy: %.4f", ENTROPY / GOLD_SIZE))
    out_file:close()
 end
 main()

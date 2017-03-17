@@ -74,7 +74,7 @@ function make_lstm(data, opt, model, use_chars)
        else
 	  local char_vecs = nn.LookupTable(data.char_size, opt.word_vec_size)
 	  char_vecs.name = 'word_vecs' .. name
-	  x = nn.Reshape(-1, opt.word_vec_size, false)(char_vecs(inputs[1])) -- (batch_size*source_l) x word_vec_size
+          x = nn.Reshape(-1, opt.word_vec_size, false)(char_vecs(inputs[1])) -- (batch_size*source_l) x word_vec_size
           --:usePrealloc(nameL..'reshape1', {{opt.max_batch_l, opt.max_sent_l, opt.word_vec_size}},
               --{{opt.max_batch_l*opt.max_sent_l, opt.word_vec_size}})(
 	  --local charcnn = make_cnn(opt.char_vec_size,  opt.kernel_width, opt.num_kernels)
@@ -166,27 +166,24 @@ function make_bow_encoder(data, opt)
   local inputs = {input}
   local word_vecs = nn.LookupTable(data.char_size, opt.word_vec_size)
   word_vecs.name = 'word_vecs_bow'
-  local embeds = word_vecs(nn.Reshape(-1, true)(input)) -- batch_l x (source_l*source_char_l) x word_vec_size
-  embeds = nn.ViewAs()({embeds, nn.Replicate(opt.word_vec_size, 4)(input)}) -- batch_l x source_l x source_char_l x word_vec_size
+  local embeds = nn.Bottle(word_vecs, 2, 3)(input) -- batch_l x source_l x source_char_l x word_vec_size
 
   local output
   if opt.conv_bow == 1 then
-    local template = nn.View(-1):setNumInputDims(1)(input) -- (batch_l*source_l) x source_char_l
-    template = nn.Replicate(opt.word_vec_size, 3)(template) -- (batch_l*source_l) x source_char_l x word_vec_size
-    local reshaped_embeds = nn.ViewAs()({embeds, template})
     local conv = make_cnn(opt.word_vec_size, opt.kernel_width, opt.num_kernels)
-
-    local template2 = nn.Sum(3)(input) -- batch_l x source_l
-    template2 = nn.Replicate(opt.num_kernels, 3)(template2) -- batch_l x source_l x num_kernels
-    local conv_output = conv(reshaped_embeds)
+    local conv_output = nn.Bottle(conv, 3, 2)(embeds)
     if opt.num_highway_layers > 0 then
       local mlp = make_highway(opt.num_kernels, opt.num_highway_layers)
-      conv_output = mlp(conv_output)
+      conv_output = nn.Bottle(mlp)(conv_output)
     end	  
-    output = nn.ViewAs()({conv_output, template2})
+    output = conv_output
   else
     -- bag of words
     output = nn.Sum(3)(embeds) -- batch_l x source_l x word_vec_size
+    if opt.linear_bow == 1 then
+      local linear_bow = nn.Linear(opt.word_vec_size, opt.linear_bow_size)
+      output = nn.Bottle(linear_bow, 2)(output)
+    end
   end
   if opt.bow_encoder_lstm == 1 then
     -- make output suitable for LSTM
@@ -198,6 +195,9 @@ function make_bow_encoder(data, opt)
     local pos_embeddings = nn.LookupTable(opt.max_sent_l, opt.pos_dim)
     local pos_states = pos_embeddings(pos) -- batch_l x source_l x pos_dim
     output = nn.JoinTable(3)({output, pos_states}) -- batch_l x source_l x (word_vec_size + pos_dim)
+  end
+  if opt.bow_dropout > 0 then
+    output = nn.Dropout(opt.bow_dropout, nil, false)(output)
   end
 
   return nn.gModule(inputs, {output})
@@ -256,7 +256,6 @@ function make_decoder_attn(data, opt, simple)
                                 {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, 1}})
                         ({context, nn.Replicate(1,3)(target_t)}) -- batch_l x (source_l*source_char_l) x 1
    attn = nn.Sum(3)(attn)
-   attn = nn.MulConstant(opt.beta_attn)(attn) -- for spikiness
    local softmax_attn = nn.SoftMax()
    softmax_attn.name = 'softmax_attn'
    attn = softmax_attn(attn)
@@ -311,11 +310,17 @@ function make_hierarchical_decoder_attn(data, opt, simple)
    local inputs = {}
    local outputs = {}
    table.insert(inputs, nn.Identity()())
-   table.insert(inputs, nn.Identity()())
-   table.insert(inputs, nn.Identity()())
    local target_t = inputs[1]
-   local context = inputs[2]
-   local bow_context = inputs[3]
+   local context, bow_context
+   if opt.coarse_attn_only == 1 then
+     table.insert(inputs, nn.Identity()())
+     bow_context = inputs[2]
+   else
+     table.insert(inputs, nn.Identity()())
+     table.insert(inputs, nn.Identity()())
+     context = inputs[2]
+     bow_context = inputs[3]
+   end
    local inf_mask
    if opt.inf_mask == 1 then
       table.insert(inputs, nn.Identity()())
@@ -326,8 +331,14 @@ function make_hierarchical_decoder_attn(data, opt, simple)
 
    local cur_target_t = target_t
    for hop = 1, opt.hop_attn do
-     local hop_attn = make_hier_hop(data, opt, simple, hop)
-     local inp = {cur_target_t, context, bow_context}
+     local hop_attn, inp
+     if opt.coarse_attn_only == 1 then
+       hop_attn = make_hier_hop_coarse_only(data, opt, simple, hop)
+       inp = {cur_target_t, bow_context}
+     else
+       hop_attn = make_hier_hop(data, opt, simple, hop)
+       inp = {cur_target_t, context, bow_context}
+     end
      if opt.inf_mask == 1 then
        table.insert(inp, inf_mask)
      end
@@ -342,9 +353,9 @@ function make_hier_hop(data, opt, simple, hop)
    table.insert(inputs, nn.Identity()())
    table.insert(inputs, nn.Identity()())
    table.insert(inputs, nn.Identity()())
-   local target_t = inputs[1]
+   local target_t = inputs[1] -- batch_l x rnn_size
    local context = inputs[2]
-   local bow_context = inputs[3] -- batch_l x source_l x bow_size
+   local bow_context = nn.Contiguous()(inputs[3]) -- batch_l x source_l x bow_size
    local inf_mask
    if opt.inf_mask == 1 then
      table.insert(inputs, nn.Identity()())
@@ -355,12 +366,29 @@ function make_hier_hop(data, opt, simple, hop)
    -- get attention
 
    -- attention over sentences
-   local reshape_context = nn.Reshape(-1, opt.rnn_size, true)(context) -- batch_l x (source_l*source_char_l) x opt.rnn_size
-   local cur_target_t = nn.LinearNoBias(opt.rnn_size, opt.bow_size)(target_t) -- :usePrealloc('dec_hier_attn_linear1_'..hop, {{opt.max_batch_l, opt.rnn_size}}, 
-          --{{opt.max_batch_l, bow_size}})(target_t) -- batch_l x bow_size
-   local attn1 = nn.MM()({bow_context, nn.Replicate(1,3)(cur_target_t)}) -- batch_l x source_l x 1
-   -- :usePrealloc("dec_hier_attn_mm1_" .. hop, {{opt.max_batch_l, opt.max_sent_l_src, bow_size},{bow_size,bow_size,1}}, {{opt.max_batch_l, opt.max_sent_l_src, 1}})
-   attn1 = nn.Sum(3)(attn1)
+   local attn1 -- raw scores, batch_l x source_l
+   if opt.bahdanau_attn == 1 then
+     local weighted_bow_context = nn.Bottle(nn.LinearNoBias(opt.bow_size, opt.hid_attn_size), 2)(bow_context) -- batch_l x source_l x hid_attn_size
+     local cur_target_t = nn.LinearNoBias(opt.rnn_size, opt.hid_attn_size)(target_t) -- batch_l x hid_attn_size
+     local hid = nn.Tanh()(nn.CAddTable(3)({weighted_bow_context, 
+                                            nn.ReplicateAs(2, 2)({cur_target_t, bow_context}) -- batch_l x source_l x hid_attn_size
+                                          })) -- batch_l x source_l x hid_attn_size
+     attn1 = nn.Bottle(nn.LinearNoBias(opt.hid_attn_size, 1), 2)(hid) -- batch_l x source_l x 1
+     attn1 = nn.Sum(3)(attn1)
+   else
+     local cur_target_t = nn.LinearNoBias(opt.rnn_size, opt.bow_size)(target_t) -- :usePrealloc('dec_hier_attn_linear1_'..hop, {{opt.max_batch_l, opt.rnn_size}}, 
+            --{{opt.max_batch_l, bow_size}})(target_t) -- batch_l x bow_size
+     attn1 = nn.MM()({bow_context, nn.Replicate(1,3)(cur_target_t)}) -- batch_l x source_l x 1
+     -- :usePrealloc("dec_hier_attn_mm1_" .. hop, {{opt.max_batch_l, opt.max_sent_l_src, bow_size},{bow_size,bow_size,1}}, {{opt.max_batch_l, opt.max_sent_l_src, 1}})
+     attn1 = nn.Sum(3)(attn1)
+   end
+
+   -- trained temperature
+   if opt.train_temp == 1 then
+     local temp = nn.Sum(2)(nn.Linear(opt.rnn_size, 1)(target_t)) -- batch_l
+     attn1 = nn.CMulTable()({nn.ReplicateAs(2, 2)({temp, attn1}), attn1})
+   end
+
    local softmax_attn = nn.SoftMax() --:usePrealloc('dec_hier_attn_softmax1_'..hop, {{opt.max_batch_l, opt.max_sent_l_src}})
    if opt.use_sigmoid_sent == 1 then
      softmax_attn = nn.Sigmoid()
@@ -371,10 +399,18 @@ function make_hier_hop(data, opt, simple, hop)
      -- sample (hard attention)
      local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
                                             opt.with_replace, opt.uniform_attn)
-                                            :usePrealloc("sampler_" .. hop,
-                                            {{opt.max_batch_l, opt.max_sent_l_src}})
+                                            --:usePrealloc("sampler_" .. hop,
+                                            --{{opt.max_batch_l, opt.max_sent_l_src}})
      sampler.name = 'sampler'
      attn1 = sampler(attn1) -- one hot
+   else
+     if opt.sent_ent > 0 then
+       -- this module does nothing to input, but adds scale*(log(a) + 1) gradient
+       -- on backward
+       local ent_module = nn.EntropyBackward(opt.sent_ent)
+       ent_module.name = 'entropy_backward'
+       attn1 = ent_module(attn1)
+     end
    end
 
    -- attention over words of each sentence
@@ -384,13 +420,15 @@ function make_hier_hop(data, opt, simple, hop)
                          --({reshape_context,
                          --nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.rnn_size):usePrealloc("dec_hier_attn_linear2_"..hop, {{opt.max_batch_l, opt.rnn_size}})
                          --(target_t))}) -- batch_l x (source_l*source_char_l) x 1
+   local reshape_context = nn.Reshape(-1, opt.rnn_size, true)(context) -- batch_l x (source_l*source_char_l) x opt.rnn_size
    local attn2 = nn.MM()({reshape_context,
                          nn.Replicate(1,3)(nn.LinearNoBias(opt.rnn_size, opt.rnn_size)(target_t))}) -- batch_l x (source_l*source_char_l) x 1
-   attn2 = nn.Sum(3)(attn2)
-   attn2 = nn.View(-1):setNumInputDims(1)(nn.ViewAs(3)({attn2, context})) -- (batch_l*source_l) x source_char_l
+   attn2 = nn.Sum(3)(attn2) -- batch_l x (source_l*source_char_l)
+   --attn2 = nn.View(-1):setNumInputDims(1)(nn.ViewAs(3)({attn2, context})) -- (batch_l*source_l) x source_char_l
+   attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
 
    if opt.inf_mask == 1 then
-     local attn_mask = nn.View(-1):setNumInputDims(1)(inf_mask) -- (batch_l*source_l) x source_char_l
+     local attn_mask = inf_mask -- batch_l x source_l x source_char_l
      attn2 = nn.CAddTable()({attn2, attn_mask})
    end
 
@@ -399,7 +437,7 @@ function make_hier_hop(data, opt, simple, hop)
      softmax_attn2 = nn.Sigmoid()
    end
    softmax_attn2.name = 'softmax_attn2_' .. hop
-   attn2 = softmax_attn2(attn2)
+   attn2 = nn.Bottle(softmax_attn2)(attn2)
    if opt.attn_word_type == 'hard' then
      -- word level sampling
      local sampler_word = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
@@ -407,7 +445,7 @@ function make_hier_hop(data, opt, simple, hop)
      sampler_word.name = 'sampler_word'
      attn2 = sampler_word(attn2) -- one hot
    end
-   attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
+   --attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
 
    -- multiply attentions together
    local mul_attn = nn.CMulTable()({nn.ReplicateAs(3,3)({attn1, attn2}), attn2}) -- batch_l x source_l x source_char_l
@@ -447,6 +485,63 @@ function make_hier_hop(data, opt, simple, hop)
    -- finished hops
    local out = context_output
    return nn.gModule(inputs, {out})   
+end
+
+function make_hier_hop_coarse_only(data, opt, simple, hop)
+   local inputs = {}
+   table.insert(inputs, nn.Identity()())
+   table.insert(inputs, nn.Identity()())
+   local target_t = inputs[1] -- batch_l x rnn_size
+   local bow_context = nn.Contiguous()(inputs[2]) -- batch_l x source_l x bow_size
+   simple = simple or 0
+   local dropout = opt.dropout or 0
+   -- get attention
+
+   -- attention over sentences
+   local attn1 -- raw scores, batch_l x source_l
+   local cur_target_t = nn.LinearNoBias(opt.rnn_size, opt.bow_size)(target_t) -- batch_l x bow_size
+   attn1 = nn.MM()({bow_context, nn.Replicate(1,3)(cur_target_t)}) -- batch_l x source_l x 1
+   attn1 = nn.Sum(3)(attn1)
+
+   local softmax_attn = nn.SoftMax()
+   if opt.use_sigmoid_sent == 1 then
+     softmax_attn = nn.Sigmoid()
+   end
+   softmax_attn.name = 'softmax_attn1_' .. hop
+   attn1 = softmax_attn(attn1) -- batch_l x source_l
+   if opt.attn_type == 'hard' then
+     -- sample (hard attention)
+     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
+                                            opt.with_replace, opt.uniform_attn)
+     sampler.name = 'sampler'
+     attn1 = sampler(attn1) -- one hot
+   end
+
+   -- apply attention to context
+   local context_combined = nn.MM()({nn.Replicate(1,2)(attn1), bow_context}) -- batch_l x 1 x bow_vec_size
+   context_combined = nn.Sum(2)(context_combined) -- batch_l x bow_vec_size
+   local context_output
+   if simple == 0 then
+      context_combined = nn.JoinTable(2)({context_combined, inputs[1]}) -- batch_l x (bow_vec_size + rnn_size)
+
+      local dec_hier_linear = nn.LinearNoBias(opt.bow_size + opt.rnn_size, opt.rnn_size)
+      context_output = nn.Tanh()(dec_hier_linear(context_combined))
+      -- :usePrealloc("dec_hier_noattn_tanh"..hop, {{opt.max_batch_l,opt.rnn_size}})
+   else
+      assert('failure')
+      context_output = nn.CAddTable()({context_combined,inputs[1]})
+   end
+
+   if dropout > 0 then
+      context_output = nn.Dropout(dropout, nil, false)(context_output)
+      --:usePrealloc("dec_hier_attn_dropout" .. hop,
+                                                        --{{opt.rnn_size, opt.rnn_size}})(context_output)
+   end     
+
+   -- finished hops
+   local out = context_output
+   return nn.gModule(inputs, {out})   
+
 end
 
 function make_pos_embeds(data, opt)

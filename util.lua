@@ -149,3 +149,30 @@ function ReplicateAs:updateGradInput(input, gradOutput)
 
   return self.gradInput
 end
+
+
+local EntropyBackward = torch.class('nn.EntropyBackward', 'nn.Module')
+-- this module does nothing to input, but adds scale*(log(a) + 1) gradient
+-- on backward
+
+function EntropyBackward:__init(entropy)
+  nn.Module.__init(self)
+  self.entropy = entropy
+  self.gradInput = torch.Tensor()
+end
+
+function EntropyBackward:updateOutput(input)
+  self.output = input
+  return self.output
+end
+
+function EntropyBackward:updateGradInput(input, gradOutput)
+  self.gradInput = gradOutput
+
+  -- add entropy term (we want lower entropy, so in gradient descent this gets subtracted)
+  local grad_ent = torch.add(input, 1e-8)
+  grad_ent = grad_ent:log():add(1):mul(-1)
+  self.gradInput:add(self.entropy, grad_ent)
+
+  return self.gradInput
+end

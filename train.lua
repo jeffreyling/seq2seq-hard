@@ -6,44 +6,61 @@ require 'data.lua'
 require 'util.lua'
 require 'models.lua'
 require 'model_utils.lua'
-require 'logging.lua'
+require 'logging'
 
 --nngraph.setDebug(true)
 
 cmd = torch.CmdLine()
 
+-- debugging
 cmd:option('-log_path', '', [[Logging path]])
+cmd:option('-try_worst', 0, [[For debugging memory constraints]])
+cmd:option('-debug', 0, [[Debug]])
 
+-- sentence embeddings
+-- TODO
+cmd:option('-sentence_a', 1e-4, [[ See Arora et al (2017) ]])
+
+-- synthetic dataset
+cmd:option('-synth_data', 0, [[ Using synthetic dataset ]])
+
+-- useful
+cmd:option('-separate_vecs', 0, [[Separate sentence and enc vecs]])
+cmd:option('-sent_learning_rate', 0, [[Learning rate for bow encoder.]])
+cmd:option('-bow_dropout', 0.0, [[Use dropout after bow]])
+cmd:option('-fix_bow_vecs', 0, [[No gradients for bow encoder vecs]])
+cmd:option('-linear_bow', 0, [[Add linear layer above bow encoder]])
+cmd:option('-linear_bow_size', 100, [[linear layer above bow encoder size]])
 cmd:option('-all_lstm', 0, [[Run LSTM encoder without factoring]])
+cmd:option('-use_sigmoid_sent', 0, [[Use sigmoid instead of softmax for sent attn (SOFT ONLY!)]])
+cmd:option('-use_sigmoid_word', 0, [[Use sigmoid instead of softmax for word attn (SOFT ONLY!)]])
+cmd:option('-hop_attn', 1, [[Do this many hops for attention]])
+
+-- not useful
+cmd:option('-sent_ent', 0.0, [[Sentence entropy regularizer for soft]])
+cmd:option('-train_temp', 0, [[Trained temperature for sent attn]])
+cmd:option('-coarse_attn_only', 0, [[Only use coarse features for context]])
+cmd:option('-bahdanau_attn', 0, [[Use Bahdanau attention (concat + MLP)]])
+cmd:option('-hid_attn_size', 500, [[hidden size of Bahdanau MLP]])
 cmd:option('-inf_mask', 0, [[Mask out attention for padding]])
 cmd:option('-add_sent_context', 0, [[Add previous sentence context to each row]])
 cmd:option('-add_sent_context_init', 0, [[Init encoder with previous sent context]])
 cmd:option('-pos_embeds', 0, [[Use positional embeddings as encoder initialization]])
 cmd:option('-pos_embeds_sent', 0, [[Use positional embeddings for each sentence]])
 cmd:option('-pos_dim', 25, [[Embedding size for bow context pos]])
-
-cmd:option('-beta_attn', 1, [[Beta value for attention]])
-cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
-cmd:option('-sampling_curric', 0, [[Set 1 to anneal 5,4,3,2,1 samples]])
-cmd:option('-with_replace', 1, [[With replacement for multisampling]])
-cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
-cmd:option('-use_sigmoid_sent', 0, [[Use sigmoid instead of softmax for sent attn (SOFT ONLY!)]])
-cmd:option('-use_sigmoid_word', 0, [[Use sigmoid instead of softmax for word attn (SOFT ONLY!)]])
-cmd:option('-hop_attn', 1, [[Do this many hops for attention]])
 --cmd:option('-different_sampling', 1, [[Make this many distributions for sampling, then sum]])
 --cmd:option('-diff_method', 'oneplus', [[softplus or oneplus]])
 
-cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
-cmd:option('-denoise', 0, [[Denoising autoencoder p]])
 cmd:option('-no_pad', 0, [[Single block of document as image]])
-cmd:option('-conv_bow', 0, [[Use convolution instead of summing bag of words]])
+cmd:option('-conv_bow', 1, [[Use convolution instead of summing bag of words]])
 cmd:option('-no_bow', 0, [[Use LSTM instead of BOW encoder]])
-cmd:option('-bow_encoder_lstm', 0, [[LSTM over sentence BOW]])
+cmd:option('-bow_encoder_lstm', 0, [[LSTM over sentence BOW (should use with no_bow)]])
 cmd:option('-mask_padding', 1, [[Mask LSTM states for padding words]])
-cmd:option('-debug', 0, [[Debug]])
 cmd:option('-hierarchical', 1, [[Do hierarchical attention]])
 cmd:option('-attn_type', 'soft', [[`soft`, `hard` for first attention on decoder side]])
 cmd:option('-attn_word_type', 'soft', [[`soft`, `hard` for hierarchical second attention]])
+
+-- model size
 cmd:option('-num_layers', 2, [[Number of layers in the LSTM encoder/decoder]])
 cmd:option('-rnn_size', 500, [[Size of LSTM hidden states]])
 cmd:option('-word_vec_size', 300, [[Word embedding sizes]])
@@ -60,16 +77,22 @@ cmd:option('-use_chars_enc', 1, [[If = 1, use character on the encoder
                                 side (instead of word embeddings]])
 
 -- crazy hacks
+cmd:option('-denoise', 0, [[Denoising autoencoder p]])
 cmd:option('-share_embed', 0, [[ Autoencoder mode: share enc/dec embeddings ]])
 cmd:option('-fix_encoder', 0, [[Fix encoder]])
 cmd:option('-fix_decoder', 0, [[Fix decoder]])
 cmd:option('-reinit_encoder', 0, [[Reinit encoder weights]])
 cmd:option('-reinit_decoder', 0, [[Reinit decoder weights]])
 cmd:option('-zero_one', 0, [[Use zero-one loss instead of log-prob]])
-cmd:option('-moving_variance', 1, [[Use moving variance to normalize rewards (thus ignoring reward_scale)]])
+cmd:option('-moving_variance', 0, [[Use moving variance to normalize rewards (thus ignoring reward_scale)]])
 cmd:option('-soft_curriculum', 0, [[Anneal semi_sampling_p as 1/sqrt(epoch) if set to 1]])
 
 -- hard attention specs (attn_type == 'hard')
+cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
+cmd:option('-sampling_curric', 0, [[Set 1 to anneal 5,4,3,2,1 samples]])
+cmd:option('-with_replace', 1, [[With replacement for multisampling]])
+cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
+cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
 cmd:option('-reward_scale', 0.04, [[Scale reward by this factor]])
 cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
@@ -145,13 +168,13 @@ cmd:text("**Optimization options**")
 cmd:text("")
 
 -- optimization
-cmd:option('-epochs', 13, [[Number of training epochs]])
+cmd:option('-epochs', 20, [[Number of training epochs]])
 cmd:option('-start_epoch', 1, [[If loading from a checkpoint, the epoch from which to start]])
 cmd:option('-param_init', 0.1, [[Parameters are initialized over uniform distribution with support
                                (-param_init, param_init)]])
 cmd:option('-learning_rate', 1, [[Starting learning rate. If AdaGrad is used, then this is the
                                   global learning rate.]])
-cmd:option('-adagrad', 0, [[Use AdaGrad instead of vanilla SGD.]])
+cmd:option('-learning_method', 'sgd', [[sgd, adagrad, adam, adadelta]])
 cmd:option('-max_grad_norm', 5, [[If the norm of the gradient vector exceeds this, renormalize it
                                 to have the norm equal to max_grad_norm]])
 cmd:option('-dropout', 0.3, [[Dropout probability. 
@@ -301,6 +324,9 @@ function train(train_data, valid_data)
        grad_sz = opt.word_vec_size
        if opt.conv_bow == 1 then
          grad_sz = opt.num_kernels
+       end
+       if opt.linear_bow == 1 then
+         grad_sz = opt.linear_bow_size
        end
      end
      if opt.pos_embeds_sent == 1 then
@@ -522,7 +548,6 @@ function train(train_data, valid_data)
 
    -- decay learning rate if val perf does not improve or we hit the opt.start_decay_at limit
    function decay_lr(epoch)
-      logging:info(opt.val_perf)
       if opt.start_decay == 1 then
          start_decay = 1
       end
@@ -538,7 +563,6 @@ function train(train_data, valid_data)
          for j = 1, #layer_etas do
            layer_etas[j] = layer_etas[j] * opt.lr_decay
          end
-	 --opt.learning_rate = opt.learning_rate * opt.lr_decay
       end
    end   
 
@@ -673,14 +697,6 @@ function train(train_data, valid_data)
         if opt.soft_curriculum == 1 then
           local p = 1/math.sqrt(epoch)
           logging:info(string.format('soft curriculum sampling p = %.2f', p))
-          --for _,module in ipairs(sampler_layers) do
-            --module.semi_sampling_p = p
-          --end
-          --if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
-            --for _, module in ipairs(sampler_word_layers) do
-              --module.semi_sampling_p = p
-            --end
-          --end
         end
       end
       
@@ -695,9 +711,12 @@ function train(train_data, valid_data)
           end
         else
           d = data[batch_order[i]]
-          --local idx, b,t,s,sc = data:get_worst()
-          --print(b,t,s,sc)
-          --d = data[idx]
+          if opt.try_worst == 1 then
+            print('Trying worst')
+            local idx, b,t,s,sc = data:get_worst()
+            print(b,t,s,sc)
+            d = data[idx]
+          end
         end
         local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
         local batch_l, target_l, source_l, target_l_all = d[5], d[6], d[7], d[8]
@@ -915,9 +934,13 @@ function train(train_data, valid_data)
             table.insert(decoder_out, out[#out]) -- for backprop
             local decoder_attn_input
             if opt.hierarchical == 1 then
-              decoder_attn_input = {out[#out], context, context_bow}
-              if opt.inf_mask == 1 then
-                table.insert(decoder_attn_input, inf_mask)
+              if opt.coarse_attn_only == 1 then
+                decoder_attn_input = {out[#out], context_bow}
+              else
+                decoder_attn_input = {out[#out], context, context_bow}
+                if opt.inf_mask == 1 then
+                  table.insert(decoder_attn_input, inf_mask)
+                end
               end
             else
               decoder_attn_input = {out[#out], context}
@@ -971,9 +994,7 @@ function train(train_data, valid_data)
                 end
                 cur_reward = sum_reward:clone()
               end
-              if opt.moving_variance == 1 then
-                cur_reward:mul(opt.reward_scale) -- helps performance
-              end
+              cur_reward:mul(opt.reward_scale) -- helps performance, kind of like learning rate
 
               -- broadcast
               local cur_samplers = {}
@@ -991,10 +1012,9 @@ function train(train_data, valid_data)
               --end
               if opt.attn_type == 'hard' then
                 decoder_attn_clones[t]:apply(get_single_layer)
-                local p = 1/math.sqrt(epoch)
                 for _,layer in ipairs(cur_samplers) do
                   if opt.soft_curriculum == 1 then
-                    layer.semi_sampling_p = p
+                    layer.semi_sampling_p = 1/math.sqrt(epoch)
                   end
                   if opt.sampling_curric == 1 then
                     if epoch > 5 and layer.multisampling > 1 then
@@ -1025,7 +1045,11 @@ function train(train_data, valid_data)
             local dl_dtarget = generator:backward(preds[t], dl_dpred)
             local decoder_attn_input
             if opt.hierarchical == 1 then
-              decoder_attn_input = {decoder_out[t], context, context_bow}
+              if opt.coarse_attn_only == 1 then
+                decoder_attn_input = {decoder_out[t], context_bow}
+              else
+                decoder_attn_input = {decoder_out[t], context, context_bow}
+              end
               if opt.inf_mask == 1 then
                 table.insert(decoder_attn_input, inf_mask)
               end
@@ -1038,12 +1062,18 @@ function train(train_data, valid_data)
             local decoder_input = {target[t], table.unpack(rnn_state_dec[t-1])}
             local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
             -- accumulate encoder/decoder grads
-            encoder_grads:add(dl_dattn[2])
+            if opt.hierarchical == 1 then
+              if opt.coarse_attn_only == 1 then
+                encoder_bow_grads:add(dl_dattn[2])
+              else
+                encoder_grads:add(dl_dattn[2])
+                encoder_bow_grads:add(dl_dattn[3])
+              end
+            else
+              encoder_grads:add(dl_dattn[2])
+            end
             if opt.brnn == 1 then
               encoder_bwd_grads:add(dl_dattn[2])
-            end
-            if opt.hierarchical == 1 then
-              encoder_bow_grads:add(dl_dattn[3])
             end
 
             drnn_state_dec[#drnn_state_dec]:zero()
@@ -1209,6 +1239,10 @@ function train(train_data, valid_data)
 
             if opt.no_bow == 0 then
               word_vecs_bow.gradWeight[1]:zero()
+              if opt.fix_bow_vecs == 1 then
+                 -- no update
+                 word_vecs_bow.gradWeight:zero()
+              end
             end
           end
 
@@ -1263,7 +1297,7 @@ function train(train_data, valid_data)
         end
         grad_norm = grad_norm^0.5	 
 
-        if opt.hierarchical == 1 and opt.no_bow == 0 then
+        if opt.hierarchical == 1 and opt.no_bow == 0 and opt.separate_vecs == 0 then
           word_vec_layers[1].gradWeight:add(word_vecs_bow.gradWeight)
         end
         if opt.brnn == 1 then
@@ -1311,16 +1345,17 @@ function train(train_data, valid_data)
             end
           end
 
-          if opt.adagrad == 1 then
+          if opt.learning_method == 'adagrad' then
             adagradStep(params[j], grad_params[j], layer_etas[j], optStates[j])
-          else
-            --params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+          elseif opt.learning_method == 'adam' then
+            adamStep(params[j], grad_params[j], layer_etas[j], optStates[j])
+          elseif opt.learning_method == 'sgd' then
             params[j]:add(grad_params[j]:mul(-layer_etas[j]))
           end	    
           param_norm = param_norm + params[j]:norm()^2
         end	 
         param_norm = param_norm^0.5
-        if opt.hierarchical == 1 and opt.no_bow == 0 then
+        if opt.hierarchical == 1 and opt.no_bow == 0 and opt.separate_vecs == 0 then
           word_vecs_bow.weight:copy(word_vec_layers[1].weight)
         end
         if opt.brnn == 1 then
@@ -1393,7 +1428,8 @@ function train(train_data, valid_data)
 
       local score = eval(valid_data)
       opt.val_perf[#opt.val_perf + 1] = score
-      if opt.adagrad == 0 then --unncessary with adagrad
+      logging:info(opt.val_perf)
+      if opt.learning_method == 'sgd' then --unncessary with adagrad
         decay_lr(epoch)
       end      
       -- clean and save models
@@ -1478,25 +1514,26 @@ function train(train_data, valid_data)
         end
       end
 
-      local sent_context
-      if opt.add_sent_context_init == 1 then
-        sent_context = add_sent_context_init:forward(context_bow:contiguous())
-        if source_l >= 2 then
-          sent_context[{{}, {2,source_l}}]:copy(sent_context[{{}, {1,source_l-1}}])
-        end
-        sent_context[{{}, {1}}]:zero()
-        sent_context = sent_context:view(batch_l*source_l, opt.num_layers*opt.rnn_size*2)
+      -- TODO fix this... context_bow hasn't been initialized yet
+      --local sent_context
+      --if opt.add_sent_context_init == 1 then
+        --sent_context = add_sent_context_init:forward(context_bow:contiguous())
+        --if source_l >= 2 then
+          --sent_context[{{}, {2,source_l}}]:copy(sent_context[{{}, {1,source_l-1}}])
+        --end
+        --sent_context[{{}, {1}}]:zero()
+        --sent_context = sent_context:view(batch_l*source_l, opt.num_layers*opt.rnn_size*2)
 
-        for l = 1, opt.num_layers do
-          rnn_state_enc[l*2-1]:copy(sent_context[{{},{(l*2-2)*opt.rnn_size+1, (l*2-1)*opt.rnn_size}}])
-          rnn_state_enc[l*2]:copy(sent_context[{{},{(l*2-1)*opt.rnn_size+1, (l*2)*opt.rnn_size}}])
-        end
-      elseif opt.add_sent_context == 1 then
-        sent_context = torch.zeros(batch_l, source_l, opt.bow_size):cuda()
-        if source_l >= 2 then
-          sent_context[{{}, {2,source_l}}]:copy(context_bow[{{}, {1,source_l-1}}])
-        end
-      end
+        --for l = 1, opt.num_layers do
+          --rnn_state_enc[l*2-1]:copy(sent_context[{{},{(l*2-2)*opt.rnn_size+1, (l*2-1)*opt.rnn_size}}])
+          --rnn_state_enc[l*2]:copy(sent_context[{{},{(l*2-1)*opt.rnn_size+1, (l*2)*opt.rnn_size}}])
+        --end
+      --elseif opt.add_sent_context == 1 then
+        --sent_context = torch.zeros(batch_l, source_l, opt.bow_size):cuda()
+        --if source_l >= 2 then
+          --sent_context[{{}, {2,source_l}}]:copy(context_bow[{{}, {1,source_l-1}}])
+        --end
+      --end
 
       -- forward prop encoder
       if opt.all_lstm == 1 then
@@ -1603,7 +1640,11 @@ function train(train_data, valid_data)
         local out = decoder_clones[1]:forward(decoder_input)
         local decoder_attn_input
         if opt.hierarchical == 1 then
-          decoder_attn_input = {out[#out], context, context_bow}
+          if opt.coarse_attn_only == 1 then
+            decoder_attn_input = {out[#out], context_bow}
+          else
+            decoder_attn_input = {out[#out], context, context_bow}
+          end
           if opt.inf_mask == 1 then
             table.insert(decoder_attn_input, inf_mask)
           end
@@ -1733,6 +1774,9 @@ function main()
          opt.bow_size = opt.num_kernels
        else
          opt.bow_size = opt.word_vec_size
+         if opt.linear_bow == 1 then
+           opt.bow_size = opt.linear_bow_size
+         end
        end
      end
      if opt.pos_embeds_sent == 1 then
@@ -1825,7 +1869,9 @@ function main()
 
       -- check for word2vec
       if opt.train_from == '' then
-        assert(opt.pre_word_vecs_enc ~= '', 'not using word2vec!')
+        if opt.synth_data == 0 then
+          assert(opt.pre_word_vecs_enc ~= '', 'not using word2vec!')
+        end
         opt.pre_word_vecs_dec = opt.pre_word_vecs_enc
       end
    else
@@ -1844,7 +1890,17 @@ function main()
       encoder = model[1]:double()
       decoder = model[2]:double()      
       generator = model[3]:double()
-      decoder_attn = model[4]:double()
+      if model_opt.coarse_attn_only == 1 and opt.coarse_attn_only == 0 then
+        -- copy weights
+        decoder_attn = make_hierarchical_decoder_attn(valid_data, opt)
+        local decoder_attn_params = model[4]:double():parameters()
+        local targ_params = decoder_attn:parameters()
+
+        -- copy only 1 for coarse attn bilinear
+        targ_params[1]:copy(decoder_attn_params[1])
+      else
+        decoder_attn = model[4]:double()
+      end
       if model_opt.brnn == 1 then
         encoder_bwd = model[save_idx['encoder_bwd']]:double()
       end      
@@ -1956,18 +2012,22 @@ function main()
       idx = idx + 1
    end
 
+   assert(opt.learning_method == 'sgd' or opt.learning_method == 'adagrad' or opt.learning_method == 'adam', 'unsupported learning method!')
    layer_etas = {} -- different learning rates
-   for i = 1, #layers do
-     layer_etas[i] = opt.learning_rate
+   if opt.learning_method == 'sgd' then
+      for i = 1, #layers do
+         layer_etas[i] = opt.learning_rate
+      end
+      -- lower for bow_encoder
+      layer_etas[layers_idx['bow_encoder']] = opt.sent_learning_rate
+   else
+      -- adagrad and the rest
+      optStates = {}
+      for i = 1, #layers do
+         layer_etas[i] = opt.learning_rate
+         optStates[i] = {}
+      end     
    end
-   --if opt.adagrad == 1 then
-      --layer_etas = {}
-      --optStates = {}
-      --for i = 1, #layers do
-	 --layer_etas[i] = opt.learning_rate
-	 --optStates[i] = {}
-      --end     
-   --end
 
    if opt.gpuid >= 0 then
       for i = 1, #layers do	 
