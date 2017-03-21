@@ -25,19 +25,20 @@ cmd:option('-sentence_a', 1e-4, [[ See Arora et al (2017) ]])
 cmd:option('-synth_data', 0, [[ Using synthetic dataset ]])
 
 -- useful
-cmd:option('-separate_vecs', 0, [[Separate sentence and enc vecs]])
+cmd:option('-sent_ent', 0.0, [[Sentence entropy regularizer for soft]])
+cmd:option('-sparsemax', 0, [[Use sparsemax for sentence attn]])
 cmd:option('-sent_learning_rate', 0, [[Learning rate for bow encoder.]])
-cmd:option('-bow_dropout', 0.0, [[Use dropout after bow]])
 cmd:option('-fix_bow_vecs', 0, [[No gradients for bow encoder vecs]])
-cmd:option('-linear_bow', 0, [[Add linear layer above bow encoder]])
-cmd:option('-linear_bow_size', 100, [[linear layer above bow encoder size]])
 cmd:option('-all_lstm', 0, [[Run LSTM encoder without factoring]])
 cmd:option('-use_sigmoid_sent', 0, [[Use sigmoid instead of softmax for sent attn (SOFT ONLY!)]])
 cmd:option('-use_sigmoid_word', 0, [[Use sigmoid instead of softmax for word attn (SOFT ONLY!)]])
 cmd:option('-hop_attn', 1, [[Do this many hops for attention]])
 
 -- not useful
-cmd:option('-sent_ent', 0.0, [[Sentence entropy regularizer for soft]])
+cmd:option('-linear_bow', 0, [[Add linear layer above bow encoder]])
+cmd:option('-linear_bow_size', 100, [[linear layer above bow encoder size]])
+cmd:option('-bow_dropout', 0.0, [[Use dropout after bow]])
+cmd:option('-separate_vecs', 0, [[Separate sentence and enc vecs]])
 cmd:option('-train_temp', 0, [[Trained temperature for sent attn]])
 cmd:option('-coarse_attn_only', 0, [[Only use coarse features for context]])
 cmd:option('-bahdanau_attn', 0, [[Use Bahdanau attention (concat + MLP)]])
@@ -58,7 +59,6 @@ cmd:option('-bow_encoder_lstm', 0, [[LSTM over sentence BOW (should use with no_
 cmd:option('-mask_padding', 1, [[Mask LSTM states for padding words]])
 cmd:option('-hierarchical', 1, [[Do hierarchical attention]])
 cmd:option('-attn_type', 'soft', [[`soft`, `hard` for first attention on decoder side]])
-cmd:option('-attn_word_type', 'soft', [[`soft`, `hard` for hierarchical second attention]])
 
 -- model size
 cmd:option('-num_layers', 2, [[Number of layers in the LSTM encoder/decoder]])
@@ -90,16 +90,16 @@ cmd:option('-soft_curriculum', 0, [[Anneal semi_sampling_p as 1/sqrt(epoch) if s
 -- hard attention specs (attn_type == 'hard')
 cmd:option('-multisampling', 0, [[If > 0, in ReinforceCategorical do k samples instead of 1]])
 cmd:option('-sampling_curric', 0, [[Set 1 to anneal 5,4,3,2,1 samples]])
-cmd:option('-with_replace', 1, [[With replacement for multisampling]])
-cmd:option('-uniform_attn', 0, [[Uniform attention instead of scaling]])
 cmd:option('-start_soft', 0, [[If training from a soft model, but we want to train hard. Here we copy the parameters]])
-cmd:option('-reward_scale', 0.04, [[Scale reward by this factor]])
-cmd:option('-entropy_scale', 0.002, [[Scale entropy term]])
+cmd:option('-reward_scale', 0.3, [[Scale reward by this factor]])
+cmd:option('-entropy_scale', 0.0, [[Scale entropy term]])
 cmd:option('-semi_sampling_p', 0, [[Probability of passing params through over sampling,
                                     set 0 to always sample]])
+cmd:option('-subtract_first', 1, [[Subtract baseline before adding discounted rewards, i.e. sum of gamma^t*(r_t - b_t)]])
 
-cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned`, `average`, `exact`, `both`]])
+cmd:option('-baseline_method', 'average', [[What baseline update to use. Options are `learned`, `average`]])
 cmd:option('-baseline_lr', 0.1, [[Learning rate for averaged baseline, b_{k+1} = (1-lr)*b_k + lr*r]])
+cmd:option('-baseline_learning_rate', 0.001, [[Learning rate for learned baseline]])
 cmd:option('-global_baseline', 0, [[Baseline global instead of time dependent. Time dependent baseline is better]])
 cmd:option('-global_variance', 1, [[Variance global instead of time dependent. Global variance is better]])
 
@@ -438,11 +438,10 @@ function train(train_data, valid_data)
     end
   end
 
-   if opt.attn_type == 'hard' then
-     -- get stochastic layers
-     if opt.baseline_method == 'average' or opt.baseline_method == 'both' then
-       -- baseline should be time dependent on target
+   if opt.attn_type == 'hard' and opt.baseline_method == 'average' then
+       -- reset baselines
        if opt.global_baseline == 0 and type(opt.baseline) == 'number' then
+         -- baseline should be time dependent on target
          opt.baseline = torch.zeros(opt.max_sent_l_targ)
        end
 
@@ -451,7 +450,6 @@ function train(train_data, valid_data)
            opt.reward_variance = torch.zeros(opt.max_sent_l_targ)
          end
        end
-     end
    end
 
    local h_init = torch.zeros(opt.max_batch_l, opt.rnn_size)
@@ -600,44 +598,6 @@ function train(train_data, valid_data)
            end
          end
        end
-     elseif opt.baseline_method == 'exact' then
-       -- update first
-       opt.exact_stats['n'] = opt.exact_stats['n'] + unnorm_reward:size(1)
-       opt.exact_stats['x'] = opt.exact_stats['x'] + unnorm_reward:sum()
-       opt.exact_stats['x^2'] = opt.exact_stats['x^2'] + torch.pow(unnorm_reward, 2):sum()
-
-       -- exact mean and variance
-       b = opt.exact_stats['x'] / opt.exact_stats['n']
-       if opt.moving_variance == 1 then
-         scale = opt.exact_stats['x^2'] / opt.exact_stats['n'] - b*b
-         scale = 1/math.sqrt(scale + 1e-8)
-       end
-     elseif opt.baseline_method == 'both' then
-       -- we update the moving averages first
-       assert(h_state, 'need to pass in hidden state for learned baseline')
-       b_learned = baseline_m:forward(h_state):squeeze(2)
-       local reward_minus_learned = unnorm_reward:clone():add(-1, b_learned) -- use normalized version for update
-       if opt.global_baseline == 1 then
-         opt.baseline = (1-baseline_lr)*opt.baseline + baseline_lr*reward_minus_learned:mean()
-         b_const = opt.baseline
-       else
-         opt.baseline[t] = (1-baseline_lr)*opt.baseline[t] + baseline_lr*reward_minus_learned:mean()
-         b_const = opt.baseline[t]
-       end
-       b = b_const + b_learned -- add the learned and moving covariates
-
-       if opt.moving_variance == 1 then
-         local var_update = reward_minus_learned:var()
-         if var_update == var_update then -- prevent nan
-           if opt.global_variance == 1 then
-             opt.reward_variance = (1-baseline_lr)*opt.reward_variance + baseline_lr*var_update
-             scale = 1/math.sqrt(opt.reward_variance + 1e-8)
-           else
-             opt.reward_variance[t] = (1-baseline_lr)*opt.reward_variance[t] + baseline_lr*var_update
-             scale = 1/math.sqrt(opt.reward_variance[t] + 1e-8)
-           end
-         end
-       end
      end
 
      -- get the variance reduced reward
@@ -660,9 +620,6 @@ function train(train_data, valid_data)
       if opt.attn_type == 'hard' then
          if opt.sampling_curric == 1 then
            sampler_layers = {}
-           --if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
-             --sampler_word_layers = {}
-           --end
            for i = 1, opt.max_sent_l_targ do
              decoder_attn_clones[i]:apply(get_RL_layer)
            end
@@ -983,18 +940,37 @@ function train(train_data, valid_data)
               local reward_input = {pred, mask}
               reward_criterion:forward(reward_input, target_out[t])
               local unnorm_reward = reward_criterion.reward
-              local cur_reward, b, b_learned = compute_VR_reward(unnorm_reward, mask, t, preds[t])
-              if opt.input_feed == 1 then
-                if t == target_l then
-                  -- cumulative reward
-                  sum_reward = cur_reward
-                else
-                  sum_reward:mul(discount)
-                  sum_reward:add(cur_reward)
-                end
-                cur_reward = sum_reward:clone()
+
+              local targ_reward = unnorm_reward -- default
+              local norm_reward, b, b_learned
+              if opt.subtract_first == 1 then
+                  -- get (r-b) before taking discounted sum
+                  norm_reward, b, b_learned = compute_VR_reward(targ_reward, mask, t, preds[t])
+                  if opt.input_feed == 1 then
+                    if t == target_l then
+                      -- cumulative reward
+                      sum_reward = norm_reward
+                    else
+                      sum_reward:mul(discount)
+                      sum_reward:add(norm_reward)
+                    end
+                    norm_reward = sum_reward:clone()
+                  end
+              else
+                  -- get discounted sum then take (R-b)
+                  if opt.input_feed == 1 then
+                    if t == target_l then
+                      -- cumulative reward
+                      sum_reward = unnorm_reward
+                    else
+                      sum_reward:mul(discount)
+                      sum_reward:add(unnorm_reward)
+                    end
+                    targ_reward = sum_reward:clone()
+                  end
+                  norm_reward, b, b_learned = compute_VR_reward(targ_reward, mask, t, preds[t])
               end
-              cur_reward:mul(opt.reward_scale) -- helps performance, kind of like learning rate
+              norm_reward:mul(opt.reward_scale) -- helps performance, kind of like learning rate
 
               -- broadcast
               local cur_samplers = {}
@@ -1002,14 +978,9 @@ function train(train_data, valid_data)
                 if layer.name ~= nil then
                     if layer.name == 'sampler' then
                       table.insert(cur_samplers, layer)
-                    elseif layer.name == 'sampler_word' then
-                      table.insert(cur_samplers, layer)
                     end
                 end
               end
-              --if opt.hierarchical == 1 and opt.attn_word_type == 'hard' then
-                --table.insert(stochastic_layers, sampler_word_layers[t])
-              --end
               if opt.attn_type == 'hard' then
                 decoder_attn_clones[t]:apply(get_single_layer)
                 for _,layer in ipairs(cur_samplers) do
@@ -1022,18 +993,14 @@ function train(train_data, valid_data)
                       layer.multisampling = layer.multisampling - 1
                     end
                   end
-                  layer:reinforce(cur_reward)
+                  layer:reinforce(norm_reward)
                 end
               end
 
               -- update learned baselines
               if opt.baseline_method == 'learned' then
-                local dl_db = reward_criterion:update_baseline(b, mask, unnorm_reward)
+                local dl_db = reward_criterion:update_baseline(b_learned, mask, targ_reward)
                 -- no need to divide by batch_l since MSECriterion does it
-                baseline_m:backward(preds[t], dl_db:view(dl_db:size(1), 1))
-              elseif opt.baseline_method == 'both' then
-                local target = unnorm_reward:add(-b_const) -- use normalized version for update
-                local dl_db = reward_criterion:update_baseline(b_learned, mask, target)
                 baseline_m:backward(preds[t], dl_db:view(dl_db:size(1), 1))
               end
             end
@@ -1332,7 +1299,7 @@ function train(train_data, valid_data)
         local param_norm = 0
         local shrinkage = opt.max_grad_norm / grad_norm
         for j = 1, #grad_params do
-          if j == layers_idx['baseline_m'] and opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
+          if opt.attn_type == 'hard' and opt.baseline_method == 'learned' and j == layers_idx['baseline_m'] then
             -- special case
             local n = grad_params[j]:norm()
             local s = opt.max_grad_norm / n
@@ -1387,6 +1354,14 @@ function train(train_data, valid_data)
           num_words_source / time_taken,
           num_words_target / time_taken)			   
           logging:info(stats)
+
+            --logging:info('baseline:')
+            --logging:info(opt.baseline)
+            --if opt.moving_variance == 1 then
+              --logging:info('variance:')
+              --logging:info(opt.reward_variance)
+            --end
+
         end
         if i % 200 == 0 then
           collectgarbage()
@@ -1416,14 +1391,7 @@ function train(train_data, valid_data)
       local train_score = math.exp(total_loss/total_nonzeros)
       logging:info('Train ' .. train_score)
       logging:info(opt.train_perf)
-      if opt.attn_type == 'hard' and opt.debug == 1 then
-        logging:info('baseline:')
-        logging:info(opt.baseline)
-        if opt.moving_variance == 1 then
-          logging:info('variance:')
-          logging:info(opt.reward_variance)
-        end
-      end
+
       opt.train_perf[#opt.train_perf + 1] = train_score
 
       local score = eval(valid_data)
@@ -1697,10 +1665,10 @@ function get_RL_layer(layer)
         table.insert(decoder_attn_layers, layer)
       elseif layer.name == 'sampler' then
         table.insert(sampler_layers, layer)
-      elseif layer.name == 'sampler_word' then
-        table.insert(sampler_word_layers, layer)
-      elseif layer.name == 'mul_constant' then
-        table.insert(mul_constant_layers, layer)
+      --elseif layer.name == 'sampler_word' then
+        --table.insert(sampler_word_layers, layer)
+      --elseif layer.name == 'mul_constant' then
+        --table.insert(mul_constant_layers, layer)
       end
    end
 end
@@ -1847,20 +1815,13 @@ function main()
       end
 
       if opt.attn_type == 'hard' then
-        if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
+        if opt.baseline_method == 'learned' then
           logging:info('using learned baseline method')
           baseline_m, reward_criterion = make_reinforce(valid_data, opt)
         else
           _, reward_criterion = make_reinforce(valid_data, opt)
         end
         opt.baseline = 0 -- RL average
-        if opt.baseline_method == 'exact' then
-          -- TODO: allow this to be time dependent
-          opt.exact_stats = {} -- RL exact stats: \sum x, \sum x^2, n
-          opt.exact_stats['n'] = 0
-          opt.exact_stats['x'] = 0
-          opt.exact_stats['x^2'] = 0
-        end
 
         if opt.moving_variance == 1 then
           opt.reward_variance = 0 -- RL stddev
@@ -1914,14 +1875,12 @@ function main()
       end
 
       if model_opt.attn_type == 'hard' then
-        if model_opt.baseline_method == 'learned' or model_opt.baseline_method == 'both' then
+        if model_opt.baseline_method == 'learned' then
           baseline_m = model[save_idx['baseline_m']]:double()
         end
-        if model_opt.baseline_method == 'average' or model_opt.baseline_method == 'both' then
+        if model_opt.baseline_method == 'average' then
+          opt.baseline_method = 'average'
           opt.baseline = model_opt.baseline
-        end
-        if model_opt.baseline_method == 'exact' then
-          opt.exact_stats = model_opt.exact_stats
         end
         if model_opt.moving_variance == 1 then
           opt.moving_variance = 1 
@@ -1941,14 +1900,13 @@ function main()
    logging:info('attention on sentences:', opt.attn_type)
    if opt.hierarchical == 1 then
      logging:info('doing hierarchical model')
-     logging:info(string.format('using %s attn for words', opt.attn_word_type))
    else
      logging:info('doing full attention over doc')
    end
    if opt.mask_padding == 1 then
      logging:info('masking padding for encoder hidden states')
    end
-   if opt.baseline_method == 'learned' or opt.baseline_method == 'both' then
+   if opt.baseline_method == 'learned' then
      logging:info('using learned baseline method')
    end
    if opt.no_bow == 1 then
@@ -1965,8 +1923,6 @@ function main()
    if opt.multisampling > 0 then
      --assert(opt.hop_attn > 1 or opt.multisampling > 1, 'please do more than one sample')
      logging:info(string.format('sampling attn %d instead of once', opt.multisampling))
-     logging:info('with replace = ' .. opt.with_replace)
-     logging:info('uniform attn = ' .. opt.uniform_attn)
    else
      logging:info('NOT multisampling')
    end
@@ -2001,7 +1957,7 @@ function main()
        idx = idx + 1
      end
    end
-   if opt.attn_type == 'hard' and (opt.baseline_method == 'learned' or opt.baseline_method == 'both') then
+   if opt.attn_type == 'hard' and opt.baseline_method == 'learned' then
      table.insert(layers, baseline_m)
      layers_idx['baseline_m'] = idx
      idx = idx + 1
@@ -2020,6 +1976,9 @@ function main()
       end
       -- lower for bow_encoder
       layer_etas[layers_idx['bow_encoder']] = opt.sent_learning_rate
+      if opt.baseline_method == 'learned' then
+          layer_etas[layers_idx['bow_encoder']] = opt.baseline_learning_rate
+      end
    else
       -- adagrad and the rest
       optStates = {}
@@ -2056,6 +2015,7 @@ function main()
       --end      
       encoder_bwd:apply(get_layer)
    end   
+
    train(train_data, valid_data)
 end
 

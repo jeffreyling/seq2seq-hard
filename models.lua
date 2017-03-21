@@ -1,5 +1,6 @@
 require 'hard_attn'
 require 'memory'
+require 'SparseMax'
 
 function make_lstm(data, opt, model, use_chars)
    assert(model == 'enc' or model == 'dec' or model == 'bow_enc')
@@ -393,6 +394,9 @@ function make_hier_hop(data, opt, simple, hop)
    if opt.use_sigmoid_sent == 1 then
      softmax_attn = nn.Sigmoid()
    end
+   if opt.sparsemax == 1 then
+     softmax_attn = nn.SparseMax()
+   end
    softmax_attn.name = 'softmax_attn1_' .. hop
    attn1 = softmax_attn(attn1) -- batch_l x source_l
    if opt.attn_type == 'hard' then
@@ -438,13 +442,6 @@ function make_hier_hop(data, opt, simple, hop)
    end
    softmax_attn2.name = 'softmax_attn2_' .. hop
    attn2 = nn.Bottle(softmax_attn2)(attn2)
-   if opt.attn_word_type == 'hard' then
-     -- word level sampling
-     local sampler_word = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
-                                                  opt.with_replace, opt.uniform_attn)
-     sampler_word.name = 'sampler_word'
-     attn2 = sampler_word(attn2) -- one hot
-   end
    --attn2 = nn.ViewAs(3)({attn2, context}) -- batch_l x source_l x source_char_l
 
    -- multiply attentions together

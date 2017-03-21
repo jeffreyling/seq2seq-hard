@@ -88,13 +88,11 @@ end
 ------------------------------------------------------------------------
 local ReinforceCategorical, parent = torch.class("nn.ReinforceCategorical", "nn.Reinforce")
 
-function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, multisampling, with_replace, uniform_attn)
+function ReinforceCategorical:__init(semi_sampling_p, entropy_scale, multisampling)
   parent.__init(self)
   self.semi_sampling_p = semi_sampling_p or 0
   self.entropy_scale = entropy_scale or 0
   self.multisampling = multisampling or 0
-  self.with_replace = with_replace or 1
-  self.uniform_attn = uniform_attn or 1
   self.through = false -- pass prob weights through
 
   self.time_step = 0
@@ -112,13 +110,9 @@ function ReinforceCategorical:_doArgmax(input)
      end
      self._vals, self._index = input:topk(k, 2, true) -- true for max
 
-     if self.uniform_attn == 1 then
-       self.output:scatter(2, self._index, 1/k)
-     else
-       self.output:scatter(2, self._index, self._vals)
-       -- normalize
-       self.output:cdiv(self.output:sum(2):expandAs(self.output))
-     end
+     self.output:scatter(2, self._index, self._vals)
+     -- normalize
+     self.output:cdiv(self.output:sum(2):expandAs(self.output))
    else
      _, self._index = input:max(2)
      self.output:scatter(2, self._index, 1)
@@ -142,12 +136,7 @@ function ReinforceCategorical:_doSample(input)
 
       if self.multisampling > 0 then
         -- sample k times
-        if self.with_replace == 1 then
-          input.multinomial(self._index, input, self.multisampling, true)
-        else
-          assert(false, 'fix policy gradient first')
-          input.multinomial(self._index, input, self.multisampling, false)
-        end
+        input.multinomial(self._index, input, self.multisampling, true)
 
         self.output:zero()
         -- TODO: undesirable loop...
@@ -207,6 +196,7 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
    else 
      self.gradInput:copy(self.output)
      if self.multisampling > 0 then
+       assert(false, 'TODO check')
        self.gradInput:mul(self.multisampling) -- undo dividing by k
      end
      self._input = self._input or input.new()
@@ -293,6 +283,12 @@ function ReinforceNLLCriterion:update_baseline(b, mask, target)
   -- baseline grad
   local gradInput = self.criterion:backward(b, target)
   gradInput:maskedFill(mask, 0)
+  --logging:info('b', true)
+  --logging:info(b, true)
+  --logging:info('target', true)
+  --logging:info(target, true)
+  --logging:info('gradInput', true)
+  --logging:info(gradInput, true)
 
   return gradInput
 end
