@@ -17,17 +17,13 @@ cmd:option('-log_path', '', [[Logging path]])
 cmd:option('-try_worst', 0, [[For debugging memory constraints]])
 cmd:option('-debug', 0, [[Debug]])
 
--- sentence embeddings
--- TODO
-cmd:option('-sentence_a', 1e-4, [[ See Arora et al (2017) ]])
-
 -- synthetic dataset
-cmd:option('-synth_data', 0, [[ Using synthetic dataset ]])
+cmd:option('-synth_data', 0, [[ Using synthetic dataset ]]) -- TODO :(
 
 -- useful
 cmd:option('-sent_ent', 0.0, [[Sentence entropy regularizer for soft]])
 cmd:option('-sparsemax', 0, [[Use sparsemax for sentence attn]])
-cmd:option('-sent_learning_rate', 0, [[Learning rate for bow encoder.]])
+cmd:option('-sent_learning_rate', 0.1, [[Learning rate for bow encoder.]])
 cmd:option('-fix_bow_vecs', 0, [[No gradients for bow encoder vecs]])
 cmd:option('-all_lstm', 0, [[Run LSTM encoder without factoring]])
 cmd:option('-use_sigmoid_sent', 0, [[Use sigmoid instead of softmax for sent attn (SOFT ONLY!)]])
