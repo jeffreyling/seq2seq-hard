@@ -965,7 +965,7 @@ function main()
    
    MAX_WORD_L = model_opt.max_word_l
    context_proto = torch.zeros(1, MAX_SENT_L, MAX_WORD_L, model_opt.rnn_size)
-   context_bow_proto = torch.zeros(1, MAX_SENT_L, opt.bow_size)
+   context_bow_proto = torch.zeros(1, MAX_SENT_L, model_opt.bow_size)
    if model_opt.pos_embeds == 1 or model_opt.pos_embeds_sent == 1 then
      pos_proto = torch.LongTensor(1, MAX_SENT_L):zero():cuda()
      for t = 1, MAX_SENT_L do
