@@ -325,20 +325,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    end   
    context = context:expand(K, source_sent_l, source_char_l, model_opt.rnn_size)
    if model_opt.hierarchical == 1 then
-     local bow_size
-     if model_opt.bow_encoder_lstm == 1 then
-       bow_size = model_opt.rnn_size
-     else
-       if model_opt.conv_bow == 1 then
-         bow_size = model_opt.num_kernels
-       else
-         bow_size = model_opt.word_vec_size
-       end
-     end
-     if model_opt.pos_embeds == 1 then
-       bow_size = bow_size + model_opt.pos_dim
-     end
-     context_bow = context_bow:expand(K, source_sent_l, bow_size)
+     context_bow = context_bow:expand(K, source_sent_l, model_opt.bow_size)
    end
    
    out_float = torch.FloatTensor()
