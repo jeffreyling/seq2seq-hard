@@ -264,7 +264,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    end
    if model_opt.hierarchical == 1 then
      local bow_out
-     if model_opt.pos_embeds == 1 then -- TODO: change to pos_embeds_sent
+     if model_opt.pos_embeds_sent == 1 then
        local pos = pos_proto[{{}, {1, source_sent_l}}]
        bow_out = model[layers_idx['bow_encoder']]:forward({source_input:permute(2,3,1):contiguous(), pos})
      else
@@ -993,7 +993,7 @@ function main()
    end
    context_bow_proto = torch.zeros(1, MAX_SENT_L, bow_size)
    if model_opt.pos_embeds == 1 or model_opt.pos_embeds_sent == 1 then
-     pos_proto = torch.zeros(1, MAX_SENT_L):cuda()
+     pos_proto = torch.LongTensor(1, MAX_SENT_L):zero():cuda()
      for t = 1, MAX_SENT_L do
        pos_proto[{{}, {t}}]:fill(t)
      end

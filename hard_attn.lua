@@ -196,8 +196,7 @@ function ReinforceCategorical:updateGradInput(input, gradOutput)
    else 
      self.gradInput:copy(self.output)
      if self.multisampling > 0 then
-       assert(false, 'TODO check')
-       self.gradInput:mul(self.multisampling) -- undo dividing by k
+       self.gradInput:div(self.multisampling) -- 1/k samplings
      end
      self._input = self._input or input.new()
      -- prevent division by zero error

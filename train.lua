@@ -21,6 +21,9 @@ cmd:option('-debug', 0, [[Debug]])
 cmd:option('-synth_data', 0, [[ Using synthetic dataset ]]) -- TODO :(
 
 -- useful
+cmd:option('-pos_embeds_sent', 0, [[Use positional embeddings for each sentence]])
+cmd:option('-pos_dim', 25, [[Embedding size for bow context pos]])
+
 cmd:option('-sent_ent', 0.0, [[Sentence entropy regularizer for soft]])
 cmd:option('-sparsemax', 0, [[Use sparsemax for sentence attn]])
 cmd:option('-sent_learning_rate', 0.1, [[Learning rate for bow encoder.]])
@@ -43,8 +46,6 @@ cmd:option('-inf_mask', 0, [[Mask out attention for padding]])
 cmd:option('-add_sent_context', 0, [[Add previous sentence context to each row]])
 cmd:option('-add_sent_context_init', 0, [[Init encoder with previous sent context]])
 cmd:option('-pos_embeds', 0, [[Use positional embeddings as encoder initialization]])
-cmd:option('-pos_embeds_sent', 0, [[Use positional embeddings for each sentence]])
-cmd:option('-pos_dim', 25, [[Embedding size for bow context pos]])
 --cmd:option('-different_sampling', 1, [[Make this many distributions for sampling, then sum]])
 --cmd:option('-diff_method', 'oneplus', [[softplus or oneplus]])
 
@@ -333,7 +334,7 @@ function train(train_data, valid_data)
    local encoder_bow_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.bow_size)
    context_bow_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.bow_size)
    if opt.pos_embeds == 1 or opt.pos_embeds_sent == 1 then
-     pos_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l):cuda()
+     pos_proto = torch.LongTensor(opt.max_batch_l, opt.max_sent_l):zero():cuda()
      for t = 1, opt.max_sent_l do
        pos_proto[{{}, {t}}]:fill(t)
      end
@@ -941,7 +942,7 @@ function train(train_data, valid_data)
               local norm_reward, b, b_learned
               if opt.subtract_first == 1 then
                   -- get (r-b) before taking discounted sum
-                  norm_reward, b, b_learned = compute_VR_reward(targ_reward, mask, t, preds[t])
+                  norm_reward, b, b_learned = compute_VR_reward(targ_reward, mask, t, decoder_out[t])
                   if opt.input_feed == 1 then
                     if t == target_l then
                       -- cumulative reward
@@ -1178,7 +1179,7 @@ function train(train_data, valid_data)
                 local ctx_grads = masked_selecter:backward({context, rnn_state_mask}, cur_grads)[1]
                 encoder_grads:add(ctx_grads)
               else
-                bow_encoder:backward(source:permute(2,3,1):contiguous(), cur_grads:contiguous())
+                bow_encoder:backward(source:permute(2,3,1):contiguous(), encoder_bow_lstm_grads:contiguous())
               end
             else
               if opt.no_bow == 1 then
