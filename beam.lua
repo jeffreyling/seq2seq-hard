@@ -20,7 +20,7 @@ cmd:option('-log_path', '', [[Logging path]])
 -- check attn options
 cmd:option('-num_argmax', 0, [[Change multisampling to do different number of argmax]])
 cmd:option('-view_attn', 0, [[View attention weights at each time step]])
-cmd:option('-print_attn', 0, [[Print attention weights]])
+cmd:option('-print_attn', 1, [[Print attention weights]])
 cmd:option('-print_sent_attn', 1, [[Print sentence attention instead of all attn]])
 
 cmd:option('-no_pad', 1, [[No pad format for data]])
@@ -42,8 +42,8 @@ cmd:option('-char_dict', 'data/demo.char.dict', [[If using chars, path to charac
 
 -- beam search options
 cmd:option('-beam', 5,[[Beam size]])
-cmd:option('-max_sent_l', 250, [[Maximum sentence length. If any sequences in srcfile are longer
-                               than this then it will error out]])
+cmd:option('-max_sent_l', 20, [[Maximum sentence length. If any sequences in srcfile are longer
+                               than this then it will error out. This is really max num sents in doc!]])
 cmd:option('-simple', 0, [[If = 1, output prediction is simply the first time the top of the beam
                          ends with an end-of-sentence token. If = 0, the model considers all 
                          hypotheses that have been generated so far that ends with end-of-sentence 
@@ -171,7 +171,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
    local nonzeros = get_nonzeros(source)
    source = source:t():contiguous() -- get words to dim 1 for LSTM
    --local source_l = math.min(source:size(1), opt.max_sent_l)
-   local source_char_l = math.min(source:size(1), opt.max_sent_l)
+   local source_char_l = source:size(1)
    local source_sent_l = source:size(2)
    local attn_argmax = {}   -- store attn weights
    attn_argmax[1] = {}
@@ -434,6 +434,7 @@ function generate_beam(model, initial, K, max_sent_l, source, gold)
                     max_attn, max_index = result:max(1)
                     attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])         
                  else
+                     -- sum the rows
                     local pre_attn = decoder_softmax.output:reshape(K, source_sent_l, source_char_l)[prev_k]:clone()
                     local row_attn = pre_attn:sum(2):squeeze(2)
                     local result
@@ -842,8 +843,8 @@ function main()
      logging:info('using hdf5 file ' .. opt.src_hdf5)
    else
      assert(path.exists(opt.src_file), 'src_file does not exist')
-     assert(path.exists(opt.model), 'model does not exist')
    end
+   assert(path.exists(opt.model), 'model does not exist')
    
    if opt.gpuid >= 0 then
       require 'cutorch'
@@ -900,7 +901,7 @@ function main()
 
    -- load gold labels if it exists
    if path.exists(opt.targ_file) then
-      print('loading GOLD labels at ' .. opt.targ_file)
+      logging:info('loading GOLD labels at ' .. opt.targ_file)
       gold = {}
       local file = io.open(opt.targ_file, 'r')
       for line in file:lines() do
@@ -1022,6 +1023,7 @@ function main()
         line = clean_sent(line)      
         logging:info('SENT ' .. sent_id .. ': ' ..line, MUTE)
         if model_opt.use_chars_enc == 0 then
+            assert(false, 'do not use now')
            source, source_str = sent2wordidx(line, word2idx_src, model_opt.start_symbol)
         else
            source, source_str = doc2charidx(line, char2idx, model_opt.max_word_l, model_opt.start_symbol)

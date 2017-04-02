@@ -177,6 +177,10 @@ function make_bow_encoder(data, opt)
       local mlp = make_highway(opt.num_kernels, opt.num_highway_layers)
       conv_output = nn.Bottle(mlp)(conv_output)
     end	  
+    if opt.batch_norm_conv == 1 then
+      local batch_norm = nn.BatchNormalization(opt.num_kernels)
+      conv_output = nn.Bottle(batch_norm, 2)(conv_output)
+    end
     output = conv_output
   else
     -- bag of words
@@ -252,49 +256,39 @@ function make_decoder_attn(data, opt, simple)
    local dropout = opt.dropout or 0
    -- get attention
 
-   local attn = nn.MM():usePrealloc("dec_attn_mm1",
-                                {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size}, {opt.rnn_size,opt.rnn_size,1}},
-                                {{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, 1}})
-                        ({context, nn.Replicate(1,3)(target_t)}) -- batch_l x (source_l*source_char_l) x 1
+   local attn = nn.MM()({context, nn.Replicate(1,3)(target_t)}) -- batch_l x (source_l*source_char_l) x 1
+   -- :usePrealloc("dec_attn_mm1",
+                                --{{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size}, {opt.rnn_size,opt.rnn_size,1}},
+                                --{{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, 1}})
    attn = nn.Sum(3)(attn)
    local softmax_attn = nn.SoftMax()
    softmax_attn.name = 'softmax_attn'
    attn = softmax_attn(attn)
-
-   -- sample (hard attention)
-   if opt.attn_type == 'hard' then
-     local sampler = nn.ReinforceCategorical(opt.semi_sampling_p, opt.entropy_scale, opt.multisampling,
-                                            opt.with_replace, opt.uniform_attn)
-                                            :usePrealloc("sampler",
-                                            {{opt.max_sent_l_src, opt.max_sent_l_src}})
-     sampler.name = 'sampler'
-     attn = sampler(attn) -- one hot
-   end
    attn = nn.Replicate(1,2)(attn) -- batch_l x  1 x (source_l*source_char_l)
 
    -- apply attention to context
-   local context_combined = nn.MM():usePrealloc("dec_attn_mm2",
-                                                {{opt.max_batch_l, 1, opt.max_sent_l_src*opt.max_word_l},{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size}},
-                                                {{opt.max_batch_l, 1, opt.rnn_size}})
-                                    ({attn, context}) -- batch_l x 1 x rnn_size
-   context_combined = nn.Sum(2):usePrealloc("dec_attn_sum",
-                                            {{opt.max_batch_l, 1, opt.rnn_size}},
-                                            {{opt.max_batch_l, opt.rnn_size}})
-                                (context_combined) -- batch_l x rnn_size
+   local context_combined = nn.MM()({attn, context}) -- batch_l x 1 x rnn_size
+   -- :usePrealloc("dec_attn_mm2",
+                                                --{{opt.max_batch_l, 1, opt.max_sent_l_src*opt.max_word_l},{opt.max_batch_l, opt.max_sent_l_src*opt.max_word_l, opt.rnn_size}},
+                                                --{{opt.max_batch_l, 1, opt.rnn_size}})
+   context_combined = nn.Sum(2)(context_combined) -- batch_l x rnn_size
+             -- :usePrealloc("dec_attn_sum",
+                                            --{{opt.max_batch_l, 1, opt.rnn_size}},
+                                            --{{opt.max_batch_l, opt.rnn_size}})
    local context_output
    if simple == 0 then
-      context_combined = nn.JoinTable(2):usePrealloc("dec_attn_jointable",
-                                                     {{opt.max_batch_l,opt.rnn_size},{opt.max_batch_l, opt.rnn_size}})
-                                         ({context_combined, inputs[1]}) -- batch_l x rnn_size*2
-      context_output = nn.Tanh():usePrealloc("dec_noattn_tanh", {{opt.max_batch_l, opt.rnn_size}})
-                                (nn.LinearNoBias(opt.rnn_size*2,opt.rnn_size):usePrealloc("dec_noattn_linear", {{opt.max_batch_l,2*opt.rnn_size}})(context_combined))
+      context_combined = nn.JoinTable(2)({context_combined, inputs[1]}) -- batch_l x rnn_size*2
+      -- :usePrealloc("dec_attn_jointable",
+                                                     --{{opt.max_batch_l,opt.rnn_size},{opt.max_batch_l, opt.rnn_size}})
+      context_output = nn.Tanh()(nn.LinearNoBias(opt.rnn_size*2,opt.rnn_size)(context_combined))
+      -- :usePrealloc("dec_noattn_tanh", {{opt.max_batch_l, opt.rnn_size}})
    else
       context_output = nn.CAddTable()({context_combined,inputs[1]})
    end
 
    if dropout > 0 then
-      context_output = nn.Dropout(dropout, nil, false):usePrealloc("dec_attn_dropout",{{opt.rnn_size, opt.rnn_size}})
-                                                      (context_output)
+      context_output = nn.Dropout(dropout, nil, false)(context_output)
+      -- :usePrealloc("dec_attn_dropout",{{opt.rnn_size, opt.rnn_size}})
    end     
    table.insert(outputs, context_output)
    --return nn.gModule(inputs, {context_output})   
@@ -590,7 +584,11 @@ function make_cnn(input_size, kernel_width, num_kernels)
    else
       local conv = nn.TemporalConvolution(input_size, num_kernels, kernel_width)
       local conv_layer = conv(input)
-      output = nn.Max(2)(nn.Tanh()(conv_layer))
+      if opt.relu_conv == 1 then
+        output = nn.Max(2)(nn.ReLU()(conv_layer))
+      else
+        output = nn.Max(2)(nn.Tanh()(conv_layer))
+      end
    end
    return nn.gModule({input}, {output})
 end

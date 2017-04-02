@@ -8,7 +8,7 @@ require 'models.lua'
 require 'model_utils.lua'
 require 'logging'
 
---nngraph.setDebug(true)
+nngraph.setDebug(true)
 
 cmd = torch.CmdLine()
 
@@ -17,10 +17,10 @@ cmd:option('-log_path', '', [[Logging path]])
 cmd:option('-try_worst', 0, [[For debugging memory constraints]])
 cmd:option('-debug', 0, [[Debug]])
 
--- synthetic dataset
-cmd:option('-synth_data', 0, [[ Using synthetic dataset ]]) -- TODO :(
-
 -- useful
+cmd:option('-batch_norm_conv', 0, [[Use batch norm for conv]])
+cmd:option('-relu_conv', 0, [[Use Relu on conv]])
+cmd:option('-adam_conv', 0, [[Use Adam on conv only]])
 cmd:option('-pos_embeds_sent', 0, [[Use positional embeddings for each sentence]])
 cmd:option('-pos_dim', 25, [[Embedding size for bow context pos]])
 
@@ -331,20 +331,24 @@ function train(train_data, valid_data)
      end
      encoder_bow_lstm_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, grad_sz)
    end
-   local encoder_bow_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.bow_size)
-   context_bow_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.bow_size)
-   if opt.pos_embeds == 1 or opt.pos_embeds_sent == 1 then
-     pos_proto = torch.LongTensor(opt.max_batch_l, opt.max_sent_l):zero():cuda()
-     for t = 1, opt.max_sent_l do
-       pos_proto[{{}, {t}}]:fill(t)
-     end
-     if opt.pos_embeds == 1 then
-       pos_grad_proto = torch.zeros(opt.max_batch_l*opt.max_sent_l, opt.num_layers*opt.rnn_size*2):cuda()
-     end
-   end
+
+   local encoder_bow_grad_proto
    local add_sent_context_init_grad_proto
-   if opt.add_sent_context_init == 1 then
-     add_sent_context_init_grad_proto = torch.zeros(opt.max_batch_l*opt.max_sent_l, opt.num_layers*opt.rnn_size*2):cuda()
+   if opt.hierarchical == 1 then
+       encoder_bow_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.bow_size)
+       context_bow_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.bow_size)
+       if opt.pos_embeds == 1 or opt.pos_embeds_sent == 1 then
+         pos_proto = torch.LongTensor(opt.max_batch_l, opt.max_sent_l):zero():cuda()
+         for t = 1, opt.max_sent_l do
+           pos_proto[{{}, {t}}]:fill(t)
+         end
+         if opt.pos_embeds == 1 then
+           pos_grad_proto = torch.zeros(opt.max_batch_l*opt.max_sent_l, opt.num_layers*opt.rnn_size*2):cuda()
+         end
+       end
+       if opt.add_sent_context_init == 1 then
+         add_sent_context_init_grad_proto = torch.zeros(opt.max_batch_l*opt.max_sent_l, opt.num_layers*opt.rnn_size*2):cuda()
+       end
    end
 
    -- clone encoder/decoder up to max source/target length   
@@ -460,12 +464,12 @@ function train(train_data, valid_data)
       h_init = h_init:cuda()      
       h_init_enc = h_init_enc:cuda()
       context_proto = context_proto:cuda()
-      context_bow_proto = context_bow_proto:cuda()
       encoder_grad_proto = encoder_grad_proto:cuda()
       if opt.brnn == 1 then
         encoder_bwd_grad_proto = encoder_bwd_grad_proto:cuda()
       end	 
       if opt.hierarchical == 1 then
+        context_bow_proto = context_bow_proto:cuda()
         encoder_bow_grad_proto = encoder_bow_grad_proto:cuda()
         if opt.bow_encoder_lstm == 1 then
           encoder_bow_lstm_grad_proto = encoder_bow_lstm_grad_proto:cuda()
@@ -1314,7 +1318,11 @@ function train(train_data, valid_data)
           elseif opt.learning_method == 'adam' then
             adamStep(params[j], grad_params[j], layer_etas[j], optStates[j])
           elseif opt.learning_method == 'sgd' then
-            params[j]:add(grad_params[j]:mul(-layer_etas[j]))
+              if opt.adam_conv == 1 and j == layers_idx['bow_encoder'] then
+                  adamStep(params[j], grad_params[j], 0.001, optStatesconv)
+              else
+                  params[j]:add(grad_params[j]:mul(-layer_etas[j]))
+              end
           end	    
           param_norm = param_norm + params[j]:norm()^2
         end	 
@@ -1336,7 +1344,7 @@ function train(train_data, valid_data)
 
         -- Bookkeeping
         num_words_target = num_words_target + batch_l*target_l
-        num_words_source = num_words_source + batch_l*source_l
+        num_words_source = num_words_source + batch_l*source_l*max_word_l_sz
         train_nonzeros = train_nonzeros + nonzeros
         loss = loss / num_samples -- normalize
         train_loss = train_loss + loss*batch_l
@@ -1346,7 +1354,7 @@ function train(train_data, valid_data)
           epoch, i, data:size(), batch_l, layer_etas[1])
           stats = stats .. string.format('PPL: %.2f, |Param|: %.2f, |GParam|: %.2f, ',
           math.exp(train_loss/train_nonzeros), param_norm, grad_norm)
-          stats = stats .. string.format('Training: %d/%d/%d total/(source sentences)/target tokens/sec',
+          stats = stats .. string.format('Training: %d/%d/%d total/source/target tokens/sec',
           (num_words_target+num_words_source) / time_taken,
           num_words_source / time_taken,
           num_words_target / time_taken)			   
@@ -1443,10 +1451,13 @@ function train(train_data, valid_data)
         bow_source = source:permute(2,3,1):contiguous()
       end
       local context = context_proto[{{1, batch_l}, {1, source_l}, {1, source_char_l}}]
-      local context_bow = context_bow_proto[{{1, batch_l}, {1, source_l}}]
+      local context_bow
       local rnn_state_bow_enc
-      if opt.hierarchical == 1 and opt.bow_encoder_lstm == 1 then
-        rnn_state_bow_enc = reset_state(init_fwd_bow_enc, batch_l)
+      if opt.hierarchical == 1 then
+        context_bow = context_bow_proto[{{1, batch_l}, {1, source_l}}]
+        if opt.bow_encoder_lstm == 1 then
+            rnn_state_bow_enc = reset_state(init_fwd_bow_enc, batch_l)
+        end
       end
       local rnn_state_mask
       if opt.no_bow == 1 then
@@ -1912,7 +1923,7 @@ function main()
    if opt.bow_encoder_lstm == 1 then
      logging:info('using bow encoder lstm')
    end
-   if opt.conv_bow == 1 then
+   if opt.hierarchical == 1 and opt.conv_bow == 1 then
      assert(opt.cudnn == 1, 'use cudnn!')
      logging:info('using convolution instead of bag of words')
    end
@@ -1971,10 +1982,15 @@ function main()
       for i = 1, #layers do
          layer_etas[i] = opt.learning_rate
       end
-      -- lower for bow_encoder
-      layer_etas[layers_idx['bow_encoder']] = opt.sent_learning_rate
-      if opt.baseline_method == 'learned' then
-          layer_etas[layers_idx['bow_encoder']] = opt.baseline_learning_rate
+      if opt.hierarchical == 1 then
+          -- lower for bow_encoder
+          layer_etas[layers_idx['bow_encoder']] = opt.sent_learning_rate
+          if opt.baseline_method == 'learned' then
+              layer_etas[layers_idx['bow_encoder']] = opt.baseline_learning_rate
+          end
+      end
+      if opt.adam_conv == 1 then
+          optStatesconv = {}
       end
    else
       -- adagrad and the rest
